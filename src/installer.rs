@@ -791,10 +791,16 @@ fn decompress_xz(data: &[u8]) -> Result<Vec<u8>> {
             let _ = stdin.write_all(data);
         });
 
+        let err_thread = s.spawn(move || {
+            let mut err = Vec::new();
+            let _ = stderr.read_to_end(&mut err);
+            err
+        });
+
         let mut out = Vec::new();
-        let mut err = Vec::new();
         let _ = stdout.read_to_end(&mut out);
-        let _ = stderr.read_to_end(&mut err);
+
+        let err = err_thread.join().unwrap_or_default();
         (out, err)
     });
 
