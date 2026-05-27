@@ -58,7 +58,7 @@ pub fn make_backup_gpt_header(primary: &GptInfo) -> GptHeader {
     let efi_backup = backup.efi_backup_lba;
     backup.efi_start_lba = efi_backup;
     backup.efi_backup_lba = efi_start;
-    backup.part_table_start_lba = efi_start + 1 - 33;
+    backup.part_table_start_lba = efi_backup - 32;
     backup.header_crc32 = 0;
     let header_bytes = unsafe {
         std::slice::from_raw_parts(&backup as *const GptHeader as *const u8, 92)
