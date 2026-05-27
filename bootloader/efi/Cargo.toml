@@ -1,0 +1,19 @@
+[package]
+name = "choosable-efi"
+version = "0.1.0"
+edition = "2021"
+description = "UEFI bootloader for Choosable (BOOTX64.EFI) — no external UEFI crate dependencies"
+
+[dependencies]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+
+[[bin]]
+name = "choosable-efi"
+path = "src/main.rs"
