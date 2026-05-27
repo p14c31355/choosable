@@ -172,7 +172,7 @@ pub fn enumerate_disks() -> Result<Vec<PhyDriveInfo>> {
 
 /// Safe helper: check if MBR is GPT-protective without packed struct field ref
 pub fn read_mbr_is_gpt(mbr: &Mbr) -> bool {
-    let fs_flag_ptr = &mbr.partitions[0].fs_flag as *const u8;
+    let fs_flag_ptr = std::ptr::addr_of!(mbr.partitions[0].fs_flag);
     unsafe { std::ptr::read_unaligned(fs_flag_ptr) == PART_TYPE_GPT_PROTECTIVE }
 }
 
