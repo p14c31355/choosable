@@ -25,8 +25,6 @@ pub struct PhyDriveInfo {
 
 /// Check if a disk is a whole disk (not a partition)
 pub fn is_whole_disk(path: &str) -> bool {
-    // On Linux: check if /sys/class/block/{name}/start exists
-    // If it exists, it's a partition; otherwise it's a whole disk
     let name = path.trim_start_matches("/dev/");
     let start_file = format!("/sys/class/block/{}/start", name);
     !Path::new(&start_file).exists()
@@ -57,14 +55,12 @@ pub fn get_disk_model(path: &str) -> String {
 /// Check if disk is USB-based
 pub fn is_usb_disk(path: &str) -> bool {
     let name = path.trim_start_matches("/dev/");
-    // Check if the device's transport is USB
     let transport_path = format!("/sys/class/block/{}/device/../transport", name);
     if let Ok(link) = std::fs::read_link(&transport_path) {
         if let Some(transport) = link.file_name() {
             return transport == "usb";
         }
     }
-    // Alternative: check subsystem
     let subsystem_path = format!("/sys/class/block/{}/device/../subsystem", name);
     if let Ok(link) = std::fs::read_link(&subsystem_path) {
         if let Some(subsystem) = link.file_name() {
@@ -105,7 +101,6 @@ pub fn get_sector_size_physical(path: &str) -> u32 {
 pub fn enumerate_disks() -> Result<Vec<PhyDriveInfo>> {
     let mut disks = Vec::new();
 
-    // Read /sys/class/block for block devices
     let block_dir = Path::new("/sys/class/block");
     if !block_dir.exists() {
         return Ok(disks);
@@ -116,7 +111,6 @@ pub fn enumerate_disks() -> Result<Vec<PhyDriveInfo>> {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
 
-        // Skip loop, ram, dm, and other virtual devices
         if name_str.starts_with("loop")
             || name_str.starts_with("ram")
             || name_str.starts_with("dm-")
@@ -127,12 +121,10 @@ pub fn enumerate_disks() -> Result<Vec<PhyDriveInfo>> {
 
         let disk_path = format!("/dev/{}", name_str);
 
-        // Skip if not a block device
         if !Path::new(&disk_path).exists() {
             continue;
         }
 
-        // Skip if it's a partition
         if !is_whole_disk(&disk_path) {
             continue;
         }
@@ -145,7 +137,7 @@ pub fn enumerate_disks() -> Result<Vec<PhyDriveInfo>> {
         let sector_size_physical = get_sector_size_physical(&disk_path);
 
         disks.push(PhyDriveInfo {
-            phy_drive: 0, // Will be assigned later
+            phy_drive: 0,
             disk_path,
             size_bytes,
             model,
@@ -162,19 +154,23 @@ pub fn enumerate_disks() -> Result<Vec<PhyDriveInfo>> {
         });
     }
 
-    // Sort: USB/removable first, then by size (largest first)
     disks.sort_by(|a, b| {
         b.is_usb.cmp(&a.is_usb)
             .then(b.removable.cmp(&a.removable))
             .then(b.size_bytes.cmp(&a.size_bytes))
     });
 
-    // Assign phy_drive IDs
     for (i, disk) in disks.iter_mut().enumerate() {
         disk.phy_drive = i;
     }
 
     Ok(disks)
+}
+
+/// Safe helper: check if MBR is GPT-protective without packed struct field ref
+pub fn read_mbr_is_gpt(mbr: &Mbr) -> bool {
+    let fs_flag_ptr = &mbr.partitions[0].fs_flag as *const u8;
+    unsafe { std::ptr::read_unaligned(fs_flag_ptr) == PART_TYPE_GPT_PROTECTIVE }
 }
 
 /// Read the MBR from a disk
@@ -187,27 +183,22 @@ pub fn read_mbr(disk_path: &str) -> Result<Mbr> {
 }
 
 /// Read the MBR and detect if it's a Choosable disk
-pub fn detect_choosable(disk_path: &str, size_bytes: u64) -> Result<(bool, Option<String>, Option<u64>, Option<u64>, Mbr)> {
-    // Open disk
+pub fn detect_choosable(disk_path: &str, _size_bytes: u64) -> Result<(bool, Option<String>, Option<u64>, Option<u64>, Mbr)> {
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .open(disk_path)?;
 
     let mbr = Mbr::read(&mut file)?;
 
-    // Check partition layout for Choosable signature
-    if mbr.is_gpt_protective() {
-        // GPT disk - check partition table
+    if read_mbr_is_gpt(&mbr) {
         let gpt = GptInfo::read_from_disk(&mut file)?;
 
-        // Check partition 1 starts at 2048
         if gpt.partitions[0].start_lba != CHOOSABLE_PART1_START_SECTOR {
             return Ok((false, None, None, None, mbr));
         }
 
         let efi_part_size_sectors = CHOOSABLE_EFI_PART_SIZE / SECTOR_SIZE;
 
-        // Check partition 2 is right after partition 1 and has correct size
         if gpt.partitions[1].start_lba != gpt.partitions[0].end_lba + 1
             || (gpt.partitions[1].end_lba + 1 - gpt.partitions[1].start_lba) != efi_part_size_sectors
         {
@@ -215,9 +206,8 @@ pub fn detect_choosable(disk_path: &str, size_bytes: u64) -> Result<(bool, Optio
         }
 
         // Check partition 2 name is "VTOYEFI" (use ptr arithmetic for packed struct)
-        // name field is at offset 56 in GptPartitionEntry (16+16+8+8+8 = 56)
         let entry_ptr = &gpt.partitions[1] as *const GptPartitionEntry as *const u8;
-        let name_offset = 56usize; // offset_of(GptPartitionEntry, name)
+        let name_offset = 56usize;
         let name_ptr = unsafe { entry_ptr.add(name_offset) as *const u16 };
         let mut name_arr = [0u16; 36];
         for i in 0..36 {
@@ -228,15 +218,11 @@ pub fn detect_choosable(disk_path: &str, size_bytes: u64) -> Result<(bool, Optio
             return Ok((false, None, None, None, mbr));
         }
 
-        // Read choosable version from partition 2
         let part2_start = gpt.partitions[1].start_lba * SECTOR_SIZE;
-        let version = read_choosable_version(&disk_path, part2_start)?;
+        let version = read_choosable_version(disk_path, part2_start)?;
 
         Ok((true, version, Some(part2_start), Some(gpt.partitions[1].attributes), mbr))
     } else {
-        // MBR disk
-
-        // Check partition 1 starts at 2048
         if mbr.partitions[0].start_lba != CHOOSABLE_PART1_START_SECTOR as u32 {
             return Ok((false, None, None, None, mbr));
         }
@@ -244,19 +230,14 @@ pub fn detect_choosable(disk_path: &str, size_bytes: u64) -> Result<(bool, Optio
         let part1_end = mbr.partitions[0].start_lba + mbr.partitions[0].sector_count;
         let efi_part_size_sectors = (CHOOSABLE_EFI_PART_SIZE / SECTOR_SIZE) as u32;
 
-        // Check partition 2 starts right after partition 1 and has correct size
         if mbr.partitions[1].start_lba != part1_end
             || mbr.partitions[1].sector_count != efi_part_size_sectors
         {
             return Ok((false, None, None, None, mbr));
         }
 
-        // Check partition 2 is type EF (EFI System) - not strictly required for MBR Choosable
-        // (Choosable uses 0xEF for the EFI partition in MBR mode)
-
-        // Read choosable version from partition 2
         let part2_start = mbr.partitions[1].start_lba as u64 * SECTOR_SIZE;
-        let version = read_choosable_version(&disk_path, part2_start)?;
+        let version = read_choosable_version(disk_path, part2_start)?;
 
         Ok((true, version, Some(mbr.partitions[1].start_lba as u64), None, mbr))
     }
@@ -383,9 +364,6 @@ pub fn write_sectors<W: Write + Seek>(
 pub fn get_partition_name(disk_path: &str, part_num: u32) -> String {
     let base = disk_path.trim_start_matches("/dev/");
 
-    // For NVMe devices: /dev/nvme0n1p1
-    // For SCSI/SATA: /dev/sda1
-    // For mmc: /dev/mmcblk0p1
     if base.starts_with("nvme") || base.starts_with("mmcblk") {
         format!("{}p{}", disk_path, part_num)
     } else {

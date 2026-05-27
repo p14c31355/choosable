@@ -33,6 +33,46 @@ impl FilesystemType {
     }
 }
 
+// ─── CRC32 helper (replaces `crc32fast` in-line) ────────────────────────
+
+pub fn crc32_checksum(data: &[u8]) -> u32 {
+    crc32fast::hash(data)
+}
+
+/// Recalculate GPT header and partition table CRCs in-place
+pub fn finalize_gpt_crcs(gpt: &mut GptInfo) {
+    let part_table_bytes = unsafe {
+        std::slice::from_raw_parts(gpt.partitions.as_ptr() as *const u8, 128 * 128)
+    };
+    gpt.header.part_table_crc32 = crc32_checksum(part_table_bytes);
+    gpt.header.header_crc32 = 0;
+    let header_bytes = unsafe {
+        std::slice::from_raw_parts(&gpt.header as *const GptHeader as *const u8, 92)
+    };
+    gpt.header.header_crc32 = crc32_checksum(header_bytes);
+}
+
+/// Compute backup GPT header (swap primary/backup LBA, recalc CRC)
+pub fn make_backup_gpt_header(primary: &GptInfo) -> GptHeader {
+    let mut backup = primary.header.clone();
+    // Use ptr arithmetic from struct base (efi_start_lba at +24, efi_backup_lba at +32)
+    let base = &backup as *const GptHeader as *const u8;
+    let efi_start: u64 = unsafe { std::ptr::read_unaligned(base.add(24) as *const u64) };
+    let efi_backup: u64 = unsafe { std::ptr::read_unaligned(base.add(32) as *const u64) };
+    let base_mut = &mut backup as *mut GptHeader as *mut u8;
+    unsafe {
+        std::ptr::write_unaligned(base_mut.add(24) as *mut u64, efi_backup);
+        std::ptr::write_unaligned(base_mut.add(32) as *mut u64, efi_start);
+    }
+    backup.part_table_start_lba = efi_start + 1 - 33;
+    backup.header_crc32 = 0;
+    let header_bytes = unsafe {
+        std::slice::from_raw_parts(&backup as *const GptHeader as *const u8, 92)
+    };
+    backup.header_crc32 = crc32_checksum(header_bytes);
+    backup
+}
+
 // ─── Non-destructive install ────────────────────────────────────────────
 
 pub fn non_destructive_install(disk_path: &str, label: &str, fs_type: FilesystemType, secure_boot: bool, yes: bool) -> Result<()> {
@@ -59,7 +99,7 @@ pub fn non_destructive_install(disk_path: &str, label: &str, fs_type: Filesystem
     let part1_mb = (part1_sectors * SECTOR_SIZE) / SIZE_1MB;
 
     let mbr = read_mbr(disk_path)?;
-    let is_gpt = mbr.is_gpt_protective();
+    let is_gpt = read_mbr_is_gpt(&mbr);
 
     println!("Disk : {}", disk_path);
     println!("Model: {}", model);
@@ -94,8 +134,8 @@ pub fn non_destructive_install(disk_path: &str, label: &str, fs_type: Filesystem
     let next_part_start = find_next_partition_start(disk_path, &mbr, is_gpt, size_bytes)?;
     let free_space = next_part_start.saturating_sub(part1_end * SECTOR_SIZE);
 
-    let (part2_start_sector, _) = if free_space >= CHOOSABLE_EFI_PART_SIZE {
-        (part1_end, false)
+    let part2_start_sector = if free_space >= CHOOSABLE_EFI_PART_SIZE {
+        align_to_4k(part1_end)
     } else {
         let new_part1_mb = part1_mb - (CHOOSABLE_EFI_PART_SIZE / SIZE_1MB);
         println!("We need to shrink partition 1 from {} MiB to {} MiB...", part1_mb, new_part1_mb);
@@ -117,30 +157,38 @@ pub fn non_destructive_install(disk_path: &str, label: &str, fs_type: Filesystem
             }
         }
 
-        (part1_end - (CHOOSABLE_EFI_PART_SIZE / SECTOR_SIZE) + 1, true)
+        align_to_4k(part1_end - (CHOOSABLE_EFI_PART_SIZE / SECTOR_SIZE) + 1)
     };
 
     println!("Writing partition table with new VTOYEFI partition...");
     update_partition_table(disk_path, &mbr, is_gpt, size_bytes, part2_start_sector)?;
 
-    // Write boot images using the open disk
     let mut disk_file = open_disk_readwrite(disk_path)?;
+
+    // Format EFI partition (FAT16 "VTOYEFI")
+    format_efi_partition(disk_path, 2)?;
+
     write_boot_images(&mut disk_file, is_gpt, part2_start_sector)?;
 
     let guid = generate_guid();
-    disk_file.seek(SeekFrom::Start(384))?;
-    disk_file.write_all(&guid)?;
-    disk_file.seek(SeekFrom::Start(440))?;
-    disk_file.write_all(&guid[12..16])?;
+    disk_file.seek(SeekFrom::Start(384))?; disk_file.write_all(&guid)?;
+    disk_file.seek(SeekFrom::Start(440))?; disk_file.write_all(&guid[12..16])?;
     disk_file.flush()?;
 
     write_disk_image_raw(&mut disk_file, part2_start_sector)?;
     disk_file.flush()?;
 
+    // Fix GPT attributes for GPT scheme
+    if is_gpt {
+        fix_gpt_attributes(disk_path)?;
+    }
+
     if !secure_boot {
         std::thread::sleep(std::time::Duration::from_secs(1));
         process_secure_boot_esp(disk_path, part2_start_sector, false)?;
     }
+
+    notify_kernel(disk_path);
 
     println!();
     println!("\x1b[32mChoosable non-destructive installation on {} successfully finished.\x1b[0m", disk_path);
@@ -152,7 +200,6 @@ fn detect_partition_fs(partition: &str) -> Result<String> {
         .args(&["-o", "value", "-s", "TYPE", partition])
         .output()
         .map_err(|_| ChoosableError::ToolNotFound("blkid".to_string()))?;
-
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_lowercase())
     } else {
@@ -161,15 +208,18 @@ fn detect_partition_fs(partition: &str) -> Result<String> {
 }
 
 fn run_cmd(cmd: &str, args: &[&str]) -> Result<()> {
-    let status = std::process::Command::new(cmd)
-        .args(args)
-        .status()
+    let status = std::process::Command::new(cmd).args(args).status()
         .map_err(|e| ChoosableError::ToolNotFound(format!("{}: {}", cmd, e)))?;
-
     if !status.success() {
         return Err(ChoosableError::Generic(format!("{} failed with code {:?}", cmd, status.code())));
     }
     Ok(())
+}
+
+/// 4KB alignment helper
+fn align_to_4k(sector: u64) -> u64 {
+    let m = sector % 8;
+    if m > 0 { sector - m } else { sector }
 }
 
 fn find_next_partition_start(disk_path: &str, mbr: &Mbr, is_gpt: bool, disk_size_bytes: u64) -> Result<u64> {
@@ -195,53 +245,45 @@ fn find_next_partition_start(disk_path: &str, mbr: &Mbr, is_gpt: bool, disk_size
     }
 }
 
-fn update_partition_table(disk_path: &str, mbr: &Mbr, is_gpt: bool, disk_size_bytes: u64, part2_start_sector: u64) -> Result<()> {
+fn update_partition_table(disk_path: &str, mbr: &Mbr, is_gpt: bool, _disk_size_bytes: u64, part2_start_sector: u64) -> Result<()> {
     if is_gpt {
-        // For GPT, open the disk directly (not generic)
         let mut disk = open_disk_readwrite(disk_path)?;
-        update_gpt_partition_table_f(&mut disk, disk_size_bytes, part2_start_sector)?;
+        update_gpt_partition_table_f(&mut disk, part2_start_sector)?;
         disk.flush()?;
     } else {
         let mut disk = open_disk_readwrite(disk_path)?;
-        update_mbr_partition_table_f(&mut disk, mbr, disk_size_bytes, part2_start_sector)?;
+        update_mbr_partition_table_f(&mut disk, mbr, part2_start_sector)?;
         disk.flush()?;
     }
     Ok(())
 }
 
-fn update_mbr_partition_table_f(disk: &mut std::fs::File, mbr: &Mbr, disk_size_bytes: u64, part2_start_sector: u64) -> Result<()> {
+fn update_mbr_partition_table_f(disk: &mut std::fs::File, mbr: &Mbr, part2_start_sector: u64) -> Result<()> {
     let mut new_mbr = mbr.clone();
     let efi_sectors = (CHOOSABLE_EFI_PART_SIZE / SECTOR_SIZE) as u32;
+    let disk_size = disk.seek(SeekFrom::End(0))?;
+    disk.seek(SeekFrom::Start(0))?;
 
-    // Find free slot
     let slot = {
         let mut s = None;
         for i in 1..4 {
-            if new_mbr.partitions[i].sector_count == 0 {
-                s = Some(i);
-                break;
-            }
+            if new_mbr.partitions[i].sector_count == 0 { s = Some(i); break; }
         }
         match s {
             Some(slot) => slot,
             None => {
-                // shift 2→3, 3→4
-                for j in (1..=2).rev() {
-                    new_mbr.partitions[j + 1] = new_mbr.partitions[j];
-                }
+                for j in (1..=2).rev() { new_mbr.partitions[j + 1] = new_mbr.partitions[j]; }
                 1
             }
         }
     };
 
-    // Fix partition 1 size first (before borrowing mutably for fill)
     let part1_count = part2_start_sector as u32 - CHOOSABLE_PART1_START_SECTOR as u32;
-    fill_mbr_chs_entry(&mut new_mbr.partitions[0], disk_size_bytes, CHOOSABLE_PART1_START_SECTOR as u32, part1_count);
+    fill_mbr_chs_entry(&mut new_mbr.partitions[0], disk_size, CHOOSABLE_PART1_START_SECTOR as u32, part1_count);
     new_mbr.partitions[0].active = PART_ACTIVE;
     new_mbr.partitions[0].fs_flag = 0x07;
 
-    // Fill partition 2
-    fill_mbr_chs_entry(&mut new_mbr.partitions[slot], disk_size_bytes, part2_start_sector as u32, efi_sectors);
+    fill_mbr_chs_entry(&mut new_mbr.partitions[slot], disk_size, part2_start_sector as u32, efi_sectors);
     new_mbr.partitions[slot].active = PART_INACTIVE;
     new_mbr.partitions[slot].fs_flag = PART_TYPE_EFI_SYSTEM;
 
@@ -250,89 +292,176 @@ fn update_mbr_partition_table_f(disk: &mut std::fs::File, mbr: &Mbr, disk_size_b
     Ok(())
 }
 
-fn fill_mbr_chs_entry(entry: &mut PartitionTableEntry, disk_size_bytes: u64, start_sector: u32, sector_count: u32) {
+fn fill_mbr_chs_entry(entry: &mut PartitionTableEntry, _disk_size_bytes: u64, start_sector: u32, sector_count: u32) {
     let nsector: u32 = 63u32;
-    let nhead = find_head_count(disk_size_bytes);
 
     entry.start_lba = start_sector;
     entry.sector_count = sector_count;
 
-    let cylinder = start_sector / nhead / nsector;
-    let head = (start_sector / nsector) % nhead;
+    let cylinder = start_sector / 255 / nsector;
+    let head = (start_sector / nsector) % 255;
     let sector = (start_sector % nsector) + 1;
 
     entry.start_head = head as u8;
     entry.start_sector_cylinder = ((cylinder as u16 & 0x3FF) << 6) | ((sector as u16) & 0x3F);
 
     let end_lba = start_sector + sector_count - 1;
-    let ecylinder = end_lba / nhead / nsector;
-    let ehead = (end_lba / nsector) % nhead;
+    let ecylinder = end_lba / 255 / nsector;
+    let ehead = (end_lba / nsector) % 255;
     let esector = (end_lba % nsector) + 1;
 
     entry.end_head = ehead as u8;
     entry.end_sector_cylinder = ((ecylinder as u16 & 0x3FF) << 6) | ((esector as u16) & 0x3F);
 }
 
-fn find_head_count(disk_size_bytes: u64) -> u32 {
-    let mut nhead: u32 = 8u32;
-    let nsector: u64 = 63u64;
-    let total = disk_size_bytes / SECTOR_SIZE;
-    while nhead > 0 && (total / nsector / (nhead as u64)) > 1024 {
-        nhead = nhead.saturating_mul(2);
-    }
-    if nhead == 0 { 255u32 } else { nhead }
-}
-
-fn update_gpt_partition_table_f(disk: &mut std::fs::File, disk_size_bytes: u64, part2_start_sector: u64) -> Result<()> {
+fn update_gpt_partition_table_f(disk: &mut std::fs::File, part2_start_sector: u64) -> Result<()> {
     disk.seek(SeekFrom::Start(0))?;
     let mut gpt = GptInfo::read_from_disk(disk)?;
     let efi_sectors = CHOOSABLE_EFI_PART_SIZE / SECTOR_SIZE;
 
-    // Find free slot
     let slot = {
         let mut s = None;
         for i in 1..128 {
-            if gpt.partitions[i].unique_part_guid == [0u8; 16] {
-                s = Some(i);
-                break;
-            }
+            if gpt.partitions[i].unique_part_guid == [0u8; 16] { s = Some(i); break; }
         }
         match s {
             Some(slot) => slot,
             None => {
-                for j in (1..127).rev() {
-                    gpt.partitions[j + 1] = gpt.partitions[j];
-                }
+                for j in (1..127).rev() { gpt.partitions[j + 1] = gpt.partitions[j]; }
                 1
             }
         }
     };
 
-    // Adjust partition 1
     gpt.partitions[0].end_lba = part2_start_sector - 1;
 
-    // Partition 2: VTOYEFI
     gpt.partitions[slot].part_type_guid = GPT_TYPE_EFI_SYSTEM;
     gpt.partitions[slot].unique_part_guid = generate_guid();
     gpt.partitions[slot].start_lba = part2_start_sector;
     gpt.partitions[slot].end_lba = part2_start_sector + efi_sectors - 1;
-    gpt.partitions[slot].attributes = CHOOSABLE_EFI_PART_ATTR;
+    gpt.partitions[slot].attributes = GPT_ATTR_VTOYEFI;
     let mut name = [0u16; 36];
     name[0] = 'V' as u16; name[1] = 'T' as u16; name[2] = 'O' as u16;
     name[3] = 'Y' as u16; name[4] = 'E' as u16; name[5] = 'F' as u16; name[6] = 'I' as u16;
     gpt.partitions[slot].name = name;
 
-    // CRC update
-    gpt.header.part_table_crc32 = crc32_checksum(
-        unsafe { std::slice::from_raw_parts(gpt.partitions.as_ptr() as *const u8, 128 * 128) }
-    );
-    gpt.header.header_crc32 = 0;
-    gpt.header.header_crc32 = crc32_checksum(
-        unsafe { std::slice::from_raw_parts(&gpt.header as *const GptHeader as *const u8, 92) }
-    );
-
+    finalize_gpt_crcs(&mut gpt);
     gpt.write_to_disk(disk)?;
     Ok(())
+}
+
+// ─── EFI partition format (FAT16 "VTOYEFI") ─────────────────────────────
+
+/// Format the EFI partition as FAT16 with label "VTOYEFI"
+fn format_efi_partition(disk_path: &str, part_num: u32) -> Result<()> {
+    let part = get_partition_name(disk_path, part_num);
+    println!("Formatting EFI partition {} as FAT16...", part);
+
+    // Ventoy uses: mkfs.vfat -F 16 -n VTOYEFI -s 1 <partition>
+    for _ in 0..10 {
+        // Unmount if mounted
+        check_umount(&part);
+
+        let status = std::process::Command::new("mkfs.vfat")
+            .args(&["-F", "16", "-n", "VTOYEFI", "-s", "1", &part])
+            .status();
+
+        match status {
+            Ok(s) if s.success() => {
+                println!("EFI partition formatted successfully.");
+                return Ok(());
+            }
+            _ => {
+                println!("mkfs.vfat failed, retrying...");
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+        }
+    }
+
+    Err(ChoosableError::FormatFailed)
+}
+
+/// Unmount a partition if mounted
+fn check_umount(partition: &str) {
+    // Read /proc/mounts and unmount
+    if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
+        for line in mounts.lines() {
+            if line.starts_with(partition) {
+                if let Some(mount_point) = line.split_whitespace().nth(1) {
+                    let _ = std::process::Command::new("umount")
+                        .arg(mount_point)
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                }
+            }
+        }
+    }
+}
+
+// ─── GPT attribute fix (vtoygpt -f equivalent) ──────────────────────────
+
+/// Fix GPT attributes for VTOYEFI partition on already-installed disk
+pub fn fix_gpt_attributes(disk_path: &str) -> Result<()> {
+    let mut disk = open_disk_readwrite(disk_path)?;
+
+    // Get disk size
+    let disk_size = disk.seek(SeekFrom::End(0))?;
+    disk.seek(SeekFrom::Start(0))?;
+
+    let mut gpt = GptInfo::read_from_disk(&mut disk)?;
+
+    // Read via raw ptr arithmetic (packed struct, name at +56, attributes at +48 within entry)
+    let entry_ptr = &gpt.partitions[1] as *const GptPartitionEntry as *const u8;
+    let name_ptr = unsafe { entry_ptr.add(56) as *const u16 };
+    let mut name_arr = [0u16; 36];
+    for i in 0..36 {
+        name_arr[i] = unsafe { std::ptr::read_unaligned(name_ptr.add(i)) };
+    }
+    let is_vtoyefi = name_arr[0] == 'V' as u16 && name_arr[1] == 'T' as u16 && name_arr[2] == 'O' as u16 && name_arr[3] == 'Y' as u16;
+
+    let attr_ptr = unsafe { entry_ptr.add(48) as *const u64 };
+    let current_attr: u64 = unsafe { std::ptr::read_unaligned(attr_ptr) };
+
+    if is_vtoyefi && current_attr != GPT_ATTR_VTOYEFI {
+        println!("Fixing GPT attributes for VTOYEFI partition...");
+        unsafe { std::ptr::write_unaligned(attr_ptr as *mut u64, GPT_ATTR_VTOYEFI); }
+
+        // Recalculate CRCs and write
+        finalize_gpt_crcs(&mut gpt);
+        gpt.write_to_disk(&mut disk)?;
+
+        // Also write backup GPT
+        let backup_header = make_backup_gpt_header(&gpt);
+        let backup_offset = gpt.header.efi_backup_lba * SECTOR_SIZE;
+        disk.seek(SeekFrom::Start(backup_offset))?;
+        backup_header.write(&mut disk)?;
+
+        // Write backup partition table
+        let backup_pt_offset = (gpt.header.efi_backup_lba - 32) * SECTOR_SIZE;
+        disk.seek(SeekFrom::Start(backup_pt_offset))?;
+        for entry in &gpt.partitions {
+            let ptr = entry as *const GptPartitionEntry as *const u8;
+            let bytes = unsafe { std::slice::from_raw_parts(ptr, 128) };
+            disk.write_all(bytes)?;
+        }
+
+        disk.flush()?;
+        println!("GPT attributes fixed.");
+    }
+
+    Ok(())
+}
+
+// ─── Kernel notification ────────────────────────────────────────────────
+
+fn notify_kernel(disk_path: &str) {
+    let _ = std::process::Command::new("partprobe").arg(disk_path)
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+    let _ = std::process::Command::new("udevadm").args(&["trigger", "--name-match", disk_path])
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+    let _ = std::process::Command::new("partx").args(&["-u", disk_path])
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
 }
 
 // ─── Secure Boot ESP processing ─────────────────────────────────────────
@@ -340,14 +469,9 @@ fn update_gpt_partition_table_f(disk: &mut std::fs::File, disk_size_bytes: u64, 
 pub fn process_secure_boot_esp(disk_path: &str, part2_start_byte: u64, enable_secure_boot: bool) -> Result<()> {
     use std::io::Cursor;
 
-    if enable_secure_boot {
-        return Ok(());
-    }
+    if enable_secure_boot { return Ok(()); }
 
-    let mut file = std::fs::OpenOptions::new()
-        .read(true).write(true)
-        .open(disk_path)?;
-
+    let mut file = std::fs::OpenOptions::new().read(true).write(true).open(disk_path)?;
     let partition_size = CHOOSABLE_EFI_PART_SIZE;
     let mut buf = vec![0u8; partition_size as usize];
     file.seek(SeekFrom::Start(part2_start_byte))?;
@@ -358,8 +482,7 @@ pub fn process_secure_boot_esp(disk_path: &str, part2_start_byte: u64, enable_se
         {
             let cursor = Cursor::new(&mut rw[..]);
             let fs = match fatfs::FileSystem::new(cursor, fatfs::FsOptions::new()) {
-                Ok(fs) => fs,
-                Err(_) => return Ok(()),
+                Ok(fs) => fs, Err(_) => return Ok(()),
             };
             let root = fs.root_dir();
 
@@ -373,33 +496,20 @@ pub fn process_secure_boot_esp(disk_path: &str, part2_start_byte: u64, enable_se
 
             if has_sb {
                 println!("Disabling Secure Boot (renaming EFI files)...");
-
                 if let Ok(efi) = root.open_dir("EFI") {
                     if let Ok(boot) = efi.open_dir("BOOT") {
                         let efi_data = if let Ok(mut f) = boot.open_file("grubx64_real.efi") {
-                            let mut d = Vec::new();
-                            f.read_to_end(&mut d).ok();
-                            Some(d)
+                            let mut d = Vec::new(); f.read_to_end(&mut d).ok(); Some(d)
                         } else { None };
-
                         if let Some(data) = &efi_data {
-                            if let Ok(mut f) = boot.create_file("BOOTX64.EFI") {
-                                f.write_all(data).ok();
-                            }
+                            if let Ok(mut f) = boot.create_file("BOOTX64.EFI") { f.write_all(data).ok(); }
                         }
-
                         let ia32_data = if let Ok(mut f) = boot.open_file("grubia32_real.efi") {
-                            let mut d = Vec::new();
-                            f.read_to_end(&mut d).ok();
-                            Some(d)
+                            let mut d = Vec::new(); f.read_to_end(&mut d).ok(); Some(d)
                         } else { None };
-
                         if let Some(data) = &ia32_data {
-                            if let Ok(mut f) = boot.create_file("BOOTIA32.EFI") {
-                                f.write_all(data).ok();
-                            }
+                            if let Ok(mut f) = boot.create_file("BOOTIA32.EFI") { f.write_all(data).ok(); }
                         }
-
                         let _ = boot.remove("grubx64_real.efi");
                         let _ = boot.remove("grubx64.efi");
                         let _ = boot.remove("MokManager.efi");
@@ -411,7 +521,7 @@ pub fn process_secure_boot_esp(disk_path: &str, part2_start_byte: u64, enable_se
                 }
                 let _ = root.remove("ENROLL_THIS_KEY_IN_MOKMANAGER.cer");
             }
-        } // cursor, fs, root, all dir/file handles dropped here
+        }
         rw
     };
 
@@ -419,9 +529,7 @@ pub fn process_secure_boot_esp(disk_path: &str, part2_start_byte: u64, enable_se
     file.write_all(&rw_buf)?;
     file.flush()?;
 
-    let _ = std::process::Command::new("partprobe").arg(disk_path).status();
-    let _ = std::process::Command::new("udevadm").args(&["trigger", "--name-match", disk_path]).status();
-
+    notify_kernel(disk_path);
     Ok(())
 }
 
@@ -480,16 +588,14 @@ pub fn install_choosable(
     if !yes {
         print!("Continue? (y/n) ");
         std::io::stdout().flush().ok();
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer).ok();
+        let mut answer = String::new(); std::io::stdin().read_line(&mut answer).ok();
         if answer.trim().to_lowercase() != "y" { println!("Aborted."); return Ok(()); }
 
         eprintln!();
         eprintln!("\x1b[33mAll the data on the disk {} will be lost!!!\x1b[0m", disk_path);
         print!("Double-check. Continue? (y/n) ");
         std::io::stdout().flush().ok();
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer).ok();
+        let mut answer = String::new(); std::io::stdin().read_line(&mut answer).ok();
         if answer.trim().to_lowercase() != "y" { println!("Aborted."); return Ok(()); }
     }
 
@@ -497,9 +603,7 @@ pub fn install_choosable(
 
     println!("Cleaning disk...");
     let zero_buf = vec![0u8; 64 * 512];
-    disk.seek(SeekFrom::Start(0))?;
-    disk.write_all(&zero_buf)?;
-    disk.flush()?;
+    disk.seek(SeekFrom::Start(0))?; disk.write_all(&zero_buf)?; disk.flush()?;
 
     println!("Creating partition table...");
     if use_gpt {
@@ -507,6 +611,8 @@ pub fn install_choosable(
     } else {
         install_mbr_f(&mut disk, disk_path, size_bytes, reserve_space_mb, label, fs_type, secure_boot)?;
     }
+
+    notify_kernel(disk_path);
 
     println!();
     println!("\x1b[32mChoosable installed successfully to {}.\x1b[0m", disk_path);
@@ -519,8 +625,7 @@ fn install_mbr_f(disk: &mut std::fs::File, disk_path: &str, disk_size_bytes: u64
     let part1_start = CHOOSABLE_PART1_START_SECTOR;
 
     let mut part2_start = if reserve_space_mb > 0 { total_sectors - efi_part_sectors - (reserve_space_mb * 2048) } else { total_sectors - efi_part_sectors };
-    let modsector = part2_start % 8;
-    if modsector > 0 { part2_start -= modsector; }
+    part2_start = align_to_4k(part2_start);
     let part1_sectors = part2_start - part1_start;
 
     let mut mbr = Mbr::new_empty();
@@ -530,9 +635,10 @@ fn install_mbr_f(disk: &mut std::fs::File, disk_path: &str, disk_size_bytes: u64
     fill_mbr_chs_entry(&mut mbr.partitions[1], disk_size_bytes, part2_start as u32, efi_part_sectors as u32);
     mbr.partitions[1].fs_flag = PART_TYPE_EFI_SYSTEM;
 
-    disk.seek(SeekFrom::Start(0))?;
-    mbr.write(disk)?;
-    disk.flush()?;
+    disk.seek(SeekFrom::Start(0))?; mbr.write(disk)?; disk.flush()?;
+
+    // Format EFI partition
+    format_efi_partition(disk_path, 2)?;
 
     let part1 = get_partition_name(disk_path, 1);
     format_partition(&part1, label, fs_type)?;
@@ -558,8 +664,7 @@ fn install_gpt_f(disk: &mut std::fs::File, disk_path: &str, disk_size_bytes: u64
     let total_sectors = disk_size_bytes / SECTOR_SIZE;
     let part2_end = total_sectors - 34;
     let mut part2_start = if reserve_space_mb > 0 { part2_end - efi_part_sectors - (reserve_space_mb * 2048) } else { part2_end - efi_part_sectors };
-    let modsector = part2_start % 8;
-    if modsector > 0 { part2_start -= modsector; }
+    part2_start = align_to_4k(part2_start);
     let part1_end = part2_start - 1;
 
     let disk_guid = generate_guid();
@@ -571,9 +676,15 @@ fn install_gpt_f(disk: &mut std::fs::File, disk_path: &str, disk_size_bytes: u64
     gpt_info.partitions[1].end_lba = part2_start + efi_part_sectors - 1;
     gpt_info.partitions[1].attributes = GPT_ATTR_VTOYEFI;
 
+    // Finalize CRCs before writing
+    finalize_gpt_crcs(&mut gpt_info);
+
     gpt_info.write_to_disk(disk)?;
     disk.flush()?;
     std::thread::sleep(std::time::Duration::from_secs(1));
+
+    // Format EFI partition
+    format_efi_partition(disk_path, 2)?;
 
     let part1 = get_partition_name(disk_path, 1);
     format_partition(&part1, label, fs_type)?;
@@ -586,6 +697,9 @@ fn install_gpt_f(disk: &mut std::fs::File, disk_path: &str, disk_size_bytes: u64
 
     write_disk_image_raw(disk, part2_start)?;
     disk.flush()?;
+
+    // Fix GPT attributes (ventoy equivalent: vtoycli gpt -f)
+    fix_gpt_attributes(disk_path)?;
 
     if !secure_boot {
         std::thread::sleep(std::time::Duration::from_secs(1));
@@ -618,7 +732,7 @@ fn format_partition(partition: &str, label: &str, fs_type: FilesystemType) -> Re
     Ok(())
 }
 
-fn write_boot_images(disk: &mut std::fs::File, is_gpt: bool, part2_start_sector: u64) -> Result<()> {
+fn write_boot_images(disk: &mut std::fs::File, is_gpt: bool, _part2_start_sector: u64) -> Result<()> {
     println!("Writing boot images...");
     let boot_img = read_install_file(CHOOSABLE_FILE_BOOT_IMG)?;
     let boot_code_len = std::cmp::min(boot_img.len(), 446);
@@ -665,10 +779,6 @@ fn decompress_xz(data: &[u8]) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
-pub fn crc32_checksum(data: &[u8]) -> u32 {
-    crc32fast::hash(data)
-}
-
 // ─── Update ──────────────────────────────────────────────────────────────
 
 pub fn update_choosable(disk_path: &str, secure_boot: Option<bool>, yes: bool) -> Result<()> {
@@ -693,8 +803,7 @@ pub fn update_choosable(disk_path: &str, secure_boot: Option<bool>, yes: bool) -
     if !yes {
         print!("Update Choosable {} ===> {}   Continue? (y/n) ", old_ver, cur_ver);
         std::io::stdout().flush().ok();
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer).ok();
+        let mut answer = String::new(); std::io::stdin().read_line(&mut answer).ok();
         if answer.trim().to_lowercase() != "y" { println!("Aborted."); return Ok(()); }
     }
 
@@ -743,6 +852,13 @@ pub fn update_choosable(disk_path: &str, secure_boot: Option<bool>, yes: bool) -
         process_secure_boot_esp(disk_path, part2_start, false)?;
     }
 
+    // Fix GPT attributes on update (ventoy: vtoycli gpt -f)
+    if is_gpt {
+        fix_gpt_attributes(disk_path)?;
+    }
+
+    notify_kernel(disk_path);
+
     println!();
     println!("\x1b[32mChoosable updated successfully on {}.\x1b[0m", disk_path);
     Ok(())
@@ -785,15 +901,11 @@ pub fn list_choosable(disk_path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Check secure boot by looking for grubx64_real.efi on the EFI partition
 fn check_choosable_secure_boot(disk_path: &str, part2_start_byte: u64) -> bool {
     use std::io::Cursor;
-
     let file = match std::fs::OpenOptions::new().read(true).open(disk_path) {
-        Ok(f) => f,
-        Err(_) => return false,
+        Ok(f) => f, Err(_) => return false,
     };
-
     let partition_size = CHOOSABLE_EFI_PART_SIZE;
     let mut buf = vec![0u8; partition_size as usize];
     let mut file = file;
@@ -802,10 +914,8 @@ fn check_choosable_secure_boot(disk_path: &str, part2_start_byte: u64) -> bool {
 
     let cursor = Cursor::new(buf);
     let fs = match fatfs::FileSystem::new(cursor, fatfs::FsOptions::new()) {
-        Ok(fs) => fs,
-        Err(_) => return false,
+        Ok(fs) => fs, Err(_) => return false,
     };
-
     let root = fs.root_dir();
     if let Ok(efi) = root.open_dir("EFI") {
         if let Ok(boot) = efi.open_dir("BOOT") {

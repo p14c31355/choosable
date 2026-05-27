@@ -341,8 +341,21 @@ impl GptInfo {
     }
 }
 
-/// Generate a random GUID
+/// Generate a random GUID (tries /dev/urandom, falls back to time-based)
 pub fn generate_guid() -> Guid {
+    // Try /dev/urandom first (Ventoy equivalent: vtoy_gen_uuid)
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let mut guid = [0u8; 16];
+        if std::io::Read::read_exact(&mut f, &mut guid).is_ok() {
+            // Set UUID variant (bits 6-7 of byte 8 = 10xx)
+            guid[8] = (guid[8] & 0x3F) | 0x80;
+            // Set UUID version 4 (bits 4-7 of byte 6 = 0100)
+            guid[6] = (guid[6] & 0x0F) | 0x40;
+            return guid;
+        }
+    }
+
+    // Fallback to time-based pseudo-random
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -350,20 +363,17 @@ pub fn generate_guid() -> Guid {
     let nanos = now.as_nanos();
     let mut guid = [0u8; 16];
 
-    // Simple pseudo-random GUID from time
     guid[0] = (nanos >> 0) as u8;
     guid[1] = (nanos >> 8) as u8;
     guid[2] = (nanos >> 16) as u8;
     guid[3] = (nanos >> 24) as u8;
     guid[4] = (nanos >> 32) as u8;
     guid[5] = (nanos >> 40) as u8;
-    guid[6] = (nanos >> 48) as u8;
+    guid[6] = (0x40 | ((nanos >> 48) & 0x0F)) as u8;
     guid[7] = (nanos >> 56) as u8;
-    // Variant: 10xx
-    guid[8] = 0x80 | ((nanos >> 4) & 0x3F) as u8;
+    guid[8] = (0x80 | ((nanos >> 4) & 0x3F)) as u8;
     guid[9] = (nanos >> 10) as u8;
-    // Version: 0100
-    guid[10] = 0x40 | ((nanos >> 16) & 0x0F) as u8;
+    guid[10] = (nanos >> 16) as u8;
     guid[11] = (nanos >> 22) as u8;
     guid[12] = (nanos >> 28) as u8;
     guid[13] = (nanos >> 34) as u8;
