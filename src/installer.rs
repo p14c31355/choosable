@@ -277,11 +277,15 @@ fn update_mbr_partition_table_f(disk: &mut std::fs::File, mbr: &Mbr, part2_start
     };
 
     let part1_count = part2_start_sector as u32 - CHOOSABLE_PART1_START_SECTOR as u32;
-    fill_mbr_chs_entry(&mut new_mbr.partitions[0], disk_size, CHOOSABLE_PART1_START_SECTOR as u32, part1_count);
+    let mut part0 = new_mbr.partitions[0];
+    fill_mbr_chs_entry(&mut part0, disk_size, CHOOSABLE_PART1_START_SECTOR as u32, part1_count);
+    new_mbr.partitions[0] = part0;
     new_mbr.partitions[0].active = PART_ACTIVE;
     new_mbr.partitions[0].fs_flag = 0x07;
 
-    fill_mbr_chs_entry(&mut new_mbr.partitions[slot], disk_size, part2_start_sector as u32, efi_sectors);
+    let mut part_slot = new_mbr.partitions[slot];
+    fill_mbr_chs_entry(&mut part_slot, disk_size, part2_start_sector as u32, efi_sectors);
+    new_mbr.partitions[slot] = part_slot;
     new_mbr.partitions[slot].active = PART_INACTIVE;
     new_mbr.partitions[slot].fs_flag = PART_TYPE_EFI_SYSTEM;
 
