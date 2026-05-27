@@ -107,25 +107,64 @@ pub fn check_tool_work_ok(fs_type: FilesystemType) -> Result<()> {
     }
 
     // Check filesystem-specific formatting tool
-    let (tool_name, tool_arg) = match fs_type {
-        FilesystemType::ExFat => ("mkexfatfs", Some("-V")),
-        FilesystemType::Fat32 => ("mkfs.vfat", None),
-        FilesystemType::Ntfs => ("mkfs.ntfs", Some("-V")),
-    };
-
-    let mut cmd = std::process::Command::new(tool_name);
-    cmd.stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    if let Some(arg) = tool_arg {
-        cmd.arg(arg);
-    }
-    let status = cmd.status()
-        .map_err(|_| ChoosableError::ToolNotFound(tool_name.to_string()))?;
-
-    if !status.success() {
-        return Err(ChoosableError::ToolNotFound(
-            format!("{} does not work on this system", tool_name)
-        ));
+    match fs_type {
+        FilesystemType::ExFat => {
+            // Try mkexfatfs first, then mkfs.exfat as fallback
+            let tools = [
+                ("mkexfatfs", true),   // uses -V
+                ("mkfs.exfat", false), // -V exits with code 1, just check existence
+                ("/usr/sbin/mkfs.exfat", false),
+            ];
+            let mut found = false;
+            for (tool_name, use_version_flag) in &tools {
+                let mut cmd = std::process::Command::new(tool_name);
+                cmd.stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                if *use_version_flag {
+                    cmd.arg("-V");
+                }
+                match cmd.status() {
+                    Ok(_) => {
+                        // mkfs.exfat -V exits with code 1 on success,
+                        // so just check that the command exists and runs
+                        found = true;
+                        break;
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    _ => continue,
+                }
+            }
+            if !found {
+                return Err(ChoosableError::ToolNotFound(
+                    "mkexfatfs or mkfs.exfat is required for exFAT formatting".to_string()
+                ));
+            }
+        }
+        FilesystemType::Fat32 => {
+            let status = std::process::Command::new("mkfs.vfat")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map_err(|_| ChoosableError::ToolNotFound("mkfs.vfat".to_string()))?;
+            if !status.success() {
+                return Err(ChoosableError::ToolNotFound(
+                    "mkfs.vfat does not work on this system".to_string()
+                ));
+            }
+        }
+        FilesystemType::Ntfs => {
+            let status = std::process::Command::new("mkfs.ntfs")
+                .arg("-V")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map_err(|_| ChoosableError::ToolNotFound("mkfs.ntfs".to_string()))?;
+            if !status.success() {
+                return Err(ChoosableError::ToolNotFound(
+                    "mkfs.ntfs does not work on this system".to_string()
+                ));
+            }
+        }
     }
 
     // Check xzcat

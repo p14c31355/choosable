@@ -723,24 +723,46 @@ fn install_gpt_f(disk: &mut std::fs::File, disk_path: &str, disk_size_bytes: u64
 // ─── Helper utilities ────────────────────────────────────────────────────
 
 fn format_partition(partition: &str, label: &str, fs_type: FilesystemType) -> Result<()> {
-    let (cmd, args): (&str, Vec<&str>) = match fs_type {
+    println!("Formatting {} as {}...", partition, fs_type.as_str());
+
+    match fs_type {
         FilesystemType::ExFat => {
             let part_sectors = get_partition_size_sectors(partition)?;
             let part_size_gb = part_sectors * SECTOR_SIZE / SIZE_1GB;
             let cluster_sectors = if part_size_gb > 32 { "256" } else { "64" };
-            ("mkexfatfs", vec!["-n", label, "-s", cluster_sectors, partition])
-        }
-        FilesystemType::Fat32 => ("mkfs.vfat", vec!["-n", label, "-F", "32", partition]),
-        FilesystemType::Ntfs => ("mkfs.ntfs", vec!["-f", "-L", label, partition]),
-    };
 
-    println!("Formatting {} as {}...", partition, fs_type.as_str());
-    let status = std::process::Command::new(cmd).args(&args).status()
-        .map_err(|e| ChoosableError::ToolNotFound(format!("{}: {}", cmd, e)))?;
-    if !status.success() {
-        return Err(ChoosableError::FormatFailed);
+            // Try mkexfatfs first, then mkfs.exfat (including full path) as fallback
+            for cmd in &["mkexfatfs", "mkfs.exfat", "/usr/sbin/mkfs.exfat"] {
+                let args: Vec<&str> = if *cmd == "mkexfatfs" {
+                    vec!["-n", label, "-s", cluster_sectors, partition]
+                } else {
+                    vec!["-n", label, partition]
+                };
+                match std::process::Command::new(cmd).args(&args).status() {
+                    Ok(s) if s.success() => return Ok(()),
+                    Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    _ => continue,
+                }
+            }
+            Err(ChoosableError::FormatFailed)
+        }
+        FilesystemType::Fat32 => {
+            let status = std::process::Command::new("mkfs.vfat")
+                .args(&["-n", label, "-F", "32", partition])
+                .status()
+                .map_err(|e| ChoosableError::ToolNotFound(format!("mkfs.vfat: {}", e)))?;
+            if !status.success() { return Err(ChoosableError::FormatFailed); }
+            Ok(())
+        }
+        FilesystemType::Ntfs => {
+            let status = std::process::Command::new("mkfs.ntfs")
+                .args(&["-f", "-L", label, partition])
+                .status()
+                .map_err(|e| ChoosableError::ToolNotFound(format!("mkfs.ntfs: {}", e)))?;
+            if !status.success() { return Err(ChoosableError::FormatFailed); }
+            Ok(())
+        }
     }
-    Ok(())
 }
 
 fn write_boot_images(disk: &mut std::fs::File, is_gpt: bool, _part2_start_sector: u64) -> Result<()> {

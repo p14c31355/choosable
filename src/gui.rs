@@ -65,7 +65,7 @@ impl std::fmt::Display for DiskEntry {
 
 struct ChoosableApp {
     disks: Vec<DiskEntry>,
-    selected_disk_path: Option<String>,
+    selected_disk_index: Option<usize>,
     use_gpt: bool,
     secure_boot: bool,
     force: bool,
@@ -81,7 +81,7 @@ impl Default for ChoosableApp {
     fn default() -> Self {
         Self {
             disks: Vec::new(),
-            selected_disk_path: None,
+            selected_disk_index: None,
             use_gpt: false,
             secure_boot: true,
             force: false,
@@ -110,12 +110,18 @@ impl ChoosableApp {
                 self.disks = disks;
                 self.loading = false;
                 self.status = format!("{} disks found.", self.disks.len());
-                if self.selected_disk_path.is_none() && !self.disks.is_empty() {
-                    self.selected_disk_path = Some(self.disks[0].path.clone());
+                if self.selected_disk_index.is_none() && !self.disks.is_empty() {
+                    self.selected_disk_index = Some(0);
                 }
             }
-            Message::SelectDisk(path) => {
-                self.selected_disk_path = Some(path);
+            Message::SelectDisk(display) => {
+                // Find the index of the disk that matches this display string
+                for (i, d) in self.disks.iter().enumerate() {
+                    if d.to_string() == display {
+                        self.selected_disk_index = Some(i);
+                        break;
+                    }
+                }
             }
             Message::ToggleGpt(val) => self.use_gpt = val,
             Message::ToggleSecureBoot(val) => self.secure_boot = val,
@@ -125,8 +131,8 @@ impl ChoosableApp {
             Message::NonDestructiveToggled(val) => self.non_destructive = val,
             Message::FsTypeChanged(fs) => self.fs_type = fs,
             Message::InstallClicked => {
-                if let Some(ref disk_path) = self.selected_disk_path {
-                    let disk_path = disk_path.clone();
+                if let Some(index) = self.selected_disk_index {
+                    let disk_path = self.disks[index].path.clone();
                     let gpt = self.use_gpt;
                     let secure_boot = self.secure_boot;
                     let force = self.force;
@@ -145,8 +151,8 @@ impl ChoosableApp {
                 self.status = String::from("No disk selected.");
             }
             Message::UpdateClicked => {
-                if let Some(ref disk_path) = self.selected_disk_path {
-                    let disk_path = disk_path.clone();
+                if let Some(index) = self.selected_disk_index {
+                    let disk_path = self.disks[index].path.clone();
                     let secure_boot = if self.secure_boot { Some(true) } else { Some(false) };
                     self.status = String::from("Updating...");
 
@@ -158,8 +164,8 @@ impl ChoosableApp {
                 self.status = String::from("No disk selected.");
             }
             Message::ListClicked => {
-                if let Some(ref disk_path) = self.selected_disk_path {
-                    let disk_path = disk_path.clone();
+                if let Some(index) = self.selected_disk_index {
+                    let disk_path = self.disks[index].path.clone();
                     self.status = String::from("Reading info...");
 
                     return Task::perform(
@@ -180,9 +186,9 @@ impl ChoosableApp {
             text("No disks found. Click Refresh to scan.").into()
         } else {
             let entries: Vec<String> = self.disks.iter().map(|d| d.to_string()).collect();
-            let selected = self.selected_disk_path.clone().unwrap_or_default();
+            let selected = self.selected_disk_index.and_then(|i| entries.get(i)).cloned();
 
-            pick_list(entries, Some(selected), Message::SelectDisk)
+            pick_list(entries, selected, Message::SelectDisk)
                 .placeholder("Select a disk...")
                 .width(Length::Fill)
                 .into()
@@ -284,7 +290,13 @@ async fn run_install(
 
     match result {
         Ok(()) => String::from("Installation completed successfully!"),
-        Err(e) => format!("Installation failed: {}", e),
+        Err(e) => {
+            let mut msg = format!("Installation failed: {}", e);
+            if format!("{}", e).contains("Permission denied") {
+                msg.push_str("\nHint: Run Choosable with sudo (sudo choosable) to get disk access.");
+            }
+            msg
+        }
     }
 }
 
