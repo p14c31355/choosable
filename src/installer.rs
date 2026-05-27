@@ -189,7 +189,7 @@ pub fn non_destructive_install(disk_path: &str, label: &str, fs_type: Filesystem
 
     if !secure_boot {
         std::thread::sleep(std::time::Duration::from_secs(1));
-        process_secure_boot_esp(disk_path, part2_start_sector, false)?;
+        process_secure_boot_esp(disk_path, part2_start_sector * SECTOR_SIZE, false)?;
     }
 
     notify_kernel(disk_path);
