@@ -216,13 +216,8 @@ pub fn detect_choosable(disk_path: &str, _size_bytes: u64) -> Result<(bool, Opti
 
         let expected = ['C' as u16, 'Z' as u16, 'B' as u16, 'L' as u16, 'E' as u16, 'F' as u16, 'I' as u16];
         // Use raw ptr arithmetic for packed struct (name field at offset 56)
-        let entry_ptr = &gpt.partitions[1] as *const GptPartitionEntry as *const u8;
-        let name_ptr = unsafe { entry_ptr.add(56) as *const u16 };
-        let mut name_arr = [0u16; 36];
-        for i in 0..36 {
-            name_arr[i] = unsafe { std::ptr::read_unaligned(name_ptr.add(i)) };
-        }
-        if name_arr[..7] != expected {
+        let name_ptr = std::ptr::addr_of!(gpt.partitions[1].name);
+        let name_arr = unsafe { std::ptr::read_unaligned(name_ptr) };
             return Ok((false, None, None, None, mbr));
         }
 
