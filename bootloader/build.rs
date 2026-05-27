@@ -138,24 +138,47 @@ fn build_mbr_boot_sector() -> Vec<u8> {
     c.jmp_far(0x0000, 0x061E_u16);
     while c.offset() < 0x001E { c.nop(); }
     c.sti();
-    let dn: u16 = 0x07B0; let ul: u16 = 0x07B1;
-    let dsc: u16 = 0x07C2; let dll: u16 = 0x07C8; let da: u16 = 0x07C0;
+    let dn: u16 = 0x07B0;
+    let ul: u16 = 0x07B1;
+    let dsc: u16 = 0x07C2;
+    let dll: u16 = 0x07C8;
+    let da: u16 = 0x07C0;
+    let cookie_addr: u16 = 0x7DF0;
+
     c.mov_mem8_dl(dn);
+
+    // ══ Check boot cookie at 0x7DF0 ═════════════════════════════════
+    // If "BOOT" magic (0x544F4F42) is present, jump directly to 0x7C00
+    // This is a warm reboot from the kernel after loading an ISO boot image.
+    // MOV EAX, [cookie_addr]  (32-bit load: 66 A1 + addr16)
+    c.emit(0x66).emit(0xA1).emit16(cookie_addr); // MOV EAX, [cookie_addr]
+    // CMP EAX, 0x544F4F42
+    c.emit(0x66).emit(0x3D).emit32(0x544F4F42u32); // CMP EAX, BOOT_COOKIE_MAGIC
+    let jne_normal = c.jne_ph();
+    // Boot cookie found! DL already has disk number. Jump to 0x7C00.
+    // First clear the cookie so subsequent resets don't loop
+    c.emit(0x66).emit(0xC7).emit(0x06).emit16(cookie_addr).emit32(0); // MOV DWORD [cookie], 0
+    c.mov_dl_mem16(dn); // restore DL (may have been clobbered)
+    c.jmp_far(0x0000, 0x7C00);
+
+    // ── Normal boot path ────────────────────────────────────────────
+    c.patch_rel8_here(jne_normal);
+
     c.mov_ah(0x41); c.mov_bx(0x55AA); c.int(0x13);
     let j1=c.jc_ph(); c.cmp_bx(0xAA55); let j2=c.jne_ph(); c.test_cl(0x01); let j3=c.jz_ph();
     c.mov_mem8_imm8(ul, 1);
-    let nl=c.label(); c.patch_rel8_here(j1); c.patch_rel8_here(j2); c.patch_rel8_here(j3);
+    c.patch_rel8_here(j1); c.patch_rel8_here(j2); c.patch_rel8_here(j3);
     c.mov_mem32_imm32(dll,1); c.mov_mem16_imm16(dsc,127);
     c.cmp_mem8_imm8(ul,1); let j4=c.jne_ph();
-    let lr=c.label(); c.mov_ah(0x42); c.mov_dl_mem16(dn); c.mov_si(da); c.int(0x13);
+    c.mov_ah(0x42); c.mov_dl_mem16(dn); c.mov_si(da); c.int(0x13);
     let j5=c.jnc_ph(); c.shr_mem16_1(dsc); let j6=c.jne_ph();
-    let ch=c.label(); c.patch_rel8_here(j4); c.mov_si(0x07B2);
+    c.patch_rel8_here(j4); c.mov_si(0x07B2);
     let cp=c.call_rel16_ph(); let crp=c.offset(); c.jmp_short(-2i8);
     c.patch_rel8_here(j6);
-    let lo=c.label(); c.patch_rel8_here(j5); c.mov_dl_mem16(dn); c.jmp_far(0x0000,0x7E00);
+    c.patch_rel8_here(j5); c.mov_dl_mem16(dn); c.jmp_far(0x0000,0x7E00);
     let pl=c.label(); let ci=crp-2;
     c.bytes[ci as usize+1]=(pl-crp) as u8; c.bytes[ci as usize+2]=((pl-crp)>>8) as u8;
-    c.pusha(); let pp=c.label(); c.mov_ah(0x0E); c.xor_bx_bx(); c.lodsb(); c.test_al_al();
+    c.pusha(); c.mov_ah(0x0E); c.xor_bx_bx(); c.lodsb(); c.test_al_al();
     let pz=c.jz_ph(); c.int(0x10); c.jmp_short(-9i8); c.popa(); c.ret(); c.patch_rel8_here(pz);
     while c.bytes.len()<440 { c.emit(0x00); }
     c.bytes

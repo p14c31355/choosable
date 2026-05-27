@@ -377,37 +377,166 @@ fn show_menu(files: &[DirEntry], count: usize, part_lba: u32, info: &ExfatInfo) 
     }
 }
 
-fn boot_iso(file: &DirEntry, _part_lba: u32, info: &ExfatInfo) -> ! {
-    // Read first sectors of the ISO to check for El Torito boot catalog
+/// El Torito Boot Record offsets (sector 17 in ISO9660)
+const ET_BOOT_RECORD_SECTOR: u64 = 17;
+
+/// Physical address where MBR was loaded (BIOS convention)
+const BIOS_BOOT_ADDR: u32 = 0x7C00;
+
+/// Boot cookie address and magic value
+const BOOT_COOKIE_ADDR: u32 = 0x7DF0;
+const BOOT_COOKIE_MAGIC: u32 = 0x544F4F42; // "BOOT" (little-endian)
+
+/// Read `sector_count` sectors starting at ISO cluster offset `cluster_lba` into a physical buffer
+fn read_iso_sectors(cluster_lba: u64, mut target_phys: u32, sector_count: u32) -> bool {
     let mut buf = [0u8; 512];
-    let sectors = file.file_size / 512;
+    for i in 0..sector_count {
+        if !ata_read_sector((cluster_lba + i as u64) as u32, &mut buf) {
+            return false;
+        }
+        // Copy to physical memory (stage2 identity-maps low 1GB, so phys == virt)
+        let dst = target_phys as *mut u8;
+        for j in 0..512 {
+            unsafe { *dst.add(j) = buf[j]; }
+        }
+        target_phys += 512;
+    }
+    true
+}
 
+fn boot_iso(file: &DirEntry, _part_lba: u32, info: &ExfatInfo) -> ! {
     vga_clear(0x0E);
-    vga_print(2, 10, b"Loading ISO...", 0x0F);
+    vga_print(2, 5, b"Loading ISO boot sector...", 0x0F);
 
-    // Read ISO sector 16 (PVD - Primary Volume Descriptor, sector 16)
-    // Actually we need sector 17 for the Boot Record Volume Descriptor if El Torito
-    // For now, just halt — chainloading requires real-mode far jump which we can't do in long mode.
-    // We need the stage2 trampoline to handle the actual boot jump.
-    // Store boot info at a fixed physical address and trigger a reset to stage2.
-    let phys_info_addr: *mut u8 = 0x8000 as *mut u8;
+    // Calculate the starting LBA of the ISO file on disk
+    let iso_start_lba = info.cluster_heap_offset_sectors
+        + (file.start_cluster as u64 - 2) * (info.cluster_size_bytes as u64 / 512);
 
-    // Store: [2 bytes: sector count for boot] [4 bytes: LBA of ISO boot image]
-    // This is communicated to stage2 trampoline on reboot
-    unsafe {
-        // Placeholder: write the file's start cluster info
-        let boot_lba = info.cluster_heap_offset_sectors
-            + (file.start_cluster as u64 - 2) * (info.cluster_size_bytes as u64 / 512);
+    // Step 1: Read El Torito Boot Record (sector 17 of the ISO)
+    // El Torito Boot Record is at byte 0x8000 in an ISO 9660 image (assuming 2048-byte sectors)
+    // Wait -- our ISO is stored as raw bytes in exFAT, so sectors are 512 bytes.
+    // ISO9660 Primary Volume Descriptor is at logical sector 16 (16 * 2048 bytes).
+    // With 512-byte sectors, that's at offset 16 * 2048 / 512 = 64 sectors into the file.
+    // The Boot Record is at sector 17 of the ISO = offset 17 * 2048 / 512 = 68 sectors.
+    // Actually, the El Torito Boot Record sits at ISO9660 sector 17 (after PVD at sector 16).
+    // Since ISO9660 sectors are 2048 bytes, and we use 512-byte sectors:
+    let pvd_lba = iso_start_lba + 16 * 4; // PVD at ISO sector 16 → 16*4 = 64 of our sectors
+    let boot_record_lba = iso_start_lba + 17 * 4; // Boot Record at ISO sector 17 → 17*4 = 68 of our sectors
 
-        // We can't boot from long mode directly — we need to switch back to real mode
-        // and invoke INT 13h or do an El Torito chainload.
-        // For now: print info and halt
+    // Read PVD to get the root directory info (needed for file access, but we skip that)
+    // Read El Torito Boot Record
+    let mut boot_rec = [0u8; 512];
+    if !ata_read_sector(boot_record_lba as u32, &mut boot_rec) {
+        vga_print(4, 2, b"Failed to read El Torito Boot Record.", 0x0C);
+        kbd_wait_key();
+        show_menu(&[], 0, 0, info);
     }
 
-    vga_print(4, 5, b"ISO selected. Boot from real-mode not yet implemented.", 0x0F);
-    vga_print(6, 10, b"Press any key to return to menu...", 0x07);
-    kbd_wait_key();
-    show_menu(&[], 0, 0, info); // will rescan
+    // Validate Boot Record signature (offset 0 in the 2048-byte sector = offset 0 in our 512-byte * 4)
+    // Boot Record Validation Entry starts at offset 0 → identifier byte 0 = 0x01
+    // Wait, we read 512 bytes, but the 2048-byte Boot Record has multiple fields.
+    // The first sector (512 bytes) of the Boot Record contains the Validation Entry at offset 0.
+    if boot_rec[0] != 0x01 {
+        vga_print(4, 2, b"Invalid Boot Record identifier (expected 0x01).", 0x0C);
+        kbd_wait_key();
+        show_menu(&[], 0, 0, info);
+    }
+
+    // Validation Entry: offset 0x47 (71) = Boot Catalog LBA (4 bytes)
+    // Wait, the El Torito spec:
+    // Byte 0: Header ID (0x01)
+    // Bytes 0x47-0x4A: Absolute pointer to Boot Catalog (LBA in ISO9660 sectors)
+    let catalog_iso_lba = u32::from_le_bytes([boot_rec[0x47], boot_rec[0x48], boot_rec[0x49], boot_rec[0x4A]]);
+    // Convert ISO9660 LBA to our 512-byte sector LBA
+    let catalog_lba = iso_start_lba + catalog_iso_lba as u64 * 4;
+
+    vga_print(3, 5, b"El Torito catalog at LBA: ", 0x07);
+    let mut lba_str = [0u8; 20];
+    let lba_slice = format_u64(catalog_lba, &mut lba_str);
+    vga_print(3, 30, lba_slice, 0x0A);
+
+    // Step 2: Read Boot Catalog to find the default boot entry
+    let mut catalog = [0u8; 512];
+    if !ata_read_sector(catalog_lba as u32, &mut catalog) {
+        vga_print(5, 2, b"Failed to read Boot Catalog.", 0x0C);
+        kbd_wait_key();
+        show_menu(&[], 0, 0, info);
+    }
+
+    // Boot Catalog:
+    // Byte 0: Header ID (0x01)
+    // Byte 1: Platform ID (0 = 80x86)
+    // Bytes 0x1E: Checksum word
+    // Then entry records at offset 32 (0x20):
+    //   Byte 0: Boot Indicator (0x88 = bootable)
+    //   Byte 1: Boot media type (0 = no emulation)
+    //   Bytes 8-11: Load segment (or 0 for default 0x7C0)
+    //   Bytes 28-31: Start LBA of boot image (in ISO9660 sectors)
+
+    // Find the first default entry (0x88)
+    let mut boot_image_iso_lba: u32 = 0;
+    let mut boot_sector_count: u16 = 1;
+    let mut boot_load_seg: u16 = 0x07C0; // default: 0x7C0:0x0000 = phys 0x7C00
+
+    let mut found = false;
+    for i in 0..(512 / 32) {
+        let off = i * 32;
+        if catalog[off] == 0x88 { // Bootable entry
+            let media_type = catalog[off + 1];
+            boot_load_seg = u16::from_le_bytes([catalog[off + 8], catalog[off + 9]]);
+            if boot_load_seg == 0 { boot_load_seg = 0x07C0; }
+            boot_sector_count = u16::from_le_bytes([catalog[off + 12], catalog[off + 13]]);
+            // Sector count: if 0, use the full emulated size
+            if boot_sector_count == 0 { boot_sector_count = 4; } // default 4 emulated sectors (2048 bytes)
+            boot_image_iso_lba = u32::from_le_bytes([catalog[off + 28], catalog[off + 29], catalog[off + 30], catalog[off + 31]]);
+
+            vga_print(4, 5, b"Found boot entry, type: ", 0x07);
+            vga_print_byte(media_type, 4, 27, 0x0A);
+            vga_print(5, 5, b"Boot image sectors: ", 0x07);
+            let mut sc_str = [0u8; 20];
+            let sc_slice = format_u64(boot_sector_count as u64, &mut sc_str);
+            vga_print(5, 25, sc_slice, 0x0A);
+
+            found = true;
+            break;
+        }
+    }
+
+    if !found {
+        vga_print(5, 2, b"No bootable El Torito entry found.", 0x0C);
+        kbd_wait_key();
+        show_menu(&[], 0, 0, info);
+    }
+
+    // Step 3: Read boot image into physical memory at 0x7C00
+    let boot_image_lba = iso_start_lba + boot_image_iso_lba as u64 * 4;
+
+    vga_print(7, 5, b"Loading boot image to 0x7C00...", 0x07);
+    vga_print(8, 5, b"Boot image LBA: ", 0x07);
+    let mut bi_str = [0u8; 20];
+    let bi_slice = format_u64(boot_image_lba, &mut bi_str);
+    vga_print(8, 21, bi_slice, 0x0A);
+
+    if !read_iso_sectors(boot_image_lba, BIOS_BOOT_ADDR, boot_sector_count as u32) {
+        vga_print(10, 2, b"Failed to read boot image.", 0x0C);
+        kbd_wait_key();
+        show_menu(&[], 0, 0, info);
+    }
+
+    // Step 4: Set boot cookie and warm-reboot
+    vga_print(10, 5, b"Setting boot cookie and rebooting...", 0x0F);
+
+    // Write boot cookie magic at 0x7DF0
+    let cookie_ptr = BOOT_COOKIE_ADDR as *mut u32;
+    unsafe { *cookie_ptr = BOOT_COOKIE_MAGIC; }
+
+    // Trigger keyboard controller reset (warm boot)
+    // Wait for keyboard controller to be ready
+    while inb(0x64) & 2 != 0 { unsafe { core::arch::asm!("pause") } }
+    outb(0x64, 0xFE); // Pulse CPU reset line
+
+    // If reset fails, halt
+    loop { unsafe { core::arch::asm!("hlt") } }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
