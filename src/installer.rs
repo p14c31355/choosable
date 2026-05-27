@@ -221,9 +221,10 @@ fn run_cmd(cmd: &str, args: &[&str]) -> Result<()> {
 }
 
 /// 4KB alignment helper
+/// 4KB alignment helper (aligns up to prevent partition overlap)
 fn align_to_4k(sector: u64) -> u64 {
     let m = sector % 8;
-    if m > 0 { sector - m } else { sector }
+    if m > 0 { sector + (8 - m) } else { sector }
 }
 
 fn find_next_partition_start(disk_path: &str, mbr: &Mbr, is_gpt: bool, disk_size_bytes: u64) -> Result<u64> {
