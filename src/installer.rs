@@ -796,12 +796,13 @@ fn decompress_xz(data: &[u8]) -> Result<Vec<u8>> {
         .spawn()
         .map_err(|_| ChoosableError::ToolNotFound("xzcat".to_string()))?;
 
-    if let Some(mut stdin) = child.stdin.take() {
-        let data_clone = data.to_vec();
-        std::thread::spawn(move || {
-            let _ = stdin.write_all(&data_clone);
-        });
-    }
+    std::thread::scope(|s| {
+        if let Some(mut stdin) = child.stdin.take() {
+            s.spawn(move || {
+                let _ = stdin.write_all(data);
+            });
+        }
+    });
 
     let output = child.wait_with_output().map_err(|e| ChoosableError::Generic(format!("xzcat: {}", e)))?;
     if !output.status.success() {
