@@ -46,7 +46,7 @@ pub const CHOOSABLE_FILE_LOG: &str = "log.txt";
 
 /// GPT partition names
 pub const GPT_PART1_NAME: &[u16] = &[
-    'V' as u16, 'T' as u16, 'O' as u16, 'Y' as u16, 'E' as u16, 'F' as u16, 'I' as u16,
+    'C' as u16, 'Z' as u16, 'B' as u16, 'L' as u16, 'E' as u16, 'F' as u16, 'I' as u16,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
