@@ -313,7 +313,7 @@ fn fill_mbr_chs_entry(entry: &mut PartitionTableEntry, _disk_size_bytes: u64, st
     entry.start_head = head as u8;
     entry.start_sector_cylinder = ((cylinder as u16 & 0x3FF) << 6) | ((sector as u16) & 0x3F);
 
-    let end_lba = start_sector + sector_count - 1;
+    let end_lba = start_sector + sector_count.saturating_sub(1);
     let ecylinder = end_lba / 255 / nsector;
     let ehead = (end_lba / nsector) % 255;
     let esector = (end_lba % nsector) + 1;
