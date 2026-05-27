@@ -1,0 +1,21 @@
+[package]
+name = "choosable-kernel"
+version = "0.1.0"
+edition = "2021"
+description = "Stage2 kernel — ISO scanner, boot menu, chainloader (x86_64-unknown-none)"
+
+[dependencies]
+
+[profile.dev]
+panic = "abort"
+opt-level = "s"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1
+
+[[bin]]
+name = "choosable-kernel"
+path = "src/main.rs"
