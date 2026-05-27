@@ -1,0 +1,12 @@
+[package]
+name = "choosable-bootloader"
+version = "0.1.0"
+edition = "2021"
+description = "Bootloader binaries for Choosable (MBR stage1, BIOS stage2, EFI)"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+
+[lib]
+name = "bootloader"
+path = "src/lib.rs"

@@ -767,19 +767,18 @@ fn format_partition(partition: &str, label: &str, fs_type: FilesystemType) -> Re
 
 fn write_boot_images(disk: &mut std::fs::File, is_gpt: bool, _part2_start_sector: u64) -> Result<()> {
     println!("Writing boot images...");
-    let boot_img = read_install_file(CHOOSABLE_FILE_BOOT_IMG)?;
-    let boot_code_len = std::cmp::min(boot_img.len(), 446);
+    let boot_img = bootloader::BOOT_IMG;
+    let boot_code_len = std::cmp::min(boot_img.len(), 440);
     disk.seek(SeekFrom::Start(0))?;
     disk.write_all(&boot_img[..boot_code_len])?;
 
+    let core = bootloader::STAGE2_BIN;
     if is_gpt {
         disk.seek(SeekFrom::Start(92))?; disk.write_all(&[0x22])?;
-        let core = decompress_xz(&read_install_file(CHOOSABLE_FILE_STG1_IMG)?)?;
         let len = std::cmp::min(core.len(), 2014 * 512);
         disk.seek(SeekFrom::Start(34 * 512))?; disk.write_all(&core[..len])?;
         disk.seek(SeekFrom::Start(17908))?; disk.write_all(&[0x23])?;
     } else {
-        let core = decompress_xz(&read_install_file(CHOOSABLE_FILE_STG1_IMG)?)?;
         let len = std::cmp::min(core.len(), 2047 * 512);
         disk.seek(SeekFrom::Start(1 * 512))?; disk.write_all(&core[..len])?;
     }
@@ -789,11 +788,10 @@ fn write_boot_images(disk: &mut std::fs::File, is_gpt: bool, _part2_start_sector
 }
 
 fn write_disk_image_raw(disk: &mut std::fs::File, part2_start_sector: u64) -> Result<()> {
-    let disk_img_xz = read_install_file(CHOOSABLE_FILE_DISK_IMG)?;
-    let decompressed = decompress_xz(&disk_img_xz)?;
-    let len = std::cmp::min(decompressed.len(), (CHOOSABLE_SECTOR_NUM * 512) as usize);
+    let efi_img = bootloader::EFI_BIN;
+    let len = std::cmp::min(efi_img.len(), (CHOOSABLE_SECTOR_NUM * 512) as usize);
     disk.seek(SeekFrom::Start(part2_start_sector * 512))?;
-    disk.write_all(&decompressed[..len])?;
+    disk.write_all(&efi_img[..len])?;
     disk.flush()?;
     Ok(())
 }
@@ -884,7 +882,7 @@ pub fn update_choosable(disk_path: &str, secure_boot: Option<bool>, yes: bool) -
     let mut diskuuid = [0u8; 16];
     disk.seek(SeekFrom::Start(384))?; disk.read_exact(&mut diskuuid)?;
 
-    let boot_img = read_install_file(CHOOSABLE_FILE_BOOT_IMG)?;
+    let boot_img = bootloader::BOOT_IMG;
     let boot_code_len = std::cmp::min(boot_img.len(), 440);
     disk.seek(SeekFrom::Start(0))?; disk.write_all(&boot_img[..boot_code_len])?;
     disk.seek(SeekFrom::Start(384))?; disk.write_all(&diskuuid)?;
@@ -896,7 +894,7 @@ pub fn update_choosable(disk_path: &str, secure_boot: Option<bool>, yes: bool) -
 
     if is_gpt {
         disk.seek(SeekFrom::Start(92))?; disk.write_all(&[0x22])?;
-        let core = decompress_xz(&read_install_file(CHOOSABLE_FILE_STG1_IMG)?)?;
+        let core = bootloader::STAGE2_BIN;
         let len = std::cmp::min(core.len(), 2014 * 512);
         disk.seek(SeekFrom::Start(34 * 512))?; disk.write_all(&core[..len])?;
         disk.seek(SeekFrom::Start(17908))?; disk.write_all(&[0x23])?;
@@ -905,7 +903,7 @@ pub fn update_choosable(disk_path: &str, secure_boot: Option<bool>, yes: bool) -
             disk.seek(SeekFrom::Start(446))?; disk.write_all(&[PART_ACTIVE])?;
             disk.seek(SeekFrom::Start(462))?; disk.write_all(&[PART_INACTIVE])?;
         }
-        let core = decompress_xz(&read_install_file(CHOOSABLE_FILE_STG1_IMG)?)?;
+        let core = bootloader::STAGE2_BIN;
         let len = std::cmp::min(core.len(), 2047 * 512);
         disk.seek(SeekFrom::Start(1 * 512))?; disk.write_all(&core[..len])?;
     }
@@ -913,9 +911,9 @@ pub fn update_choosable(disk_path: &str, secure_boot: Option<bool>, yes: bool) -
     disk.seek(SeekFrom::Start(2040 * 512))?; disk.write_all(&rsv_data)?;
     disk.flush()?;
 
-    let disk_img = decompress_xz(&read_install_file(CHOOSABLE_FILE_DISK_IMG)?)?;
-    let len = std::cmp::min(disk_img.len(), (CHOOSABLE_SECTOR_NUM * 512) as usize);
-    disk.seek(SeekFrom::Start(part2_start))?; disk.write_all(&disk_img[..len])?;
+    let efi_img = bootloader::EFI_BIN;
+    let len = std::cmp::min(efi_img.len(), (CHOOSABLE_SECTOR_NUM * 512) as usize);
+    disk.seek(SeekFrom::Start(part2_start))?; disk.write_all(&efi_img[..len])?;
     disk.flush()?;
 
     if !use_secure_boot {

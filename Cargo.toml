@@ -23,6 +23,7 @@ env_logger = "0.11.10"
 fatfs = "0.3.6"
 crc32fast = "1.5.0"
 iced = "0.13.1"
+choosable-bootloader = { path = "bootloader" }
 
 [features]
 default = ["linux"]
