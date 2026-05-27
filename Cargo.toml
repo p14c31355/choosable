@@ -2,5 +2,15 @@
 name = "choosable"
 version = "0.1.0"
 edition = "2024"
+description = "A pure Rust implementation of Ventoy - create bootable USB drives for ISO/WIM/IMG/VHD(x)/EFI files"
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+thiserror = "1"
+log = "0.4"
+env_logger = "0.11"
+
+[features]
+default = ["linux"]
+linux = []
