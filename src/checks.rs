@@ -90,14 +90,8 @@ pub fn check_umount_disk(disk_path: &str) -> Result<()> {
 /// Check that required tools work
 pub fn check_tool_work_ok() -> Result<()> {
     // Check hexdump
-    let child = std::process::Command::new("echo")
-        .arg("1")
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|_| ChoosableError::ToolNotFound("echo".to_string()))?;
-
     let hexdump = std::process::Command::new("hexdump")
-        .stdin(child.stdout.unwrap())
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
