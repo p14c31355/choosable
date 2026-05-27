@@ -158,10 +158,10 @@ impl GptHeader {
         Ok(header)
     }
 
-    /// Write GPT header to a writer at current position
+    /// Write GPT header to a writer at current position (full 512-byte sector)
     pub fn write<W: Write>(&self, writer: &mut W) -> Result<()> {
         let ptr = self as *const GptHeader as *const u8;
-        let bytes = unsafe { std::slice::from_raw_parts(ptr, 92) };
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, 512) };
         writer.write_all(bytes)?;
         Ok(())
     }

@@ -170,12 +170,6 @@ pub fn enumerate_disks() -> Result<Vec<PhyDriveInfo>> {
     Ok(disks)
 }
 
-/// Safe helper: check if MBR is GPT-protective without packed struct field ref
-pub fn read_mbr_is_gpt(mbr: &Mbr) -> bool {
-    let fs_flag_ptr = std::ptr::addr_of!(mbr.partitions[0].fs_flag);
-    unsafe { std::ptr::read_unaligned(fs_flag_ptr) == PART_TYPE_GPT_PROTECTIVE }
-}
-
 /// Read the MBR from a disk
 pub fn read_mbr(disk_path: &str) -> Result<Mbr> {
     let mut file = std::fs::OpenOptions::new()
@@ -199,7 +193,7 @@ pub fn detect_choosable(disk_path: &str, _size_bytes: u64) -> Result<(bool, Opti
         Err(e) => return Err(e),
     };
 
-    if read_mbr_is_gpt(&mbr) {
+    if mbr.is_gpt_protective() {
         let gpt = GptInfo::read_from_disk(&mut file)?;
 
         if gpt.partitions[0].start_lba != CHOOSABLE_PART1_START_SECTOR {
@@ -216,8 +210,13 @@ pub fn detect_choosable(disk_path: &str, _size_bytes: u64) -> Result<(bool, Opti
 
         let expected = ['C' as u16, 'Z' as u16, 'B' as u16, 'L' as u16, 'E' as u16, 'F' as u16, 'I' as u16];
         // Use raw ptr arithmetic for packed struct (name field at offset 56)
-        let name_ptr = std::ptr::addr_of!(gpt.partitions[1].name);
-        let name_arr = unsafe { std::ptr::read_unaligned(name_ptr) };
+        let entry_ptr = &gpt.partitions[1] as *const GptPartitionEntry as *const u8;
+        let name_ptr = unsafe { entry_ptr.add(56) as *const u16 };
+        let mut name_arr = [0u16; 36];
+        for i in 0..36 {
+            name_arr[i] = unsafe { std::ptr::read_unaligned(name_ptr.add(i)) };
+        }
+        if name_arr[..7] != expected {
             return Ok((false, None, None, None, mbr));
         }
 
@@ -246,12 +245,19 @@ pub fn detect_choosable(disk_path: &str, _size_bytes: u64) -> Result<(bool, Opti
     }
 }
 
-/// PartitionSlice: wraps a file to expose a sub-range as a standalone Read + Seek handle.
+/// PartitionSlice: wraps a file to expose a sub-range as a standalone Read + Write + Seek handle.
 /// Avoids loading the entire 32 MiB EFI partition into memory.
-struct PartitionSlice<R> {
+pub struct PartitionSlice<R> {
     inner: R,
     start_offset: u64,
     current_pos: u64,
+}
+
+impl<R: Read + Seek> PartitionSlice<R> {
+    /// Create a new PartitionSlice wrapping an existing reader, offsetting all seeks by `start_offset`.
+    pub fn new(inner: R, start_offset: u64) -> Self {
+        PartitionSlice { inner, start_offset, current_pos: 0 }
+    }
 }
 
 impl<R: Read + Seek> Read for PartitionSlice<R> {

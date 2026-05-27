@@ -97,7 +97,7 @@ pub fn non_destructive_install(disk_path: &str, label: &str, fs_type: Filesystem
     let part1_mb = (part1_sectors * SECTOR_SIZE) / SIZE_1MB;
 
     let mbr = read_mbr(disk_path)?;
-    let is_gpt = read_mbr_is_gpt(&mbr);
+    let is_gpt = mbr.is_gpt_protective();
 
     println!("Disk : {}", disk_path);
     println!("Model: {}", model);
@@ -490,45 +490,45 @@ pub fn process_secure_boot_esp(disk_path: &str, part2_start_byte: u64, enable_se
     file.seek(SeekFrom::Start(part2_start_byte))?;
     file.read_exact(&mut buf)?;
 
-    let rw_buf = {
-        let mut rw = buf.clone();
-        {
-            let cursor = Cursor::new(&mut rw[..]);
-            let fs = match fatfs::FileSystem::new(cursor, fatfs::FsOptions::new()) {
-                Ok(fs) => fs, Err(_) => return Ok(()),
-            };
-            let root = fs.root_dir();
+    let mut modified = false;
+    {
+        let cursor = Cursor::new(&mut buf[..]);
+        let fs = match fatfs::FileSystem::new(cursor, fatfs::FsOptions::new()) {
+            Ok(fs) => fs, Err(_) => return Ok(()),
+        };
+        let root = fs.root_dir();
 
-            let has_sb = if let Ok(efi) = root.open_dir("EFI") {
+        let has_sb = if let Ok(efi) = root.open_dir("EFI") {
+            if let Ok(boot) = efi.open_dir("BOOT") {
+                boot.iter().any(|e| {
+                    if let Ok(entry) = e { entry.file_name() == "grubx64_real.efi" } else { false }
+                })
+            } else { false }
+        } else { false };
+
+        if has_sb {
+            println!("Disabling Secure Boot (renaming EFI files)...");
+            if let Ok(efi) = root.open_dir("EFI") {
                 if let Ok(boot) = efi.open_dir("BOOT") {
-                    boot.iter().any(|e| {
-                        if let Ok(entry) = e { entry.file_name() == "grubx64_real.efi" } else { false }
-                    })
-                } else { false }
-            } else { false };
-
-            if has_sb {
-                println!("Disabling Secure Boot (renaming EFI files)...");
-                if let Ok(efi) = root.open_dir("EFI") {
-                    if let Ok(boot) = efi.open_dir("BOOT") {
-                        let _ = boot.rename("grubx64_real.efi", &boot, "BOOTX64.EFI");
-                        let _ = boot.rename("grubia32_real.efi", &boot, "BOOTIA32.EFI");
-                        let _ = boot.remove("grubx64.efi");
-                        let _ = boot.remove("MokManager.efi");
-                        let _ = boot.remove("mmx64.efi");
-                        let _ = boot.remove("grubia32.efi");
-                        let _ = boot.remove("mmia32.efi");
-                    }
+                    let _ = boot.rename("grubx64_real.efi", &boot, "BOOTX64.EFI");
+                    let _ = boot.rename("grubia32_real.efi", &boot, "BOOTIA32.EFI");
+                    let _ = boot.remove("grubx64.efi");
+                    let _ = boot.remove("MokManager.efi");
+                    let _ = boot.remove("mmx64.efi");
+                    let _ = boot.remove("grubia32.efi");
+                    let _ = boot.remove("mmia32.efi");
                 }
-                let _ = root.remove("ENROLL_THIS_KEY_IN_MOKMANAGER.cer");
             }
+            let _ = root.remove("ENROLL_THIS_KEY_IN_MOKMANAGER.cer");
+            modified = true;
         }
-        rw
-    };
+    }
 
-    file.seek(SeekFrom::Start(part2_start_byte))?;
-    file.write_all(&rw_buf)?;
-    file.flush()?;
+    if modified {
+        file.seek(SeekFrom::Start(part2_start_byte))?;
+        file.write_all(&buf)?;
+        file.flush()?;
+    }
 
     notify_kernel(disk_path);
     Ok(())
@@ -949,18 +949,14 @@ pub fn list_choosable(disk_path: &str) -> Result<()> {
 }
 
 fn check_choosable_secure_boot(disk_path: &str, part2_start_byte: u64) -> bool {
-    use std::io::Cursor;
-    let file = match std::fs::OpenOptions::new().read(true).open(disk_path) {
+    let mut file = match std::fs::OpenOptions::new().read(true).open(disk_path) {
         Ok(f) => f, Err(_) => return false,
     };
-    let partition_size = CHOOSABLE_EFI_PART_SIZE;
-    let mut buf = vec![0u8; partition_size as usize];
-    let mut file = file;
     if file.seek(SeekFrom::Start(part2_start_byte)).is_err() { return false; }
-    if file.read_exact(&mut buf).is_err() { return false; }
 
-    let cursor = Cursor::new(buf);
-    let fs = match fatfs::FileSystem::new(cursor, fatfs::FsOptions::new()) {
+    let slice = PartitionSlice::new(file, part2_start_byte);
+
+    let fs = match fatfs::FileSystem::new(slice, fatfs::FsOptions::new()) {
         Ok(fs) => fs, Err(_) => return false,
     };
     let root = fs.root_dir();
