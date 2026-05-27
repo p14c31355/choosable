@@ -954,7 +954,7 @@ fn check_choosable_secure_boot(disk_path: &str, part2_start_byte: u64) -> bool {
     };
     if file.seek(SeekFrom::Start(part2_start_byte)).is_err() { return false; }
 
-    let slice = PartitionSlice::new(file, part2_start_byte);
+    let slice = PartitionSlice::new(file, part2_start_byte, CHOOSABLE_EFI_PART_SIZE);
 
     let fs = match fatfs::FileSystem::new(slice, fatfs::FsOptions::new()) {
         Ok(fs) => fs, Err(_) => return false,
