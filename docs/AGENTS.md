@@ -1,0 +1,1 @@
+choosable is a repository for a fully Rust-compatible implementation of Ventoy. Dependency crates are selectable.
