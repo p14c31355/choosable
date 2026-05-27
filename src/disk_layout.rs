@@ -149,7 +149,7 @@ impl GptHeader {
         let header: GptHeader = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const GptHeader) };
 
         // Validate signature (read via raw pointer to avoid unaligned ref)
-        let sig_ptr = &header.signature as *const [u8; 8];
+        let sig_ptr = std::ptr::addr_of!(header.signature);
         let sig = unsafe { std::ptr::read_unaligned(sig_ptr) };
         if &sig != GPT_SIGNATURE {
             return Err(ChoosableError::InvalidGptSignature);
