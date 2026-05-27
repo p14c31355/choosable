@@ -1,8 +1,14 @@
 [package]
 name = "choosable"
-version = "0.0.1"
-edition = "2024"
-description = "Create bootable USB drives for ISO/WIM/IMG/VHD(x)/EFI files"
+version = "0.1.0"
+edition = "2021"
+description = "A pure Rust tool for creating bootable USB drives for ISO/WIM/IMG/VHD(x)/EFI files"
+authors = ["The Choosable Authors"]
+repository = "https://github.com/p14c31355/choosable"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+keywords = ["bootable", "usb", "iso", "mbr", "gpt", "uefi"]
+categories = ["command-line-utilities", "filesystem"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
