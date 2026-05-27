@@ -191,7 +191,13 @@ pub fn detect_choosable(disk_path: &str, _size_bytes: u64) -> Result<(bool, Opti
         .read(true)
         .open(disk_path)?;
 
-    let mbr = Mbr::read(&mut file)?;
+    let mbr = match Mbr::read(&mut file) {
+        Ok(m) => m,
+        Err(ChoosableError::InvalidMbrSignature(_, _)) => {
+            return Ok((false, None, None, None, Mbr::new_empty()));
+        }
+        Err(e) => return Err(e),
+    };
 
     if read_mbr_is_gpt(&mbr) {
         let gpt = GptInfo::read_from_disk(&mut file)?;
@@ -208,9 +214,15 @@ pub fn detect_choosable(disk_path: &str, _size_bytes: u64) -> Result<(bool, Opti
             return Ok((false, None, None, None, mbr));
         }
 
-        let entry = &gpt.partitions[1];
         let expected = ['C' as u16, 'Z' as u16, 'B' as u16, 'L' as u16, 'E' as u16, 'F' as u16, 'I' as u16];
-        if entry.name[..7] != expected {
+        // Use raw ptr arithmetic for packed struct (name field at offset 56)
+        let entry_ptr = &gpt.partitions[1] as *const GptPartitionEntry as *const u8;
+        let name_ptr = unsafe { entry_ptr.add(56) as *const u16 };
+        let mut name_arr = [0u16; 36];
+        for i in 0..36 {
+            name_arr[i] = unsafe { std::ptr::read_unaligned(name_ptr.add(i)) };
+        }
+        if name_arr[..7] != expected {
             return Ok((false, None, None, None, mbr));
         }
 

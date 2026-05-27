@@ -53,15 +53,11 @@ pub fn finalize_gpt_crcs(gpt: &mut GptInfo) {
 /// Compute backup GPT header (swap primary/backup LBA, recalc CRC)
 pub fn make_backup_gpt_header(primary: &GptInfo) -> GptHeader {
     let mut backup = primary.header.clone();
-    // Use ptr arithmetic from struct base (efi_start_lba at +24, efi_backup_lba at +32)
-    let base = &backup as *const GptHeader as *const u8;
-    let efi_start: u64 = unsafe { std::ptr::read_unaligned(base.add(24) as *const u64) };
-    let efi_backup: u64 = unsafe { std::ptr::read_unaligned(base.add(32) as *const u64) };
-    let base_mut = &mut backup as *mut GptHeader as *mut u8;
-    unsafe {
-        std::ptr::write_unaligned(base_mut.add(24) as *mut u64, efi_backup);
-        std::ptr::write_unaligned(base_mut.add(32) as *mut u64, efi_start);
-    }
+    // Direct field access on packed struct — Rust handles unaligned access automatically
+    let efi_start = backup.efi_start_lba;
+    let efi_backup = backup.efi_backup_lba;
+    backup.efi_start_lba = efi_backup;
+    backup.efi_backup_lba = efi_start;
     backup.part_table_start_lba = efi_start + 1 - 33;
     backup.header_crc32 = 0;
     let header_bytes = unsafe {
@@ -423,21 +419,13 @@ pub fn fix_gpt_attributes(disk_path: &str) -> Result<()> {
 
     let mut gpt = GptInfo::read_from_disk(&mut disk)?;
 
-    // Read via raw ptr arithmetic (packed struct, name at +56, attributes at +48 within entry)
-    let entry_ptr = &gpt.partitions[1] as *const GptPartitionEntry as *const u8;
-    let name_ptr = unsafe { entry_ptr.add(56) as *const u16 };
-    let mut name_arr = [0u16; 36];
-    for i in 0..36 {
-        name_arr[i] = unsafe { std::ptr::read_unaligned(name_ptr.add(i)) };
-    }
-    let is_czblefi = name_arr[0] == 'C' as u16 && name_arr[1] == 'Z' as u16 && name_arr[2] == 'B' as u16 && name_arr[3] == 'L' as u16;
-
-    let attr_ptr = unsafe { entry_ptr.add(48) as *const u64 };
-    let current_attr: u64 = unsafe { std::ptr::read_unaligned(attr_ptr) };
+    let entry = &mut gpt.partitions[1];
+    let is_czblefi = entry.name[0] == 'C' as u16 && entry.name[1] == 'Z' as u16 && entry.name[2] == 'B' as u16 && entry.name[3] == 'L' as u16;
+    let current_attr = entry.attributes;
 
     if is_czblefi && current_attr != GPT_ATTR_CZBLEFI {
         println!("Fixing GPT attributes for CZBLEFI partition...");
-        unsafe { std::ptr::write_unaligned(attr_ptr as *mut u64, GPT_ATTR_CZBLEFI); }
+        entry.attributes = GPT_ATTR_CZBLEFI;
 
         // Recalculate CRCs and write
         finalize_gpt_crcs(&mut gpt);
@@ -797,11 +785,19 @@ fn write_disk_image_raw(disk: &mut std::fs::File, part2_start_sector: u64) -> Re
 
 fn decompress_xz(data: &[u8]) -> Result<Vec<u8>> {
     use std::process::{Command, Stdio};
+    use std::io::Write;
     let mut child = Command::new("xzcat")
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
         .spawn()
         .map_err(|_| ChoosableError::ToolNotFound("xzcat".to_string()))?;
-    if let Some(ref mut stdin) = child.stdin { stdin.write_all(data)?; }
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let data_clone = data.to_vec();
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&data_clone);
+        });
+    }
+
     let output = child.wait_with_output().map_err(|e| ChoosableError::Generic(format!("xzcat: {}", e)))?;
     if !output.status.success() {
         return Err(ChoosableError::Generic(String::from_utf8_lossy(&output.stderr).to_string()));

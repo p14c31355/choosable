@@ -13,7 +13,14 @@ pub fn check_swap(disk_path: &str) -> Result<()> {
         let stdout = String::from_utf8_lossy(&output.stdout);
         for line in stdout.lines() {
             if let Some(dev) = line.split_whitespace().next() {
-                if dev.starts_with(disk_path) {
+                let is_sub_dev = dev == disk_path || {
+                    if let Some(suffix) = dev.strip_prefix(disk_path) {
+                        suffix.chars().next().map_or(false, |c| c.is_ascii_digit() || c == 'p')
+                    } else {
+                        false
+                    }
+                };
+                if is_sub_dev {
                     return Err(ChoosableError::Generic(format!(
                         "{} is used as swap, please swapoff it first!", disk_path
                     )));
@@ -29,14 +36,23 @@ pub fn check_swap(disk_path: &str) -> Result<()> {
 pub fn check_umount_disk(disk_path: &str) -> Result<()> {
     if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
         for line in mounts.lines() {
-            if line.starts_with(disk_path) {
-                if let Some(mount_point) = line.split_whitespace().nth(1) {
-                    println!("Unmounting {} (was mounted at {})...", disk_path, mount_point);
-                    let _ = std::process::Command::new("umount")
-                        .arg(mount_point)
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status();
+            if let Some(dev) = line.split_whitespace().next() {
+                let is_sub_dev = dev == disk_path || {
+                    if let Some(suffix) = dev.strip_prefix(disk_path) {
+                        suffix.chars().next().map_or(false, |c| c.is_ascii_digit() || c == 'p')
+                    } else {
+                        false
+                    }
+                };
+                if is_sub_dev {
+                    if let Some(mount_point) = line.split_whitespace().nth(1) {
+                        println!("Unmounting {} (was mounted at {})...", dev, mount_point);
+                        let _ = std::process::Command::new("umount")
+                            .arg(mount_point)
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status();
+                    }
                 }
             }
         }
@@ -44,10 +60,21 @@ pub fn check_umount_disk(disk_path: &str) -> Result<()> {
 
     // Verify no mounts remain
     if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
-        if mounts.lines().any(|l| l.starts_with(disk_path)) {
-            return Err(ChoosableError::Generic(format!(
-                "{} is still mounted, please unmount it first!", disk_path
-            )));
+        for line in mounts.lines() {
+            if let Some(dev) = line.split_whitespace().next() {
+                let is_sub_dev = dev == disk_path || {
+                    if let Some(suffix) = dev.strip_prefix(disk_path) {
+                        suffix.chars().next().map_or(false, |c| c.is_ascii_digit() || c == 'p')
+                    } else {
+                        false
+                    }
+                };
+                if is_sub_dev {
+                    return Err(ChoosableError::Generic(format!(
+                        "{} is still mounted, please unmount it first!", disk_path
+                    )));
+                }
+            }
         }
     }
 
