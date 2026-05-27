@@ -162,12 +162,12 @@ pub fn non_destructive_install(disk_path: &str, label: &str, fs_type: Filesystem
         align_to_4k(part1_end - (CHOOSABLE_EFI_PART_SIZE / SECTOR_SIZE) + 1)
     };
 
-    println!("Writing partition table with new VTOYEFI partition...");
+    println!("Writing partition table with new CZBLEFI partition...");
     update_partition_table(disk_path, &mbr, is_gpt, size_bytes, part2_start_sector)?;
 
     let mut disk_file = open_disk_readwrite(disk_path)?;
 
-    // Format EFI partition (FAT16 "VTOYEFI")
+    // Format EFI partition (FAT16 "CZBLEFI")
     format_efi_partition(disk_path, 2)?;
 
     write_boot_images(&mut disk_file, is_gpt, part2_start_sector)?;
@@ -341,10 +341,10 @@ fn update_gpt_partition_table_f(disk: &mut std::fs::File, part2_start_sector: u6
     gpt.partitions[slot].unique_part_guid = generate_guid();
     gpt.partitions[slot].start_lba = part2_start_sector;
     gpt.partitions[slot].end_lba = part2_start_sector + efi_sectors - 1;
-    gpt.partitions[slot].attributes = GPT_ATTR_VTOYEFI;
+    gpt.partitions[slot].attributes = GPT_ATTR_CZBLEFI;
     let mut name = [0u16; 36];
-    name[0] = 'V' as u16; name[1] = 'T' as u16; name[2] = 'O' as u16;
-    name[3] = 'Y' as u16; name[4] = 'E' as u16; name[5] = 'F' as u16; name[6] = 'I' as u16;
+    name[0] = 'C' as u16; name[1] = 'Z' as u16; name[2] = 'B' as u16;
+    name[3] = 'L' as u16; name[4] = 'E' as u16; name[5] = 'F' as u16; name[6] = 'I' as u16;
     gpt.partitions[slot].name = name;
 
     finalize_gpt_crcs(&mut gpt);
@@ -352,20 +352,20 @@ fn update_gpt_partition_table_f(disk: &mut std::fs::File, part2_start_sector: u6
     Ok(())
 }
 
-// ─── EFI partition format (FAT16 "VTOYEFI") ─────────────────────────────
+// ─── EFI partition format (FAT16 "CZBLEFI") ─────────────────────────────
 
-/// Format the EFI partition as FAT16 with label "VTOYEFI"
+/// Format the EFI partition as FAT16 with label "CZBLEFI"
 fn format_efi_partition(disk_path: &str, part_num: u32) -> Result<()> {
     let part = get_partition_name(disk_path, part_num);
     println!("Formatting EFI partition {} as FAT16...", part);
 
-    // Ventoy uses: mkfs.vfat -F 16 -n VTOYEFI -s 1 <partition>
+    // Ventoy uses: mkfs.vfat -F 16 -n CZBLEFI -s 1 <partition>
     for _ in 0..10 {
         // Unmount if mounted
         check_umount(&part);
 
         let status = std::process::Command::new("mkfs.vfat")
-            .args(&["-F", "16", "-n", "VTOYEFI", "-s", "1", &part])
+            .args(&["-F", "16", "-n", "CZBLEFI", "-s", "1", &part])
             .status();
 
         match status {
@@ -411,9 +411,9 @@ fn check_umount(partition: &str) {
     }
 }
 
-// ─── GPT attribute fix (vtoygpt -f equivalent) ──────────────────────────
+// ─── GPT attribute fix (czblgpt -f equivalent) ──────────────────────────
 
-/// Fix GPT attributes for VTOYEFI partition on already-installed disk
+/// Fix GPT attributes for CZBLEFI partition on already-installed disk
 pub fn fix_gpt_attributes(disk_path: &str) -> Result<()> {
     let mut disk = open_disk_readwrite(disk_path)?;
 
@@ -430,14 +430,14 @@ pub fn fix_gpt_attributes(disk_path: &str) -> Result<()> {
     for i in 0..36 {
         name_arr[i] = unsafe { std::ptr::read_unaligned(name_ptr.add(i)) };
     }
-    let is_vtoyefi = name_arr[0] == 'V' as u16 && name_arr[1] == 'T' as u16 && name_arr[2] == 'O' as u16 && name_arr[3] == 'Y' as u16;
+    let is_czblefi = name_arr[0] == 'C' as u16 && name_arr[1] == 'Z' as u16 && name_arr[2] == 'B' as u16 && name_arr[3] == 'L' as u16;
 
     let attr_ptr = unsafe { entry_ptr.add(48) as *const u64 };
     let current_attr: u64 = unsafe { std::ptr::read_unaligned(attr_ptr) };
 
-    if is_vtoyefi && current_attr != GPT_ATTR_VTOYEFI {
-        println!("Fixing GPT attributes for VTOYEFI partition...");
-        unsafe { std::ptr::write_unaligned(attr_ptr as *mut u64, GPT_ATTR_VTOYEFI); }
+    if is_czblefi && current_attr != GPT_ATTR_CZBLEFI {
+        println!("Fixing GPT attributes for CZBLEFI partition...");
+        unsafe { std::ptr::write_unaligned(attr_ptr as *mut u64, GPT_ATTR_CZBLEFI); }
 
         // Recalculate CRCs and write
         finalize_gpt_crcs(&mut gpt);
@@ -698,7 +698,7 @@ fn install_gpt_f(disk: &mut std::fs::File, disk_path: &str, disk_size_bytes: u64
     gpt_info.partitions[0].attributes = 0;
     gpt_info.partitions[1].start_lba = part2_start;
     gpt_info.partitions[1].end_lba = part2_start + efi_part_sectors - 1;
-    gpt_info.partitions[1].attributes = GPT_ATTR_VTOYEFI;
+    gpt_info.partitions[1].attributes = GPT_ATTR_CZBLEFI;
 
     // Finalize CRCs before writing
     finalize_gpt_crcs(&mut gpt_info);
@@ -728,7 +728,7 @@ fn install_gpt_f(disk: &mut std::fs::File, disk_path: &str, disk_size_bytes: u64
     write_disk_image_raw(disk, part2_start)?;
     disk.flush()?;
 
-    // Fix GPT attributes (ventoy equivalent: vtoycli gpt -f)
+    // Fix GPT attributes (ventoy equivalent: czblcli gpt -f)
     fix_gpt_attributes(disk_path)?;
 
     if !secure_boot {
@@ -897,7 +897,7 @@ pub fn update_choosable(disk_path: &str, secure_boot: Option<bool>, yes: bool) -
         process_secure_boot_esp(disk_path, part2_start, false)?;
     }
 
-    // Fix GPT attributes on update (ventoy: vtoycli gpt -f)
+    // Fix GPT attributes on update (ventoy: czblcli gpt -f)
     if is_gpt {
         fix_gpt_attributes(disk_path)?;
     }

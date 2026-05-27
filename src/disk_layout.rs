@@ -281,22 +281,22 @@ impl GptInfo {
             unsafe { std::ptr::write_unaligned(name_ptr.add(i), name_slice[i]); }
         }
 
-        // Partition 2: VTOYEFI
+        // Partition 2: CZBLEFI
         partitions[1].part_type_guid = GPT_TYPE_EFI_SYSTEM;
         partitions[1].unique_part_guid = generate_guid();
         partitions[1].start_lba = part1_end;
         partitions[1].end_lba = part1_end + efi_part_size_sectors - 1;
-        partitions[1].attributes = GPT_ATTR_VTOYEFI;
-        // Name: "VTOYEFI"
-        let mut vtoyefi_name = [0u16; 36];
-        vtoyefi_name[0] = 'V' as u16;
-        vtoyefi_name[1] = 'T' as u16;
-        vtoyefi_name[2] = 'O' as u16;
-        vtoyefi_name[3] = 'Y' as u16;
-        vtoyefi_name[4] = 'E' as u16;
-        vtoyefi_name[5] = 'F' as u16;
-        vtoyefi_name[6] = 'I' as u16;
-        partitions[1].name = vtoyefi_name;
+        partitions[1].attributes = GPT_ATTR_CZBLEFI;
+        // Name: "CZBLEFI"
+        let mut czblefi_name = [0u16; 36];
+        czblefi_name[0] = 'C' as u16;
+        czblefi_name[1] = 'Z' as u16;
+        czblefi_name[2] = 'B' as u16;
+        czblefi_name[3] = 'L' as u16;
+        czblefi_name[4] = 'E' as u16;
+        czblefi_name[5] = 'F' as u16;
+        czblefi_name[6] = 'I' as u16;
+        partitions[1].name = czblefi_name;
 
         GptInfo {
             protective_mbr,
@@ -343,7 +343,7 @@ impl GptInfo {
 
 /// Generate a random GUID (tries /dev/urandom, falls back to time-based)
 pub fn generate_guid() -> Guid {
-    // Try /dev/urandom first (Ventoy equivalent: vtoy_gen_uuid)
+    // Try /dev/urandom first (Ventoy equivalent: czbl_gen_uuid)
     if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
         let mut guid = [0u8; 16];
         if std::io::Read::read_exact(&mut f, &mut guid).is_ok() {

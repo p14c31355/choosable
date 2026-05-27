@@ -72,7 +72,7 @@ pub const PART_ACTIVE: u8 = 0x80;
 pub const PART_INACTIVE: u8 = 0x00;
 
 /// EFI partition hidden+required GPT attribute
-pub const GPT_ATTR_VTOYEFI: u64 = CHOOSABLE_EFI_PART_ATTR;
+pub const GPT_ATTR_CZBLEFI: u64 = CHOOSABLE_EFI_PART_ATTR;
 
 /// GPT signature string
 pub const GPT_SIGNATURE: &[u8; 8] = b"EFI PART";
