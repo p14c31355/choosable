@@ -316,10 +316,22 @@ impl GptInfo {
         let part_bytes = unsafe { std::slice::from_raw_parts(part_ptr, 128 * 128) };
         writer.write_all(part_bytes)?;
 
-        // Write backup GPT header at end of disk
+        // Write backup GPT header at end of disk (with swapped start/backup LBAs)
+        let mut backup_header = self.header.clone();
+        let efi_start = backup_header.efi_start_lba;
+        let efi_backup = backup_header.efi_backup_lba;
+        backup_header.efi_start_lba = efi_backup;
+        backup_header.efi_backup_lba = efi_start;
+        backup_header.part_table_start_lba = efi_backup - 32;
+        backup_header.header_crc32 = 0;
+        let header_bytes = unsafe {
+            std::slice::from_raw_parts(&backup_header as *const GptHeader as *const u8, 92)
+        };
+        backup_header.header_crc32 = crc32fast::hash(header_bytes);
+
         let backup_offset = self.header.efi_backup_lba * SECTOR_SIZE;
         writer.seek(SeekFrom::Start(backup_offset))?;
-        self.header.write(writer)?;
+        backup_header.write(writer)?;
 
         // Write backup partition table (before backup header)
         let backup_part_offset = (self.header.efi_backup_lba - 32) * SECTOR_SIZE;

@@ -55,19 +55,12 @@ pub fn get_disk_model(path: &str) -> String {
 /// Check if disk is USB-based
 pub fn is_usb_disk(path: &str) -> bool {
     let name = path.trim_start_matches("/dev/");
-    let transport_path = format!("/sys/class/block/{}/device/../transport", name);
-    if let Ok(link) = std::fs::read_link(&transport_path) {
-        if let Some(transport) = link.file_name() {
-            return transport == "usb";
-        }
+    let sys_path = format!("/sys/class/block/{}", name);
+    if let Ok(canonical) = std::fs::canonicalize(sys_path) {
+        canonical.to_string_lossy().contains("/usb")
+    } else {
+        false
     }
-    let subsystem_path = format!("/sys/class/block/{}/device/../subsystem", name);
-    if let Ok(link) = std::fs::read_link(&subsystem_path) {
-        if let Some(subsystem) = link.file_name() {
-            return subsystem == "usb";
-        }
-    }
-    false
 }
 
 /// Check if disk is removable
@@ -273,7 +266,17 @@ impl<R: Read + Seek> Read for PartitionSlice<R> {
 
 impl<R: Write> Write for PartitionSlice<R> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.inner.write(buf)
+        if self.current_pos >= self.size {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "write exceeds partition size",
+            ));
+        }
+        let max_to_write = (self.size - self.current_pos) as usize;
+        let buf_to_write = if buf.len() > max_to_write { &buf[..max_to_write] } else { buf };
+        let bytes_written = self.inner.write(buf_to_write)?;
+        self.current_pos += bytes_written as u64;
+        Ok(bytes_written)
     }
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()

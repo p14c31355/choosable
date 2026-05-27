@@ -209,11 +209,19 @@ impl ChoosableApp {
             ].spacing(8),
         ].spacing(8);
 
-        let actions = column![
-            button(text("Install")).on_press(Message::InstallClicked).style(button::danger),
-            button(text("Update")).on_press(Message::UpdateClicked),
-            button(text("List Info")).on_press(Message::ListClicked),
-        ].spacing(4);
+        let actions = if self.loading {
+            column![
+                button(text("Install")).style(button::danger),
+                button(text("Update")),
+                button(text("List Info")),
+            ].spacing(4)
+        } else {
+            column![
+                button(text("Install")).on_press(Message::InstallClicked).style(button::danger),
+                button(text("Update")).on_press(Message::UpdateClicked),
+                button(text("List Info")).on_press(Message::ListClicked),
+            ].spacing(4)
+        };
 
         let status_text = if self.loading {
             text(&self.status).color(iced::Color::from_rgb(0.2, 0.5, 0.8))
