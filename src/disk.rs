@@ -244,13 +244,13 @@ pub fn detect_choosable(disk_path: &str, _size_bytes: u64) -> Result<(bool, Opti
 pub struct PartitionSlice<R> {
     inner: R,
     start_offset: u64,
+    size: u64,
     current_pos: u64,
 }
 
 impl<R: Read + Seek> PartitionSlice<R> {
-    /// Create a new PartitionSlice wrapping an existing reader, offsetting all seeks by `start_offset`.
-    pub fn new(inner: R, start_offset: u64) -> Self {
-        PartitionSlice { inner, start_offset, current_pos: 0 }
+    pub fn new(inner: R, start_offset: u64, size: u64) -> Self {
+        PartitionSlice { inner, start_offset, size, current_pos: 0 }
     }
 }
 
@@ -278,7 +278,9 @@ impl<R: Read + Seek> Seek for PartitionSlice<R> {
             SeekFrom::Current(offset) => (self.start_offset + self.current_pos)
                 .checked_add_signed(offset)
                 .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid seek"))?,
-            SeekFrom::End(_) => return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "seek from end not supported")),
+            SeekFrom::End(offset) => (self.start_offset + self.size)
+                .checked_add_signed(offset)
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid seek"))?,
         };
         let actual = self.inner.seek(SeekFrom::Start(target))?;
         self.current_pos = actual.saturating_sub(self.start_offset);
@@ -293,11 +295,7 @@ fn read_choosable_version(disk_path: &str, part2_start_byte: u64) -> Result<Opti
         .open(disk_path)?;
 
     file.seek(SeekFrom::Start(part2_start_byte))?;
-    let slice = PartitionSlice {
-        inner: file,
-        start_offset: part2_start_byte,
-        current_pos: 0,
-    };
+    let slice = PartitionSlice::new(file, part2_start_byte, CHOOSABLE_EFI_PART_SIZE);
 
     let fs = fatfs::FileSystem::new(slice, fatfs::FsOptions::new())
         .map_err(|e| ChoosableError::Generic(format!("Failed to parse FAT: {}", e)))?;

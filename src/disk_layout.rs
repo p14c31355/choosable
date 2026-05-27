@@ -312,11 +312,9 @@ impl GptInfo {
 
         // Write partition table
         writer.seek(SeekFrom::Start(self.header.part_table_start_lba * SECTOR_SIZE))?;
-        for entry in &self.partitions {
-            let ptr = entry as *const GptPartitionEntry as *const u8;
-            let bytes = unsafe { std::slice::from_raw_parts(ptr, 128) };
-            writer.write_all(bytes)?;
-        }
+        let part_ptr = std::ptr::addr_of!(self.partitions) as *const u8;
+        let part_bytes = unsafe { std::slice::from_raw_parts(part_ptr, 128 * 128) };
+        writer.write_all(part_bytes)?;
 
         // Write backup GPT header at end of disk
         let backup_offset = self.header.efi_backup_lba * SECTOR_SIZE;
@@ -326,11 +324,9 @@ impl GptInfo {
         // Write backup partition table (before backup header)
         let backup_part_offset = (self.header.efi_backup_lba - 32) * SECTOR_SIZE;
         writer.seek(SeekFrom::Start(backup_part_offset))?;
-        for entry in &self.partitions {
-            let ptr = entry as *const GptPartitionEntry as *const u8;
-            let bytes = unsafe { std::slice::from_raw_parts(ptr, 128) };
-            writer.write_all(bytes)?;
-        }
+        let part_ptr = std::ptr::addr_of!(self.partitions) as *const u8;
+        let part_bytes = unsafe { std::slice::from_raw_parts(part_ptr, 128 * 128) };
+        writer.write_all(part_bytes)?;
 
         Ok(())
     }
@@ -356,25 +352,11 @@ pub fn generate_guid() -> Guid {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     let nanos = now.as_nanos();
-    let mut guid = [0u8; 16];
-
-    guid[0] = (nanos >> 0) as u8;
-    guid[1] = (nanos >> 8) as u8;
-    guid[2] = (nanos >> 16) as u8;
-    guid[3] = (nanos >> 24) as u8;
-    guid[4] = (nanos >> 32) as u8;
-    guid[5] = (nanos >> 40) as u8;
-    guid[6] = (0x40 | ((nanos >> 48) & 0x0F)) as u8;
-    guid[7] = (nanos >> 56) as u8;
-    guid[8] = (0x80 | ((nanos >> 4) & 0x3F)) as u8;
-    guid[9] = (nanos >> 10) as u8;
-    guid[10] = (nanos >> 16) as u8;
-    guid[11] = (nanos >> 22) as u8;
-    guid[12] = (nanos >> 28) as u8;
-    guid[13] = (nanos >> 34) as u8;
-    guid[14] = (nanos >> 40) as u8;
-    guid[15] = (nanos >> 46) as u8;
-
+    let mut guid = nanos.to_le_bytes();
+    // Set UUID version 4 (bits 4-7 of byte 6 = 0100)
+    guid[6] = (guid[6] & 0x0F) | 0x40;
+    // Set UUID variant (bits 6-7 of byte 8 = 10xx)
+    guid[8] = (guid[8] & 0x3F) | 0x80;
     guid
 }
 

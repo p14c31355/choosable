@@ -454,11 +454,9 @@ pub fn fix_gpt_attributes(disk_path: &str) -> Result<()> {
         // Write backup partition table
         let backup_pt_offset = (gpt.header.efi_backup_lba - 32) * SECTOR_SIZE;
         disk.seek(SeekFrom::Start(backup_pt_offset))?;
-        for entry in &gpt.partitions {
-            let ptr = entry as *const GptPartitionEntry as *const u8;
-            let bytes = unsafe { std::slice::from_raw_parts(ptr, 128) };
-            disk.write_all(bytes)?;
-        }
+        let part_ptr = std::ptr::addr_of!(gpt.partitions) as *const u8;
+        let part_bytes = unsafe { std::slice::from_raw_parts(part_ptr, 128 * 128) };
+        disk.write_all(part_bytes)?;
 
         disk.flush()?;
         println!("GPT attributes fixed.");
@@ -735,8 +733,7 @@ fn format_partition(partition: &str, label: &str, fs_type: FilesystemType) -> Re
     let status = std::process::Command::new(cmd).args(&args).status()
         .map_err(|e| ChoosableError::ToolNotFound(format!("{}: {}", cmd, e)))?;
     if !status.success() {
-        let status = std::process::Command::new(cmd).args(&args).status().map_err(|_| ChoosableError::FormatFailed)?;
-        if !status.success() { return Err(ChoosableError::FormatFailed); }
+        return Err(ChoosableError::FormatFailed);
     }
     Ok(())
 }
