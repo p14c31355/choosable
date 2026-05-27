@@ -1,7 +1,5 @@
 use std::io::{Read, Seek, SeekFrom, Write};
-use crate::constants::*;
-use crate::disk::*;
-use crate::disk_layout::*;
+use crate::{checks, constants::*, disk::*, disk_layout::*};
 use crate::error::{ChoosableError, Result};
 
 /// Filesystem type for partition 1
@@ -83,6 +81,10 @@ pub fn non_destructive_install(disk_path: &str, label: &str, fs_type: Filesystem
     let size_bytes = get_disk_size(disk_path)?;
     let disk_size_gb = human_readable_gb(size_bytes);
     let model = get_disk_model(disk_path);
+
+    // Pre-flight checks (Ventoy: check_umount_disk, check_swap)
+    checks::check_umount_disk(disk_path)?;
+    checks::check_swap(disk_path)?;
 
     let (is_choosable, _version, _, _, _) = detect_choosable(disk_path, size_bytes)?;
     if is_choosable {
@@ -568,6 +570,11 @@ pub fn install_choosable(
         }
     }
 
+    // Pre-flight checks (Ventoy: check_umount_disk, check_swap, check_tool_work_ok)
+    checks::check_umount_disk(disk_path)?;
+    checks::check_swap(disk_path)?;
+    checks::check_tool_work_ok()?;
+
     let (is_choosable, version, _, _, _) = detect_choosable(disk_path, size_bytes)?;
     if is_choosable && !force {
         return Err(ChoosableError::AlreadyInstalled(version.unwrap_or_else(|| "?".to_string())));
@@ -789,6 +796,10 @@ pub fn update_choosable(disk_path: &str, secure_boot: Option<bool>, yes: bool) -
     let (is_choosable, old_version, part2_start, _, mbr) = detect_choosable(disk_path, size_bytes)?;
 
     if !is_choosable { return Err(ChoosableError::NotChoosableDisk); }
+
+    // Pre-flight: unmount
+    checks::check_umount_disk(disk_path)?;
+
     let old_ver = old_version.unwrap_or_else(|| "Unknown".to_string());
     let cur_ver = get_current_version()?;
     let use_secure_boot = secure_boot.unwrap_or(true);
