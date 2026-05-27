@@ -159,7 +159,7 @@ pub fn non_destructive_install(disk_path: &str, label: &str, fs_type: Filesystem
             }
         }
 
-        align_to_4k(part1_end - (CHOOSABLE_EFI_PART_SIZE / SECTOR_SIZE) + 1)
+        align_to_4k(part1_end - (CHOOSABLE_EFI_PART_SIZE / SECTOR_SIZE))
     };
 
     println!("Writing partition table with new CZBLEFI partition...");
