@@ -481,7 +481,8 @@ fn notify_kernel(disk_path: &str) {
 pub fn process_secure_boot_esp(disk_path: &str, part2_start_byte: u64, enable_secure_boot: bool) -> Result<()> {
     if enable_secure_boot { return Ok(()); }
 
-    let file = std::fs::OpenOptions::new().read(true).write(true).open(disk_path)?;
+    let mut file = std::fs::OpenOptions::new().read(true).write(true).open(disk_path)?;
+    file.seek(SeekFrom::Start(part2_start_byte))?;
     let slice = PartitionSlice::new(file, part2_start_byte, CHOOSABLE_EFI_PART_SIZE);
 
     let fs = match fatfs::FileSystem::new(slice, fatfs::FsOptions::new()) {
