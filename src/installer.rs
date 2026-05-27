@@ -383,6 +383,16 @@ fn format_efi_partition(disk_path: &str, part_num: u32) -> Result<()> {
     Err(ChoosableError::FormatFailed)
 }
 
+/// Zero-clear 32 sectors at EFI partition start (Ventoy: dd if=/dev/zero ...)
+fn zero_efi_partition(disk_path: &str, part2_start_sector: u64) -> Result<()> {
+    let mut disk = std::fs::OpenOptions::new().write(true).open(disk_path)?;
+    let zero_buf = vec![0u8; 32 * 512];
+    disk.seek(SeekFrom::Start(part2_start_sector * 512))?;
+    disk.write_all(&zero_buf)?;
+    disk.flush()?;
+    Ok(())
+}
+
 /// Unmount a partition if mounted
 fn check_umount(partition: &str) {
     // Read /proc/mounts and unmount
@@ -644,6 +654,13 @@ fn install_mbr_f(disk: &mut std::fs::File, disk_path: &str, disk_size_bytes: u64
 
     disk.seek(SeekFrom::Start(0))?; mbr.write(disk)?; disk.flush()?;
 
+    // Remove old partition nodes and wait for new ones to appear
+    checks::remove_partition_nodes(disk_path);
+    checks::wait_for_partitions(disk_path)?;
+
+    // Zero-clear EFI partition area (32 sectors) then format
+    zero_efi_partition(disk_path, part2_start)?;
+
     // Format EFI partition
     format_efi_partition(disk_path, 2)?;
 
@@ -802,7 +819,18 @@ pub fn update_choosable(disk_path: &str, secure_boot: Option<bool>, yes: bool) -
 
     let old_ver = old_version.unwrap_or_else(|| "Unknown".to_string());
     let cur_ver = get_current_version()?;
-    let use_secure_boot = secure_boot.unwrap_or(true);
+
+    // Auto-detect secure boot status from disk if not specified (VentoyWorker.sh L556-562)
+    let use_secure_boot = match secure_boot {
+        Some(sb) => sb,
+        None => {
+            if let Some(p2) = part2_start {
+                check_choosable_secure_boot(disk_path, p2)
+            } else {
+                true // default
+            }
+        }
+    };
 
     println!("Disk : {}", disk_path);
     println!("Model: {}", model);
