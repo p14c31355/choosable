@@ -271,15 +271,10 @@ impl GptInfo {
         partitions[0].start_lba = CHOOSABLE_PART1_START_SECTOR;
         partitions[0].end_lba = part1_end - 1;
         partitions[0].attributes = 0;
-        // Copy GPT_PART1_NAME into the array (use raw ptr arithmetic for packed struct)
-        // name field offset in GptPartitionEntry: part_type(16)+unique_part(16)+start_lba(8)+end_lba(8)+attributes(8) = 56
-        let name_slice: &[u16] = GPT_PART1_NAME;
-        let len = name_slice.len().min(36);
-        let entry_ptr = &partitions[0] as *const GptPartitionEntry as *const u8;
-        let name_ptr = unsafe { entry_ptr.add(56) as *mut u16 };
-        for i in 0..len {
-            unsafe { std::ptr::write_unaligned(name_ptr.add(i), name_slice[i]); }
-        }
+        let mut part1_name = [0u16; 36];
+        let len = GPT_PART1_NAME.len().min(36);
+        part1_name[..len].copy_from_slice(&GPT_PART1_NAME[..len]);
+        partitions[0].name = part1_name;
 
         // Partition 2: CZBLEFI
         partitions[1].part_type_guid = GPT_TYPE_EFI_SYSTEM;
