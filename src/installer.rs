@@ -135,7 +135,13 @@ pub fn non_destructive_install(disk_path: &str, label: &str, fs_type: Filesystem
     let part2_start_sector = if free_space >= CHOOSABLE_EFI_PART_SIZE {
         align_to_4k(part1_end)
     } else {
-        let new_part1_mb = part1_mb - (CHOOSABLE_EFI_PART_SIZE / SIZE_1MB);
+        let efi_part_size_mb = CHOOSABLE_EFI_PART_SIZE / SIZE_1MB;
+        if part1_mb <= efi_part_size_mb {
+            return Err(ChoosableError::Generic(format!(
+                "Partition 1 is too small ({} MiB) to be shrunk by {} MiB", part1_mb, efi_part_size_mb
+            )));
+        }
+        let new_part1_mb = part1_mb - efi_part_size_mb;
         println!("We need to shrink partition 1 from {} MiB to {} MiB...", part1_mb, new_part1_mb);
 
         let fs_type_str = detect_partition_fs(&part1)?;
@@ -373,6 +379,9 @@ fn format_efi_partition(disk_path: &str, part_num: u32) -> Result<()> {
                 println!("EFI partition formatted successfully.");
                 return Ok(());
             }
+            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ChoosableError::ToolNotFound("mkfs.vfat".to_string()));
+            }
             _ => {
                 println!("mkfs.vfat failed, retrying...");
                 std::thread::sleep(std::time::Duration::from_secs(2));
@@ -502,23 +511,11 @@ pub fn process_secure_boot_esp(disk_path: &str, part2_start_byte: u64, enable_se
                 println!("Disabling Secure Boot (renaming EFI files)...");
                 if let Ok(efi) = root.open_dir("EFI") {
                     if let Ok(boot) = efi.open_dir("BOOT") {
-                        let efi_data = if let Ok(mut f) = boot.open_file("grubx64_real.efi") {
-                            let mut d = Vec::new(); f.read_to_end(&mut d).ok(); Some(d)
-                        } else { None };
-                        if let Some(data) = &efi_data {
-                            if let Ok(mut f) = boot.create_file("BOOTX64.EFI") { f.write_all(data).ok(); }
-                        }
-                        let ia32_data = if let Ok(mut f) = boot.open_file("grubia32_real.efi") {
-                            let mut d = Vec::new(); f.read_to_end(&mut d).ok(); Some(d)
-                        } else { None };
-                        if let Some(data) = &ia32_data {
-                            if let Ok(mut f) = boot.create_file("BOOTIA32.EFI") { f.write_all(data).ok(); }
-                        }
-                        let _ = boot.remove("grubx64_real.efi");
+                        let _ = boot.rename("grubx64_real.efi", &boot, "BOOTX64.EFI");
+                        let _ = boot.rename("grubia32_real.efi", &boot, "BOOTIA32.EFI");
                         let _ = boot.remove("grubx64.efi");
                         let _ = boot.remove("MokManager.efi");
                         let _ = boot.remove("mmx64.efi");
-                        let _ = boot.remove("grubia32_real.efi");
                         let _ = boot.remove("grubia32.efi");
                         let _ = boot.remove("mmia32.efi");
                     }

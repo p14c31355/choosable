@@ -251,22 +251,60 @@ pub fn detect_choosable(disk_path: &str, _size_bytes: u64) -> Result<(bool, Opti
     }
 }
 
+/// PartitionSlice: wraps a file to expose a sub-range as a standalone Read + Seek handle.
+/// Avoids loading the entire 32 MiB EFI partition into memory.
+struct PartitionSlice<R> {
+    inner: R,
+    start_offset: u64,
+    current_pos: u64,
+}
+
+impl<R: Read + Seek> Read for PartitionSlice<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let bytes_read = self.inner.read(buf)?;
+        self.current_pos += bytes_read as u64;
+        Ok(bytes_read)
+    }
+}
+
+impl<R: Write> Write for PartitionSlice<R> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<R: Read + Seek> Seek for PartitionSlice<R> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let target = match pos {
+            SeekFrom::Start(offset) => self.start_offset + offset,
+            SeekFrom::Current(offset) => (self.start_offset + self.current_pos)
+                .checked_add_signed(offset)
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid seek"))?,
+            SeekFrom::End(_) => return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "seek from end not supported")),
+        };
+        let actual = self.inner.seek(SeekFrom::Start(target))?;
+        self.current_pos = actual.saturating_sub(self.start_offset);
+        Ok(self.current_pos)
+    }
+}
+
 /// Read Choosable version string from EFI partition (FAT12/16/32) using fatfs
 fn read_choosable_version(disk_path: &str, part2_start_byte: u64) -> Result<Option<String>> {
-    use std::io::Cursor;
-
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .open(disk_path)?;
 
-    let partition_size = CHOOSABLE_EFI_PART_SIZE;
-    let mut buf = vec![0u8; partition_size as usize];
     file.seek(SeekFrom::Start(part2_start_byte))?;
-    file.read_exact(&mut buf)?;
+    let slice = PartitionSlice {
+        inner: file,
+        start_offset: part2_start_byte,
+        current_pos: 0,
+    };
 
-    let cursor = Cursor::new(buf);
-
-    let fs = fatfs::FileSystem::new(cursor, fatfs::FsOptions::new())
+    let fs = fatfs::FileSystem::new(slice, fatfs::FsOptions::new())
         .map_err(|e| ChoosableError::Generic(format!("Failed to parse FAT: {}", e)))?;
 
     let root_dir = fs.root_dir();
