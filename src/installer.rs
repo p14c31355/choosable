@@ -616,7 +616,7 @@ fn install_mbr_f(disk: &mut std::fs::File, disk_path: &str, disk_size_bytes: u64
     let part1_start = CHOOSABLE_PART1_START_SECTOR;
 
     let mut part2_start = if reserve_space_mb > 0 { total_sectors - efi_part_sectors - (reserve_space_mb * 2048) } else { total_sectors - efi_part_sectors };
-    part2_start = align_to_4k(part2_start);
+    part2_start = part2_start - (part2_start % 8);
     let part1_sectors = part2_start - part1_start;
 
     let mut mbr = Mbr::new_empty();
