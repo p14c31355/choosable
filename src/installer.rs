@@ -481,54 +481,39 @@ fn notify_kernel(disk_path: &str) {
 // ─── Secure Boot ESP processing ─────────────────────────────────────────
 
 pub fn process_secure_boot_esp(disk_path: &str, part2_start_byte: u64, enable_secure_boot: bool) -> Result<()> {
-    use std::io::Cursor;
-
     if enable_secure_boot { return Ok(()); }
 
-    let mut file = std::fs::OpenOptions::new().read(true).write(true).open(disk_path)?;
-    let partition_size = CHOOSABLE_EFI_PART_SIZE;
-    let mut buf = vec![0u8; partition_size as usize];
-    file.seek(SeekFrom::Start(part2_start_byte))?;
-    file.read_exact(&mut buf)?;
+    let file = std::fs::OpenOptions::new().read(true).write(true).open(disk_path)?;
+    let slice = PartitionSlice::new(file, part2_start_byte);
 
-    let mut modified = false;
-    {
-        let cursor = Cursor::new(&mut buf[..]);
-        let fs = match fatfs::FileSystem::new(cursor, fatfs::FsOptions::new()) {
-            Ok(fs) => fs, Err(_) => return Ok(()),
-        };
-        let root = fs.root_dir();
+    let fs = match fatfs::FileSystem::new(slice, fatfs::FsOptions::new()) {
+        Ok(fs) => fs,
+        Err(_) => return Ok(()),
+    };
+    let root = fs.root_dir();
 
-        let has_sb = if let Ok(efi) = root.open_dir("EFI") {
+    let has_sb = if let Ok(efi) = root.open_dir("EFI") {
+        if let Ok(boot) = efi.open_dir("BOOT") {
+            boot.iter().any(|e| {
+                if let Ok(entry) = e { entry.file_name() == "grubx64_real.efi" } else { false }
+            })
+        } else { false }
+    } else { false };
+
+    if has_sb {
+        println!("Disabling Secure Boot (renaming EFI files)...");
+        if let Ok(efi) = root.open_dir("EFI") {
             if let Ok(boot) = efi.open_dir("BOOT") {
-                boot.iter().any(|e| {
-                    if let Ok(entry) = e { entry.file_name() == "grubx64_real.efi" } else { false }
-                })
-            } else { false }
-        } else { false };
-
-        if has_sb {
-            println!("Disabling Secure Boot (renaming EFI files)...");
-            if let Ok(efi) = root.open_dir("EFI") {
-                if let Ok(boot) = efi.open_dir("BOOT") {
-                    let _ = boot.rename("grubx64_real.efi", &boot, "BOOTX64.EFI");
-                    let _ = boot.rename("grubia32_real.efi", &boot, "BOOTIA32.EFI");
-                    let _ = boot.remove("grubx64.efi");
-                    let _ = boot.remove("MokManager.efi");
-                    let _ = boot.remove("mmx64.efi");
-                    let _ = boot.remove("grubia32.efi");
-                    let _ = boot.remove("mmia32.efi");
-                }
+                let _ = boot.rename("grubx64_real.efi", &boot, "BOOTX64.EFI");
+                let _ = boot.rename("grubia32_real.efi", &boot, "BOOTIA32.EFI");
+                let _ = boot.remove("grubx64.efi");
+                let _ = boot.remove("MokManager.efi");
+                let _ = boot.remove("mmx64.efi");
+                let _ = boot.remove("grubia32.efi");
+                let _ = boot.remove("mmia32.efi");
             }
-            let _ = root.remove("ENROLL_THIS_KEY_IN_MOKMANAGER.cer");
-            modified = true;
         }
-    }
-
-    if modified {
-        file.seek(SeekFrom::Start(part2_start_byte))?;
-        file.write_all(&buf)?;
-        file.flush()?;
+        let _ = root.remove("ENROLL_THIS_KEY_IN_MOKMANAGER.cer");
     }
 
     notify_kernel(disk_path);
@@ -797,19 +782,27 @@ fn decompress_xz(data: &[u8]) -> Result<Vec<u8>> {
         .spawn()
         .map_err(|_| ChoosableError::ToolNotFound("xzcat".to_string()))?;
 
-    std::thread::scope(|s| {
-        if let Some(mut stdin) = child.stdin.take() {
-            s.spawn(move || {
-                let _ = stdin.write_all(data);
-            });
-        }
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+
+    let (decoded, err_bytes) = std::thread::scope(|s| {
+        s.spawn(move || {
+            let _ = stdin.write_all(data);
+        });
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let _ = stdout.read_to_end(&mut out);
+        let _ = stderr.read_to_end(&mut err);
+        (out, err)
     });
 
-    let output = child.wait_with_output().map_err(|e| ChoosableError::Generic(format!("xzcat: {}", e)))?;
-    if !output.status.success() {
-        return Err(ChoosableError::Generic(String::from_utf8_lossy(&output.stderr).to_string()));
+    let status = child.wait().map_err(|e| ChoosableError::Generic(format!("xzcat: {}", e)))?;
+    if !status.success() {
+        return Err(ChoosableError::Generic(String::from_utf8_lossy(&err_bytes).to_string()));
     }
-    Ok(output.stdout)
+    Ok(decoded)
 }
 
 // ─── Update ──────────────────────────────────────────────────────────────
