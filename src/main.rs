@@ -12,9 +12,16 @@ use cli::{Cli, Commands};
 use error::Result;
 
 fn main() -> Result<()> {
-    // If no subcommand is given and no arguments, launch GUI
-    if std::env::args().len() <= 1 {
+    // If no arguments given at all, launch GUI
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() <= 1 {
         return gui::run_gui();
+    }
+
+    // Handle --help / --version without requiring a subcommand
+    if args.len() == 2 && (args[1] == "--help" || args[1] == "-h" || args[1] == "--version" || args[1] == "-V") {
+        Cli::parse();
+        return Ok(());
     }
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -36,7 +43,7 @@ fn main() -> Result<()> {
             filesystem,
             yes,
         } => {
-            let secure_boot = if no_secure_boot { false } else { secure_boot || !no_secure_boot };
+            let secure_boot = !no_secure_boot;
 
             if non_destructive {
                 let fs_type = installer::FilesystemType::from_str(&filesystem)?;

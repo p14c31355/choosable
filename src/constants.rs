@@ -18,10 +18,10 @@ pub const CHOOSABLE_PART1_START_SECTOR: u64 = 2048;
 pub const CHOOSABLE_EFI_PART_ATTR: u64 = 0x8000_0000_0000_0000;
 
 /// Choosable image file section count in 512-byte sectors
-pub const CHOOSABLE_SECTOR_NUM: u64 = 32768; // 16 MiB
+pub const CHOOSABLE_SECTOR_NUM: u64 = 65536; // 32 MiB (Ventoy: VENTOY_SECTOR_NUM=65536)
 
 /// Choosable part 1 + part 2 total size in MiB
-pub const CHOOSABLE_PART_SIZE_MB: u64 = 48; // 16 MiB part1 min? Actually in shell script: PART1_MB - 32 MiB for EFI part. 32+32? Let's use 48 as min for both parts.
+pub const CHOOSABLE_PART_SIZE_MB: u64 = 33; // min: 1 MiB part1 + 32 MiB EFI part
 
 /// Maximum physical drives
 pub const CHOOSABLE_MAX_PHY_DRIVE: usize = 128;

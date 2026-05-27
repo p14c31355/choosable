@@ -705,7 +705,13 @@ fn install_gpt_f(disk: &mut std::fs::File, disk_path: &str, disk_size_bytes: u64
 
     gpt_info.write_to_disk(disk)?;
     disk.flush()?;
-    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    // Remove old partition nodes and wait for new ones
+    checks::remove_partition_nodes(disk_path);
+    checks::wait_for_partitions(disk_path)?;
+
+    // Zero-clear EFI partition area (32 sectors) then format
+    zero_efi_partition(disk_path, part2_start)?;
 
     // Format EFI partition
     format_efi_partition(disk_path, 2)?;
