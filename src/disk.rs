@@ -129,7 +129,10 @@ pub fn enumerate_disks() -> Result<Vec<PhyDriveInfo>> {
             continue;
         }
 
-        let size_bytes = get_disk_size(&disk_path)?;
+        let size_bytes = match get_disk_size(&disk_path) {
+            Ok(sz) => sz,
+            Err(_) => continue,
+        };
         let model = get_disk_model(&disk_path);
         let removable = is_removable_disk(&disk_path);
         let is_usb = is_usb_disk(&disk_path);
