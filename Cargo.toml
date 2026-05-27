@@ -1,7 +1,7 @@
 [package]
 name = "choosable"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 description = "A pure Rust implementation of Ventoy - create bootable USB drives for ISO/WIM/IMG/VHD(x)/EFI files"
 
 [dependencies]
@@ -10,6 +10,9 @@ anyhow = "1"
 thiserror = "1"
 log = "0.4"
 env_logger = "0.11"
+fatfs = "0.3"
+crc32fast = "1"
+iced = "0.13"
 
 [features]
 default = ["linux"]

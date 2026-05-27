@@ -262,18 +262,48 @@ pub fn detect_choosable(disk_path: &str, size_bytes: u64) -> Result<(bool, Optio
     }
 }
 
-/// Read Choosable version string from EFI partition
+/// Read Choosable version string from EFI partition (FAT12/16/32) using fatfs
 fn read_choosable_version(disk_path: &str, part2_start_byte: u64) -> Result<Option<String>> {
-    // Choosable stores version in a file inside the EFI partition.
-    // We can try to read it from a known offset.
-    // For now, return None (version unknown) — we'll need exFAT/VFAT parsing for this.
-    // In the original Choosable, the version is read via the file system.
-    // We can try to read raw bytes and look for version patterns.
-    // But for a proper implementation, we'd need to mount or parse the filesystem.
+    use std::io::Cursor;
 
-    // For now, just return None (version will be shown as "?")
-    let _ = disk_path;
-    let _ = part2_start_byte;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .open(disk_path)?;
+
+    let partition_size = CHOOSABLE_EFI_PART_SIZE;
+    let mut buf = vec![0u8; partition_size as usize];
+    file.seek(SeekFrom::Start(part2_start_byte))?;
+    file.read_exact(&mut buf)?;
+
+    let cursor = Cursor::new(buf);
+
+    let fs = fatfs::FileSystem::new(cursor, fatfs::FsOptions::new())
+        .map_err(|e| ChoosableError::Generic(format!("Failed to parse FAT: {}", e)))?;
+
+    let root_dir = fs.root_dir();
+    let grub_dir = match root_dir.open_dir("grub") {
+        Ok(d) => d,
+        Err(_) => return Ok(None),
+    };
+
+    let mut cfg_file = match grub_dir.open_file("grub.cfg") {
+        Ok(f) => f,
+        Err(_) => return Ok(None),
+    };
+
+    let mut content = String::new();
+    cfg_file.read_to_string(&mut content).ok();
+
+    for line in content.lines() {
+        if let Some(pos) = line.find("VENTOY_VERSION=") {
+            let after = &line[pos + "VENTOY_VERSION=".len()..];
+            let version = after.trim_matches(|c: char| c == '"' || c == '\'' || c.is_whitespace());
+            if !version.is_empty() {
+                return Ok(Some(version.to_string()));
+            }
+        }
+    }
+
     Ok(None)
 }
 
