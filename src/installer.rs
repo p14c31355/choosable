@@ -638,10 +638,14 @@ fn install_mbr_f(disk: &mut std::fs::File, disk_path: &str, disk_size_bytes: u64
     let part1_sectors = part2_start - part1_start;
 
     let mut mbr = Mbr::new_empty();
-    fill_mbr_chs_entry(&mut mbr.partitions[0], disk_size_bytes, part1_start as u32, part1_sectors as u32);
+    let mut part0 = mbr.partitions[0];
+    fill_mbr_chs_entry(&mut part0, disk_size_bytes, part1_start as u32, part1_sectors as u32);
+    mbr.partitions[0] = part0;
     mbr.partitions[0].active = PART_ACTIVE;
     mbr.partitions[0].fs_flag = 0x07;
-    fill_mbr_chs_entry(&mut mbr.partitions[1], disk_size_bytes, part2_start as u32, efi_part_sectors as u32);
+    let mut part1 = mbr.partitions[1];
+    fill_mbr_chs_entry(&mut part1, disk_size_bytes, part2_start as u32, efi_part_sectors as u32);
+    mbr.partitions[1] = part1;
     mbr.partitions[1].fs_flag = PART_TYPE_EFI_SYSTEM;
 
     disk.seek(SeekFrom::Start(0))?; mbr.write(disk)?; disk.flush()?;
