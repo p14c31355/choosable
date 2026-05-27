@@ -252,6 +252,12 @@ impl<R: Read + Seek> Read for PartitionSlice<R> {
         if self.current_pos >= self.size {
             return Ok(0);
         }
+        // Sync inner file position.  The inner file may have been advanced
+        // by other callers (fatfs internal FAT reads, etc.) without going
+        // through PartitionSlice::Seek.
+        let target = self.start_offset + self.current_pos;
+        self.inner.seek(SeekFrom::Start(target))?;
+
         let max_to_read = (self.size - self.current_pos) as usize;
         let buf_to_read = if buf.len() > max_to_read {
             &mut buf[..max_to_read]
@@ -264,7 +270,7 @@ impl<R: Read + Seek> Read for PartitionSlice<R> {
     }
 }
 
-impl<R: Write> Write for PartitionSlice<R> {
+impl<R: Write + Seek> Write for PartitionSlice<R> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if self.current_pos >= self.size {
             return Err(std::io::Error::new(
@@ -272,6 +278,12 @@ impl<R: Write> Write for PartitionSlice<R> {
                 "write exceeds partition size",
             ));
         }
+        // Ensure the inner file is at the correct absolute position.
+        // Reads may have advanced it beyond what current_pos tracks
+        // (e.g. fatfs reads the FAT into internal buffers, advancing the file position).
+        let target = self.start_offset + self.current_pos;
+        self.inner.seek(SeekFrom::Start(target))?;
+
         let max_to_write = (self.size - self.current_pos) as usize;
         let buf_to_write = if buf.len() > max_to_write { &buf[..max_to_write] } else { buf };
         let bytes_written = self.inner.write(buf_to_write)?;

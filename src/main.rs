@@ -15,7 +15,26 @@ fn main() -> Result<()> {
     // If no arguments given at all, launch GUI
     let args: Vec<String> = std::env::args().collect();
     if args.len() <= 1 {
-        return gui::run_gui();
+        // Ensure XDG_RUNTIME_DIR for Wayland under sudo
+        if std::env::var("XDG_RUNTIME_DIR").is_err() {
+            if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+                if let Some(uid) = status.lines()
+                    .find(|l| l.starts_with("Uid:"))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                {
+                    unsafe { std::env::set_var("XDG_RUNTIME_DIR", format!("/run/user/{}", uid)); }
+                }
+            }
+        }
+
+        return match gui::run_gui() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("GUI failed: {}", e);
+                eprintln!("Use 'choosable install <disk>' for CLI mode.");
+                Ok(())
+            }
+        };
     }
 
     // Handle --help / --version without requiring a subcommand
