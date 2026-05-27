@@ -2,7 +2,7 @@
 name = "choosable"
 version = "0.1.0"
 edition = "2021"
-description = "A pure Rust implementation of Ventoy - create bootable USB drives for ISO/WIM/IMG/VHD(x)/EFI files"
+description = "Create bootable USB drives for ISO/WIM/IMG/VHD(x)/EFI files"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
