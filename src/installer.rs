@@ -410,7 +410,7 @@ fn check_umount(partition: &str) {
             if line.starts_with(partition) {
                 if let Some(mount_point) = line.split_whitespace().nth(1) {
                     let _ = std::process::Command::new("umount")
-                        .arg(mount_point)
+                        .arg(partition)
                         .stdout(std::process::Stdio::null())
                         .stderr(std::process::Stdio::null())
                         .status();
