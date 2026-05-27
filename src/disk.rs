@@ -256,7 +256,16 @@ impl<R: Read + Seek> PartitionSlice<R> {
 
 impl<R: Read + Seek> Read for PartitionSlice<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let bytes_read = self.inner.read(buf)?;
+        if self.current_pos >= self.size {
+            return Ok(0);
+        }
+        let max_to_read = (self.size - self.current_pos) as usize;
+        let buf_to_read = if buf.len() > max_to_read {
+            &mut buf[..max_to_read]
+        } else {
+            buf
+        };
+        let bytes_read = self.inner.read(buf_to_read)?;
         self.current_pos += bytes_read as u64;
         Ok(bytes_read)
     }
