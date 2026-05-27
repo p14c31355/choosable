@@ -371,7 +371,7 @@ pub fn write_zeros<W: Write + Seek>(
 
     writer.seek(SeekFrom::Start(start_offset))?;
 
-    let zeros = vec![0u8; SECTOR_SIZE as usize];
+    let zeros = [0u8; SECTOR_SIZE as usize];
     let mut remaining = total_bytes;
     while remaining > 0 {
         let write_size = std::cmp::min(remaining, SECTOR_SIZE) as usize;
