@@ -208,16 +208,9 @@ pub fn detect_choosable(disk_path: &str, _size_bytes: u64) -> Result<(bool, Opti
             return Ok((false, None, None, None, mbr));
         }
 
-        // Check partition 2 name is "CZBLEFI" (use ptr arithmetic for packed struct)
-        let entry_ptr = &gpt.partitions[1] as *const GptPartitionEntry as *const u8;
-        let name_offset = 56usize;
-        let name_ptr = unsafe { entry_ptr.add(name_offset) as *const u16 };
-        let mut name_arr = [0u16; 36];
-        for i in 0..36 {
-            name_arr[i] = unsafe { std::ptr::read_unaligned(name_ptr.add(i)) };
-        }
-        let expected: Vec<u16> = vec!['C' as u16, 'Z' as u16, 'B' as u16, 'L' as u16, 'E' as u16, 'F' as u16, 'I' as u16];
-        if name_arr[..7] != expected[..] {
+        let entry = &gpt.partitions[1];
+        let expected = ['C' as u16, 'Z' as u16, 'B' as u16, 'L' as u16, 'E' as u16, 'F' as u16, 'I' as u16];
+        if entry.name[..7] != expected {
             return Ok((false, None, None, None, mbr));
         }
 
