@@ -143,7 +143,7 @@ pub struct GptHeader {
 impl GptHeader {
     /// Read GPT header from a reader at current position
     pub fn read<R: Read>(reader: &mut R) -> Result<Self> {
-        let mut buf = [0u8; 92];
+        let mut buf = [0u8; 512];
         reader.read_exact(&mut buf)?;
 
         let header: GptHeader = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const GptHeader) };
