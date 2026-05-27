@@ -235,7 +235,7 @@ pub fn detect_choosable(disk_path: &str, _size_bytes: u64) -> Result<(bool, Opti
         let part2_start = mbr.partitions[1].start_lba as u64 * SECTOR_SIZE;
         let version = read_choosable_version(disk_path, part2_start)?;
 
-        Ok((true, version, Some(mbr.partitions[1].start_lba as u64), None, mbr))
+        Ok((true, version, Some(part2_start), None, mbr))
     }
 }
 
