@@ -40,12 +40,18 @@ pub fn crc32_checksum(data: &[u8]) -> u32 {
 /// Recalculate GPT header and partition table CRCs in-place
 pub fn finalize_gpt_crcs(gpt: &mut GptInfo) {
     let part_table_bytes = unsafe {
-        std::slice::from_raw_parts(gpt.partitions.as_ptr() as *const u8, 128 * 128)
+        std::slice::from_raw_parts(
+            gpt.partitions.as_ptr() as *const u8,
+            std::mem::size_of_val(&gpt.partitions),
+        )
     };
     gpt.header.part_table_crc32 = crc32_checksum(part_table_bytes);
     gpt.header.header_crc32 = 0;
     let header_bytes = unsafe {
-        std::slice::from_raw_parts(&gpt.header as *const GptHeader as *const u8, 92)
+        std::slice::from_raw_parts(
+            &gpt.header as *const GptHeader as *const u8,
+            gpt.header.header_size as usize,
+        )
     };
     gpt.header.header_crc32 = crc32_checksum(header_bytes);
 }
@@ -274,13 +280,7 @@ fn update_mbr_partition_table_f(disk: &mut std::fs::File, mbr: &Mbr, part2_start
         for i in 1..4 {
             if new_mbr.partitions[i].sector_count == 0 { s = Some(i); break; }
         }
-        match s {
-            Some(slot) => slot,
-            None => {
-                for j in (1..=2).rev() { new_mbr.partitions[j + 1] = new_mbr.partitions[j]; }
-                1
-            }
-        }
+        s.ok_or_else(|| ChoosableError::Generic("No free partition slot available in MBR".to_string()))?
     };
 
     let part1_count = part2_start_sector as u32 - CHOOSABLE_PART1_START_SECTOR as u32;
@@ -307,17 +307,27 @@ fn fill_mbr_chs_entry(entry: &mut PartitionTableEntry, _disk_size_bytes: u64, st
     entry.start_lba = start_sector;
     entry.sector_count = sector_count;
 
-    let cylinder = start_sector / 255 / nsector;
-    let head = (start_sector / nsector) % 255;
-    let sector = (start_sector % nsector) + 1;
+    let (cylinder, head, sector) = if start_sector >= 16450560 {
+        (1023, 254, 63)
+    } else {
+        let cylinder = start_sector / 255 / nsector;
+        let head = (start_sector / nsector) % 255;
+        let sector = (start_sector % nsector) + 1;
+        (cylinder, head, sector)
+    };
 
     entry.start_head = head as u8;
     entry.start_sector_cylinder = (((cylinder & 0xFF) as u16) << 8) | (((cylinder & 0x300) >> 2) as u16) | ((sector & 0x3F) as u16);
 
     let end_lba = start_sector + sector_count.saturating_sub(1);
-    let ecylinder = end_lba / 255 / nsector;
-    let ehead = (end_lba / nsector) % 255;
-    let esector = (end_lba % nsector) + 1;
+    let (ecylinder, ehead, esector) = if end_lba >= 16450560 {
+        (1023, 254, 63)
+    } else {
+        let ecylinder = end_lba / 255 / nsector;
+        let ehead = (end_lba / nsector) % 255;
+        let esector = (end_lba % nsector) + 1;
+        (ecylinder, ehead, esector)
+    };
 
     entry.end_head = ehead as u8;
     entry.end_sector_cylinder = (((ecylinder & 0xFF) as u16) << 8) | (((ecylinder & 0x300) >> 2) as u16) | ((esector & 0x3F) as u16);
@@ -333,13 +343,7 @@ fn update_gpt_partition_table_f(disk: &mut std::fs::File, part2_start_sector: u6
         for i in 1..128 {
             if gpt.partitions[i].unique_part_guid == [0u8; 16] { s = Some(i); break; }
         }
-        match s {
-            Some(slot) => slot,
-            None => {
-                for j in (1..127).rev() { gpt.partitions[j + 1] = gpt.partitions[j]; }
-                1
-            }
-        }
+        s.ok_or_else(|| ChoosableError::Generic("No free partition slot available in GPT".to_string()))?
     };
 
     gpt.partitions[0].end_lba = part2_start_sector - 1;
@@ -557,7 +561,7 @@ pub fn install_choosable(
     // Pre-flight checks (Ventoy: check_umount_disk, check_swap, check_tool_work_ok)
     checks::check_umount_disk(disk_path)?;
     checks::check_swap(disk_path)?;
-    checks::check_tool_work_ok()?;
+    checks::check_tool_work_ok(fs_type)?;
 
     let (is_choosable, version, _, _, _) = detect_choosable(disk_path, size_bytes)?;
     if is_choosable && !force {

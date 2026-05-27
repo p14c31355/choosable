@@ -1,5 +1,6 @@
 use crate::disk::{get_partition_name, is_whole_disk};
 use crate::error::{ChoosableError, Result};
+use crate::installer::FilesystemType;
 use std::path::Path;
 
 /// Returns true if `dev` is a partition of `disk_path`.
@@ -87,8 +88,8 @@ pub fn check_umount_disk(disk_path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Check that required tools work
-pub fn check_tool_work_ok() -> Result<()> {
+/// Check that required tools work for the given filesystem type
+pub fn check_tool_work_ok(fs_type: FilesystemType) -> Result<()> {
     // Check hexdump
     let hexdump = std::process::Command::new("hexdump")
         .stdin(std::process::Stdio::null())
@@ -105,17 +106,25 @@ pub fn check_tool_work_ok() -> Result<()> {
         }
     }
 
-    // Check mkexfatfs
-    let status = std::process::Command::new("mkexfatfs")
-        .arg("-V")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|_| ChoosableError::ToolNotFound("mkexfatfs".to_string()))?;
+    // Check filesystem-specific formatting tool
+    let (tool_name, tool_arg) = match fs_type {
+        FilesystemType::ExFat => ("mkexfatfs", Some("-V")),
+        FilesystemType::Fat32 => ("mkfs.vfat", None),
+        FilesystemType::Ntfs => ("mkfs.ntfs", Some("-V")),
+    };
+
+    let mut cmd = std::process::Command::new(tool_name);
+    cmd.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Some(arg) = tool_arg {
+        cmd.arg(arg);
+    }
+    let status = cmd.status()
+        .map_err(|_| ChoosableError::ToolNotFound(tool_name.to_string()))?;
 
     if !status.success() {
         return Err(ChoosableError::ToolNotFound(
-            "mkexfatfs does not work on this system".to_string()
+            format!("{} does not work on this system", tool_name)
         ));
     }
 
