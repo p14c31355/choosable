@@ -233,11 +233,13 @@ impl GptInfo {
         reader.seek(SeekFrom::Start(SECTOR_SIZE))?;
         let header = GptHeader::read(reader)?;
 
-        // Read partition table - use ptr::read_unaligned for packed struct
+        // Read partition table - seek to each entry position respecting entry_size
         let part_start = header.part_table_start_lba * SECTOR_SIZE;
-        reader.seek(SeekFrom::Start(part_start))?;
+        let entry_size = header.part_table_entry_size as u64;
         let mut partitions = [GptPartitionEntry::empty(); 128];
-        for entry in partitions.iter_mut() {
+        for (i, entry) in partitions.iter_mut().enumerate() {
+            let offset = part_start + i as u64 * entry_size;
+            reader.seek(SeekFrom::Start(offset))?;
             let mut buf = [0u8; 128];
             reader.read_exact(&mut buf)?;
             *entry = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const GptPartitionEntry) };
@@ -358,13 +360,22 @@ pub fn generate_guid() -> Guid {
         }
     }
 
-    // Fallback to time-based pseudo-random
+    // Fallback to time-based pseudo-random with a sequence counter to prevent duplicates
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     let nanos = now.as_nanos();
     let mut guid = nanos.to_le_bytes();
+    let seq_bytes = seq.to_le_bytes();
+    guid[0] ^= seq_bytes[0];
+    guid[1] ^= seq_bytes[1];
+    guid[2] ^= seq_bytes[2];
+    guid[3] ^= seq_bytes[3];
     // Set UUID version 4 (bits 4-7 of byte 6 = 0100)
     guid[6] = (guid[6] & 0x0F) | 0x40;
     // Set UUID variant (bits 6-7 of byte 8 = 10xx)
