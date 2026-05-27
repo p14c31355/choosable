@@ -25,7 +25,7 @@ pub struct PhyDriveInfo {
 
 /// Check if a disk is a whole disk (not a partition)
 pub fn is_whole_disk(path: &str) -> bool {
-    let name = path.trim_start_matches("/dev/");
+    let name = path.strip_prefix("/dev/").unwrap_or(path);
     let start_file = format!("/sys/class/block/{}/start", name);
     !Path::new(&start_file).exists()
 }
