@@ -312,7 +312,7 @@ fn fill_mbr_chs_entry(entry: &mut PartitionTableEntry, _disk_size_bytes: u64, st
     let sector = (start_sector % nsector) + 1;
 
     entry.start_head = head as u8;
-    entry.start_sector_cylinder = ((cylinder as u16 & 0x3FF) << 6) | ((sector as u16) & 0x3F);
+    entry.start_sector_cylinder = (((cylinder & 0xFF) as u16) << 8) | (((cylinder & 0x300) >> 2) as u16) | ((sector & 0x3F) as u16);
 
     let end_lba = start_sector + sector_count.saturating_sub(1);
     let ecylinder = end_lba / 255 / nsector;
@@ -320,7 +320,7 @@ fn fill_mbr_chs_entry(entry: &mut PartitionTableEntry, _disk_size_bytes: u64, st
     let esector = (end_lba % nsector) + 1;
 
     entry.end_head = ehead as u8;
-    entry.end_sector_cylinder = ((ecylinder as u16 & 0x3FF) << 6) | ((esector as u16) & 0x3F);
+    entry.end_sector_cylinder = (((ecylinder & 0xFF) as u16) << 8) | (((ecylinder & 0x300) >> 2) as u16) | ((esector & 0x3F) as u16);
 }
 
 fn update_gpt_partition_table_f(disk: &mut std::fs::File, part2_start_sector: u64) -> Result<()> {
