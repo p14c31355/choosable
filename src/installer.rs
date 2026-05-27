@@ -666,7 +666,7 @@ fn install_gpt_f(disk: &mut std::fs::File, disk_path: &str, disk_size_bytes: u64
     let total_sectors = disk_size_bytes / SECTOR_SIZE;
     let part2_end = total_sectors - 34;
     let mut part2_start = if reserve_space_mb > 0 { part2_end - efi_part_sectors - (reserve_space_mb * 2048) } else { part2_end - efi_part_sectors };
-    part2_start = align_to_4k(part2_start);
+    part2_start = part2_start - (part2_start % 8);
     let part1_end = part2_start - 1;
 
     let disk_guid = generate_guid();
