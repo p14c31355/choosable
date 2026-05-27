@@ -48,7 +48,7 @@ pub fn check_umount_disk(disk_path: &str) -> Result<()> {
                     if let Some(mount_point) = line.split_whitespace().nth(1) {
                         println!("Unmounting {} (was mounted at {})...", dev, mount_point);
                         let _ = std::process::Command::new("umount")
-                            .arg(mount_point)
+                            .arg(dev)
                             .stdout(std::process::Stdio::null())
                             .stderr(std::process::Stdio::null())
                             .status();
