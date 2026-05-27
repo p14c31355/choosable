@@ -185,8 +185,7 @@ pub fn non_destructive_install(disk_path: &str, label: &str, fs_type: Filesystem
     disk_file.seek(SeekFrom::Start(440))?; disk_file.write_all(&guid[12..16])?;
     disk_file.flush()?;
 
-    write_disk_image_raw(&mut disk_file, part2_start_sector)?;
-    disk_file.flush()?;
+    write_efi_bootloader(disk_path, part2_start_sector * SECTOR_SIZE)?;
 
     // Fix GPT attributes for GPT scheme
     if is_gpt {
@@ -655,8 +654,7 @@ fn install_mbr_f(disk: &mut std::fs::File, disk_path: &str, disk_size_bytes: u64
     disk.seek(SeekFrom::Start(440))?; disk.write_all(&guid[12..16])?;
     disk.flush()?;
 
-    write_disk_image_raw(disk, part2_start)?;
-    disk.flush()?;
+    write_efi_bootloader(disk_path, part2_start * SECTOR_SIZE)?;
 
     if !secure_boot {
         std::thread::sleep(std::time::Duration::from_secs(1));
@@ -707,8 +705,7 @@ fn install_gpt_f(disk: &mut std::fs::File, disk_path: &str, disk_size_bytes: u64
     disk.seek(SeekFrom::Start(440))?; disk.write_all(&guid[12..16])?;
     disk.flush()?;
 
-    write_disk_image_raw(disk, part2_start)?;
-    disk.flush()?;
+    write_efi_bootloader(disk_path, part2_start * SECTOR_SIZE)?;
 
     // Fix GPT attributes (ventoy equivalent: czblcli gpt -f)
     fix_gpt_attributes(disk_path)?;
@@ -787,12 +784,40 @@ fn write_boot_images(disk: &mut std::fs::File, is_gpt: bool, _part2_start_sector
     Ok(())
 }
 
-fn write_disk_image_raw(disk: &mut std::fs::File, part2_start_sector: u64) -> Result<()> {
-    let efi_img = bootloader::EFI_BIN;
-    let len = std::cmp::min(efi_img.len(), (CHOOSABLE_SECTOR_NUM * 512) as usize);
-    disk.seek(SeekFrom::Start(part2_start_sector * 512))?;
-    disk.write_all(&efi_img[..len])?;
-    disk.flush()?;
+fn write_efi_bootloader(disk_path: &str, part2_start_byte: u64) -> Result<()> {
+    // Open the EFI partition (FAT16) and write EFI/BOOT/BOOTX64.EFI
+    use std::io::Seek;
+    let slice = {
+        let mut file = std::fs::OpenOptions::new().read(true).write(true).open(disk_path)?;
+        file.seek(SeekFrom::Start(part2_start_byte))?;
+        PartitionSlice::new(file, part2_start_byte, CHOOSABLE_EFI_PART_SIZE)
+    };
+
+    let fs = fatfs::FileSystem::new(slice, fatfs::FsOptions::new())
+        .map_err(|e| ChoosableError::Generic(format!("Failed to open EFI FAT: {}", e)))?;
+
+    let root = fs.root_dir();
+
+    // Ensure EFI/BOOT directory exists
+    let efi_dir = root.open_dir("EFI")
+        .or_else(|_| root.create_dir("EFI"))
+        .map_err(|e| ChoosableError::Generic(format!("Failed to create EFI dir: {}", e)))?;
+
+    let boot_dir = efi_dir.open_dir("BOOT")
+        .or_else(|_| efi_dir.create_dir("BOOT"))
+        .map_err(|e| ChoosableError::Generic(format!("Failed to create BOOT dir: {}", e)))?;
+
+    // Write BOOTX64.EFI
+    let efi_bin = bootloader::EFI_BIN;
+    let mut file = boot_dir.create_file("BOOTX64.EFI")
+        .map_err(|e| ChoosableError::Generic(format!("Failed to create BOOTX64.EFI: {}", e)))?;
+
+    file.write_all(efi_bin)
+        .map_err(|e| ChoosableError::Generic(format!("Failed to write EFI binary: {}", e)))?;
+
+    file.flush()
+        .map_err(|e| ChoosableError::Generic(format!("Failed to flush EFI file: {}", e)))?;
+
     Ok(())
 }
 
@@ -911,10 +936,7 @@ pub fn update_choosable(disk_path: &str, secure_boot: Option<bool>, yes: bool) -
     disk.seek(SeekFrom::Start(2040 * 512))?; disk.write_all(&rsv_data)?;
     disk.flush()?;
 
-    let efi_img = bootloader::EFI_BIN;
-    let len = std::cmp::min(efi_img.len(), (CHOOSABLE_SECTOR_NUM * 512) as usize);
-    disk.seek(SeekFrom::Start(part2_start))?; disk.write_all(&efi_img[..len])?;
-    disk.flush()?;
+    write_efi_bootloader(disk_path, part2_start)?;
 
     if !use_secure_boot {
         std::thread::sleep(std::time::Duration::from_secs(1));
