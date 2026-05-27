@@ -16,7 +16,7 @@ pub struct PhyDriveInfo {
     pub sector_size_logical: u32,
     pub sector_size_physical: u32,
     pub partition_style: Option<u32>, // 0=MBR, 1=GPT
-    pub ventoy_version: Option<String>,
+    pub choosable_version: Option<String>,
     pub secure_boot: Option<bool>,
     pub mbr: Option<Mbr>,
     pub part2_start_sector: Option<u64>,
@@ -154,7 +154,7 @@ pub fn enumerate_disks() -> Result<Vec<PhyDriveInfo>> {
             sector_size_logical,
             sector_size_physical,
             partition_style: None,
-            ventoy_version: None,
+            choosable_version: None,
             secure_boot: None,
             mbr: None,
             part2_start_sector: None,
@@ -186,8 +186,8 @@ pub fn read_mbr(disk_path: &str) -> Result<Mbr> {
     Mbr::read(&mut file)
 }
 
-/// Read the MBR and detect if it's a Ventoy disk
-pub fn detect_ventoy(disk_path: &str, size_bytes: u64) -> Result<(bool, Option<String>, Option<u64>, Option<u64>, Mbr)> {
+/// Read the MBR and detect if it's a Choosable disk
+pub fn detect_choosable(disk_path: &str, size_bytes: u64) -> Result<(bool, Option<String>, Option<u64>, Option<u64>, Mbr)> {
     // Open disk
     let mut file = std::fs::OpenOptions::new()
         .read(true)
@@ -195,17 +195,17 @@ pub fn detect_ventoy(disk_path: &str, size_bytes: u64) -> Result<(bool, Option<S
 
     let mbr = Mbr::read(&mut file)?;
 
-    // Check partition layout for Ventoy signature
+    // Check partition layout for Choosable signature
     if mbr.is_gpt_protective() {
         // GPT disk - check partition table
         let gpt = GptInfo::read_from_disk(&mut file)?;
 
         // Check partition 1 starts at 2048
-        if gpt.partitions[0].start_lba != VENTOY_PART1_START_SECTOR {
+        if gpt.partitions[0].start_lba != CHOOSABLE_PART1_START_SECTOR {
             return Ok((false, None, None, None, mbr));
         }
 
-        let efi_part_size_sectors = VENTOY_EFI_PART_SIZE / SECTOR_SIZE;
+        let efi_part_size_sectors = CHOOSABLE_EFI_PART_SIZE / SECTOR_SIZE;
 
         // Check partition 2 is right after partition 1 and has correct size
         if gpt.partitions[1].start_lba != gpt.partitions[0].end_lba + 1
@@ -228,21 +228,21 @@ pub fn detect_ventoy(disk_path: &str, size_bytes: u64) -> Result<(bool, Option<S
             return Ok((false, None, None, None, mbr));
         }
 
-        // Read ventoy version from partition 2
+        // Read choosable version from partition 2
         let part2_start = gpt.partitions[1].start_lba * SECTOR_SIZE;
-        let version = read_ventoy_version(&disk_path, part2_start)?;
+        let version = read_choosable_version(&disk_path, part2_start)?;
 
         Ok((true, version, Some(part2_start), Some(gpt.partitions[1].attributes), mbr))
     } else {
         // MBR disk
 
         // Check partition 1 starts at 2048
-        if mbr.partitions[0].start_lba != VENTOY_PART1_START_SECTOR as u32 {
+        if mbr.partitions[0].start_lba != CHOOSABLE_PART1_START_SECTOR as u32 {
             return Ok((false, None, None, None, mbr));
         }
 
         let part1_end = mbr.partitions[0].start_lba + mbr.partitions[0].sector_count;
-        let efi_part_size_sectors = (VENTOY_EFI_PART_SIZE / SECTOR_SIZE) as u32;
+        let efi_part_size_sectors = (CHOOSABLE_EFI_PART_SIZE / SECTOR_SIZE) as u32;
 
         // Check partition 2 starts right after partition 1 and has correct size
         if mbr.partitions[1].start_lba != part1_end
@@ -251,23 +251,23 @@ pub fn detect_ventoy(disk_path: &str, size_bytes: u64) -> Result<(bool, Option<S
             return Ok((false, None, None, None, mbr));
         }
 
-        // Check partition 2 is type EF (EFI System) - not strictly required for MBR Ventoy
-        // (Ventoy uses 0xEF for the EFI partition in MBR mode)
+        // Check partition 2 is type EF (EFI System) - not strictly required for MBR Choosable
+        // (Choosable uses 0xEF for the EFI partition in MBR mode)
 
-        // Read ventoy version from partition 2
+        // Read choosable version from partition 2
         let part2_start = mbr.partitions[1].start_lba as u64 * SECTOR_SIZE;
-        let version = read_ventoy_version(&disk_path, part2_start)?;
+        let version = read_choosable_version(&disk_path, part2_start)?;
 
         Ok((true, version, Some(mbr.partitions[1].start_lba as u64), None, mbr))
     }
 }
 
-/// Read Ventoy version string from EFI partition
-fn read_ventoy_version(disk_path: &str, part2_start_byte: u64) -> Result<Option<String>> {
-    // Ventoy stores version in a file inside the EFI partition.
+/// Read Choosable version string from EFI partition
+fn read_choosable_version(disk_path: &str, part2_start_byte: u64) -> Result<Option<String>> {
+    // Choosable stores version in a file inside the EFI partition.
     // We can try to read it from a known offset.
     // For now, return None (version unknown) — we'll need exFAT/VFAT parsing for this.
-    // In the original Ventoy, the version is read via the file system.
+    // In the original Choosable, the version is read via the file system.
     // We can try to read raw bytes and look for version patterns.
     // But for a proper implementation, we'd need to mount or parse the filesystem.
 

@@ -39,7 +39,7 @@ fn main() -> Result<()> {
 
             let fs_type = installer::FilesystemType::from_str(&filesystem)?;
 
-            installer::install_ventoy(
+            installer::install_choosable(
                 &disk,
                 gpt,
                 secure_boot,
@@ -65,11 +65,11 @@ fn main() -> Result<()> {
                 None
             };
 
-            installer::update_ventoy(&disk, secure_boot, yes)?;
+            installer::update_choosable(&disk, secure_boot, yes)?;
         }
 
         Commands::List { disk } => {
-            installer::list_ventoy(&disk)?;
+            installer::list_choosable(&disk)?;
         }
 
         Commands::ListDisks => {

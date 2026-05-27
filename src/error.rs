@@ -11,16 +11,16 @@ pub enum ChoosableError {
     #[error("Disk is a partition, not a whole disk: {0}")]
     IsPartition(String),
 
-    #[error("Disk already contains Ventoy (version {0}). Use -u to update or -I to force install")]
+    #[error("Disk already contains Choosable (version {0}). Use -u to update or -I to force install")]
     AlreadyInstalled(String),
 
-    #[error("Disk does not contain Ventoy. Use -i to install")]
-    NotVentoyDisk,
+    #[error("Disk does not contain Choosable. Use -i to install")]
+    NotChoosableDisk,
 
     #[error("Disk is too small. Required: {required} bytes, available: {available} bytes")]
     DiskTooSmall { required: u64, available: u64 },
 
-    #[error("4K native sector disk detected. Ventoy does not support 4K native disks")]
+    #[error("4K native sector disk detected. Choosable does not support 4K native disks")]
     FourKNativeSector,
 
     #[error("MBR disk over 2TB. MBR does not support disks > 2TB. Use -g for GPT")]
@@ -35,7 +35,7 @@ pub enum ChoosableError {
     #[error("Invalid GPT signature: expected 'EFI PART'")]
     InvalidGptSignature,
 
-    #[error("Ventoy partition layout mismatch: {0}")]
+    #[error("Choosable partition layout mismatch: {0}")]
     PartitionLayoutError(String),
 
     #[error("FAT/exFAT format failed")]

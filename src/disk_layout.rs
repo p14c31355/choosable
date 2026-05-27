@@ -177,7 +177,7 @@ impl GptHeader {
             reserved1: [0u8; 4],
             efi_start_lba: 1,
             efi_backup_lba: total_sectors - 1,
-            part_area_start_lba: VENTOY_PART1_START_SECTOR,
+            part_area_start_lba: CHOOSABLE_PART1_START_SECTOR,
             part_area_end_lba: total_sectors - 34, // At least 33 sectors for backup GPT + 1
             disk_guid,
             part_table_start_lba: 2,
@@ -250,8 +250,8 @@ impl GptInfo {
         })
     }
 
-    /// Create new GPT layout for Ventoy installation
-    pub fn new_ventoy(disk_size_bytes: u64, disk_guid: Guid) -> Self {
+    /// Create new GPT layout for Choosable installation
+    pub fn new_choosable(disk_size_bytes: u64, disk_guid: Guid) -> Self {
         let mut protective_mbr = Mbr::new_empty();
         // GPT protective partition
         protective_mbr.partitions[0].fs_flag = PART_TYPE_GPT_PROTECTIVE;
@@ -260,15 +260,15 @@ impl GptInfo {
 
         let header = GptHeader::new(disk_size_bytes, disk_guid);
 
-        let efi_part_size_sectors = VENTOY_EFI_PART_SIZE / SECTOR_SIZE;
+        let efi_part_size_sectors = CHOOSABLE_EFI_PART_SIZE / SECTOR_SIZE;
 
         let mut partitions = [GptPartitionEntry::empty(); 128];
 
-        // Partition 1: Ventoy data (exFAT/NTFS)
+        // Partition 1: Choosable data (exFAT/NTFS)
         let part1_end = (disk_size_bytes / SECTOR_SIZE) - efi_part_size_sectors - 34; // Leave room for backup GPT + EFI part
         partitions[0].part_type_guid = GPT_TYPE_BASIC_DATA;
         partitions[0].unique_part_guid = generate_guid();
-        partitions[0].start_lba = VENTOY_PART1_START_SECTOR;
+        partitions[0].start_lba = CHOOSABLE_PART1_START_SECTOR;
         partitions[0].end_lba = part1_end - 1;
         partitions[0].attributes = 0;
         // Copy GPT_PART1_NAME into the array (use raw ptr arithmetic for packed struct)

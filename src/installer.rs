@@ -33,8 +33,8 @@ impl FilesystemType {
     }
 }
 
-/// Install Ventoy to a disk (MBR or GPT)
-pub fn install_ventoy(
+/// Install Choosable to a disk (MBR or GPT)
+pub fn install_choosable(
     disk_path: &str,
     use_gpt: bool,
     secure_boot: bool,
@@ -64,7 +64,7 @@ pub fn install_ventoy(
     }
 
     // Check if disk is large enough
-    let required_sectors = VENTOY_PART1_START_SECTOR + (VENTOY_PART_SIZE_MB * 2048);
+    let required_sectors = CHOOSABLE_PART1_START_SECTOR + (CHOOSABLE_PART_SIZE_MB * 2048);
     let required_bytes = required_sectors * SECTOR_SIZE;
     if size_bytes < required_bytes {
         return Err(ChoosableError::DiskTooSmall {
@@ -75,7 +75,7 @@ pub fn install_ventoy(
 
     // Check reserved space
     if reserve_space_mb > 0 {
-        let reserve_sectors = (reserve_space_mb + VENTOY_PART_SIZE_MB) * 2048;
+        let reserve_sectors = (reserve_space_mb + CHOOSABLE_PART_SIZE_MB) * 2048;
         let disk_sectors = size_bytes / SECTOR_SIZE;
         if disk_sectors <= reserve_sectors {
             return Err(ChoosableError::Generic(format!(
@@ -84,9 +84,9 @@ pub fn install_ventoy(
         }
     }
 
-    // Check if Ventoy is already installed
-    let (is_ventoy, version, _, _, _) = detect_ventoy(disk_path, size_bytes)?;
-    if is_ventoy && !force {
+    // Check if Choosable is already installed
+    let (is_choosable, version, _, _, _) = detect_choosable(disk_path, size_bytes)?;
+    if is_choosable && !force {
         return Err(ChoosableError::AlreadyInstalled(
             version.unwrap_or_else(|| "?".to_string())
         ));
@@ -108,7 +108,7 @@ pub fn install_ventoy(
 
     // Warning
     eprintln!("\x1b[33mAttention:\x1b[0m");
-    eprintln!("\x1b[33mYou will install Ventoy to {}.\x1b[0m", disk_path);
+    eprintln!("\x1b[33mYou will install Choosable to {}.\x1b[0m", disk_path);
     eprintln!("\x1b[33mAll the data on the disk {} will be lost!!!\x1b[0m", disk_path);
     eprintln!();
 
@@ -170,12 +170,12 @@ pub fn install_ventoy(
     }
 
     println!();
-    println!("\x1b[32mVentoy installed successfully to {}.\x1b[0m", disk_path);
+    println!("\x1b[32mChoosable installed successfully to {}.\x1b[0m", disk_path);
 
     Ok(())
 }
 
-/// Install Ventoy with MBR partition style
+/// Install Choosable with MBR partition style
 fn install_mbr<W: Write + Seek>(
     disk: &mut W,
     disk_path: &str,
@@ -186,8 +186,8 @@ fn install_mbr<W: Write + Seek>(
     secure_boot: bool,
 ) -> Result<()> {
     let total_sectors = disk_size_bytes / SECTOR_SIZE;
-    let efi_part_sectors = VENTOY_EFI_PART_SIZE / SECTOR_SIZE;
-    let part1_start = VENTOY_PART1_START_SECTOR;
+    let efi_part_sectors = CHOOSABLE_EFI_PART_SIZE / SECTOR_SIZE;
+    let part1_start = CHOOSABLE_PART1_START_SECTOR;
 
     // Calculate partition layout
     let part2_start = if reserve_space_mb > 0 {
@@ -264,7 +264,7 @@ fn install_mbr<W: Write + Seek>(
 
     disk.flush()?;
 
-    // Write ventoy disk image to partition 2
+    // Write choosable disk image to partition 2
     write_disk_image(disk, disk_path, part2_start, secure_boot)?;
 
     println!("Done.");
@@ -272,7 +272,7 @@ fn install_mbr<W: Write + Seek>(
     Ok(())
 }
 
-/// Install Ventoy with GPT partition style
+/// Install Choosable with GPT partition style
 fn install_gpt<W: Write + Seek>(
     disk: &mut W,
     disk_path: &str,
@@ -282,7 +282,7 @@ fn install_gpt<W: Write + Seek>(
     fs_type: FilesystemType,
     secure_boot: bool,
 ) -> Result<()> {
-    let efi_part_sectors = VENTOY_EFI_PART_SIZE / SECTOR_SIZE;
+    let efi_part_sectors = CHOOSABLE_EFI_PART_SIZE / SECTOR_SIZE;
     let total_sectors = disk_size_bytes / SECTOR_SIZE;
 
     // Calculate partition layout
@@ -297,10 +297,10 @@ fn install_gpt<W: Write + Seek>(
 
     // Build GPT
     let disk_guid = generate_guid();
-    let mut gpt_info = GptInfo::new_ventoy(disk_size_bytes, disk_guid);
+    let mut gpt_info = GptInfo::new_choosable(disk_size_bytes, disk_guid);
 
     // Adjust partition boundaries
-    gpt_info.partitions[0].start_lba = VENTOY_PART1_START_SECTOR;
+    gpt_info.partitions[0].start_lba = CHOOSABLE_PART1_START_SECTOR;
     gpt_info.partitions[0].end_lba = part1_end;
     gpt_info.partitions[0].attributes = 0;
 
@@ -330,7 +330,7 @@ fn install_gpt<W: Write + Seek>(
     disk.write_all(&disk_guid_write[12..16])?;
     disk.flush()?;
 
-    // Write ventoy disk image to partition 2
+    // Write choosable disk image to partition 2
     write_disk_image(disk, disk_path, part2_start, secure_boot)?;
 
     std::thread::sleep(std::time::Duration::from_secs(1));
@@ -390,7 +390,7 @@ fn write_boot_images<W: Write + Seek>(
     println!("Writing boot images...");
 
     // Read boot.img (446 bytes for MBR boot code)
-    let boot_img = read_install_file(VENTOY_FILE_BOOT_IMG)?;
+    let boot_img = read_install_file(CHOOSABLE_FILE_BOOT_IMG)?;
     let boot_code_len = std::cmp::min(boot_img.len(), 446);
 
     // Write boot code to the beginning of the disk
@@ -403,7 +403,7 @@ fn write_boot_images<W: Write + Seek>(
         disk.write_all(&[0x22])?;
 
         // Decompress and write core.img (xz compressed) to offset 34 sectors
-        let core_img_xz = read_install_file(VENTOY_FILE_STG1_IMG)?;
+        let core_img_xz = read_install_file(CHOOSABLE_FILE_STG1_IMG)?;
         let decompressed = decompress_xz(&core_img_xz)?;
         let write_len = std::cmp::min(decompressed.len(), 2014 * 512);
         disk.seek(SeekFrom::Start(34 * 512))?;
@@ -414,17 +414,17 @@ fn write_boot_images<W: Write + Seek>(
         disk.write_all(&[0x23])?;
     } else {
         // MBR: Write core.img starting at sector 1
-        let core_img_xz = read_install_file(VENTOY_FILE_STG1_IMG)?;
+        let core_img_xz = read_install_file(CHOOSABLE_FILE_STG1_IMG)?;
         let decompressed = decompress_xz(&core_img_xz)?;
         let write_len = std::cmp::min(decompressed.len(), 2047 * 512);
         disk.seek(SeekFrom::Start(1 * 512))?;
         disk.write_all(&decompressed[..write_len])?;
     }
 
-    // Write ventoy.disk.img to partition 2
-    let disk_img_xz = read_install_file(VENTOY_FILE_DISK_IMG)?;
+    // Write choosable.disk.img to partition 2
+    let disk_img_xz = read_install_file(CHOOSABLE_FILE_DISK_IMG)?;
     let decompressed = decompress_xz(&disk_img_xz)?;
-    let write_len = std::cmp::min(decompressed.len(), (VENTOY_SECTOR_NUM * 512) as usize);
+    let write_len = std::cmp::min(decompressed.len(), (CHOOSABLE_SECTOR_NUM * 512) as usize);
     disk.seek(SeekFrom::Start(part2_start_sector * 512))?;
     disk.write_all(&decompressed[..write_len])?;
 
@@ -433,7 +433,7 @@ fn write_boot_images<W: Write + Seek>(
     Ok(())
 }
 
-/// Write the ventoy disk image to partition 2 (for install_gpt which uses disk_path)
+/// Write the choosable disk image to partition 2 (for install_gpt which uses disk_path)
 fn write_disk_image<W: Write + Seek>(
     disk: &mut W,
     disk_path: &str,
@@ -442,9 +442,9 @@ fn write_disk_image<W: Write + Seek>(
 ) -> Result<()> {
     println!("Writing disk image to partition 2...");
 
-    let disk_img_xz = read_install_file(VENTOY_FILE_DISK_IMG)?;
+    let disk_img_xz = read_install_file(CHOOSABLE_FILE_DISK_IMG)?;
     let decompressed = decompress_xz(&disk_img_xz)?;
-    let write_len = std::cmp::min(decompressed.len(), (VENTOY_SECTOR_NUM * 512) as usize);
+    let write_len = std::cmp::min(decompressed.len(), (CHOOSABLE_SECTOR_NUM * 512) as usize);
     disk.seek(SeekFrom::Start(part2_start_sector * 512))?;
     disk.write_all(&decompressed[..write_len])?;
 
@@ -499,8 +499,8 @@ fn decompress_xz(data: &[u8]) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
-/// Update Ventoy on an already-installed disk
-pub fn update_ventoy(
+/// Update Choosable on an already-installed disk
+pub fn update_choosable(
     disk_path: &str,
     secure_boot: Option<bool>,
     yes: bool,
@@ -513,11 +513,11 @@ pub fn update_ventoy(
     let size_bytes = get_disk_size(disk_path)?;
     let model = get_disk_model(disk_path);
 
-    // Detect Ventoy
-    let (is_ventoy, old_version, part2_start, _, mbr) = detect_ventoy(disk_path, size_bytes)?;
+    // Detect Choosable
+    let (is_choosable, old_version, part2_start, _, mbr) = detect_choosable(disk_path, size_bytes)?;
 
-    if !is_ventoy {
-        return Err(ChoosableError::NotVentoyDisk);
+    if !is_choosable {
+        return Err(ChoosableError::NotChoosableDisk);
     }
 
     let old_ver = old_version.unwrap_or_else(|| "Unknown".to_string());
@@ -538,7 +538,7 @@ pub fn update_ventoy(
     println!();
 
     if !yes {
-        print!("Update Ventoy {} ===> {}   Continue? (y/n) ", old_ver, cur_ver);
+        print!("Update Choosable {} ===> {}   Continue? (y/n) ", old_ver, cur_ver);
         use std::io::Write;
         std::io::stdout().flush().ok();
         let mut answer = String::new();
@@ -560,7 +560,7 @@ pub fn update_ventoy(
     disk.read_exact(&mut diskuuid)?;
 
     // Write boot image
-    let boot_img = read_install_file(VENTOY_FILE_BOOT_IMG)?;
+    let boot_img = read_install_file(CHOOSABLE_FILE_BOOT_IMG)?;
     let boot_code_len = std::cmp::min(boot_img.len(), 440);
     disk.seek(SeekFrom::Start(0))?;
     disk.write_all(&boot_img[..boot_code_len])?;
@@ -581,7 +581,7 @@ pub fn update_ventoy(
         disk.seek(SeekFrom::Start(92))?;
         disk.write_all(&[0x22])?;
 
-        let core_img_xz = read_install_file(VENTOY_FILE_STG1_IMG)?;
+        let core_img_xz = read_install_file(CHOOSABLE_FILE_STG1_IMG)?;
         let decompressed = decompress_xz(&core_img_xz)?;
         let write_len = std::cmp::min(decompressed.len(), 2014 * 512);
         disk.seek(SeekFrom::Start(34 * 512))?;
@@ -602,7 +602,7 @@ pub fn update_ventoy(
             disk.write_all(&[PART_INACTIVE])?;
         }
 
-        let core_img_xz = read_install_file(VENTOY_FILE_STG1_IMG)?;
+        let core_img_xz = read_install_file(CHOOSABLE_FILE_STG1_IMG)?;
         let decompressed = decompress_xz(&core_img_xz)?;
         let write_len = std::cmp::min(decompressed.len(), 2047 * 512);
         disk.seek(SeekFrom::Start(1 * 512))?;
@@ -616,10 +616,10 @@ pub fn update_ventoy(
     // Sync
     disk.flush()?;
 
-    // Write ventoy disk image
-    let disk_img_xz = read_install_file(VENTOY_FILE_DISK_IMG)?;
+    // Write choosable disk image
+    let disk_img_xz = read_install_file(CHOOSABLE_FILE_DISK_IMG)?;
     let decompressed = decompress_xz(&disk_img_xz)?;
-    let write_len = std::cmp::min(decompressed.len(), (VENTOY_SECTOR_NUM * 512) as usize);
+    let write_len = std::cmp::min(decompressed.len(), (CHOOSABLE_SECTOR_NUM * 512) as usize);
     disk.seek(SeekFrom::Start(part2_start))?;
     disk.write_all(&decompressed[..write_len])?;
 
@@ -636,21 +636,21 @@ pub fn update_ventoy(
     }
 
     println!();
-    println!("\x1b[32mVentoy updated successfully on {}.\x1b[0m", disk_path);
+    println!("\x1b[32mChoosable updated successfully on {}.\x1b[0m", disk_path);
 
     Ok(())
 }
 
-/// Get the current Ventoy version from installation files
+/// Get the current Choosable version from installation files
 fn get_current_version() -> Result<String> {
-    match read_install_file(VENTOY_FILE_VERSION) {
+    match read_install_file(CHOOSABLE_FILE_VERSION) {
         Ok(data) => Ok(String::from_utf8_lossy(&data).trim().to_string()),
         Err(_) => Ok("Unknown".to_string()),
     }
 }
 
-/// List Ventoy information on a disk
-pub fn list_ventoy(disk_path: &str) -> Result<()> {
+/// List Choosable information on a disk
+pub fn list_choosable(disk_path: &str) -> Result<()> {
     if !is_whole_disk(disk_path) {
         return Err(ChoosableError::IsPartition(disk_path.to_string()));
     }
@@ -662,10 +662,10 @@ pub fn list_ventoy(disk_path: &str) -> Result<()> {
     println!("Model: {}", model);
     println!("Size : {} GiB", human_readable_gb(size_bytes));
 
-    let (is_ventoy, version, _part2_start, _gpt_attr, mbr) = detect_ventoy(disk_path, size_bytes)?;
+    let (is_choosable, version, _part2_start, _gpt_attr, mbr) = detect_choosable(disk_path, size_bytes)?;
 
-    if is_ventoy {
-        println!("Ventoy Version in Disk: {}", version.unwrap_or_else(|| "?".to_string()));
+    if is_choosable {
+        println!("Choosable Version in Disk: {}", version.unwrap_or_else(|| "?".to_string()));
 
         let style = if mbr.is_gpt_protective() { "GPT" } else { "MBR" };
         println!("Disk Partition Style  : {}", style);
@@ -673,7 +673,7 @@ pub fn list_ventoy(disk_path: &str) -> Result<()> {
         // Secure boot status (we'd need to read the EFI partition to determine this)
         println!("Secure Boot Support   : YES");
     } else {
-        println!("Ventoy Version: NA");
+        println!("Choosable Version: NA");
     }
 
     println!();
