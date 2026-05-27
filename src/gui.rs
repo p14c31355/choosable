@@ -85,7 +85,7 @@ impl Default for ChoosableApp {
             use_gpt: false,
             secure_boot: true,
             force: false,
-            label: String::from("Ventoy"),
+            label: String::from("Choosable"),
             reserve_space: String::new(),
             non_destructive: false,
             fs_type: FsType::ExFat,
@@ -175,7 +175,7 @@ impl ChoosableApp {
         Task::none()
     }
 
-    fn view(&self) -> Element<Message> {
+    fn view(&self) -> Element<'_, Message> {
         let disk_picker: Element<Message> = if self.disks.is_empty() {
             text("No disks found. Click Refresh to scan.").into()
         } else {
@@ -201,7 +201,7 @@ impl ChoosableApp {
             ].spacing(8),
             row![
                 text("Label: "),
-                text_input("Ventoy", &self.label).on_input(Message::LabelChanged).width(Length::Fixed(150.0)),
+                text_input("Choosable", &self.label).on_input(Message::LabelChanged).width(Length::Fixed(150.0)),
             ].spacing(8),
             row![
                 text("Reserve (MiB): "),
@@ -235,7 +235,7 @@ impl ChoosableApp {
     }
 }
 
-// ── Async tasks ─────────────────────────────────────────────────────────
+// ── Async tasks (yes=true to avoid stdin prompts in GUI) ────────────────
 
 async fn refresh_disks() -> Vec<DiskEntry> {
     match crate::disk::enumerate_disks() {
@@ -269,9 +269,9 @@ async fn run_install(
     };
 
     let result = if non_destructive {
-        crate::installer::non_destructive_install(&disk_path, &label, ft, secure_boot, false)
+        crate::installer::non_destructive_install(&disk_path, &label, ft, secure_boot, true)
     } else {
-        crate::installer::install_choosable(&disk_path, gpt, secure_boot, reserve, &label, ft, force, false)
+        crate::installer::install_choosable(&disk_path, gpt, secure_boot, reserve, &label, ft, force, true)
     };
 
     match result {
@@ -281,7 +281,7 @@ async fn run_install(
 }
 
 async fn run_update(disk_path: String, secure_boot: Option<bool>) -> String {
-    match crate::installer::update_choosable(&disk_path, secure_boot, false) {
+    match crate::installer::update_choosable(&disk_path, secure_boot, true) {
         Ok(()) => String::from("Update completed successfully!"),
         Err(e) => format!("Update failed: {}", e),
     }
