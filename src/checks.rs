@@ -190,7 +190,7 @@ pub fn wait_for_partitions(disk_path: &str) -> Result<()> {
 
 /// Read major:minor from /sys/class/block/{dev}/dev
 fn read_dev_major_minor(part_path: &str) -> Option<(u32, u32)> {
-    let name = part_path.trim_start_matches("/dev/");
+    let name = part_path.strip_prefix("/dev/").unwrap_or(part_path);
     let dev_file = format!("/sys/class/block/{}/dev", name);
     if let Ok(contents) = std::fs::read_to_string(&dev_file) {
         let parts: Vec<&str> = contents.trim().split(':').collect();
