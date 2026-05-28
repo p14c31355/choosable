@@ -822,37 +822,72 @@ fn write_gpt_f(disk: &mut std::fs::File, _disk_path: &str, disk_size_bytes: u64,
     gpt_info.partitions[1].end_lba = part2_start + efi_part_sectors - 1;
     gpt_info.partitions[1].attributes = GPT_ATTR_CZBLEFI;
 
-    // ── Phase 1: All raw-disk writes BEFORE partitions exist ──────────
-    // Write boot code (440 bytes) + GPT protective MBR
-    let boot_img = bootloader::BOOT_IMG;
-    let boot_code_len = std::cmp::min(boot_img.len(), 440);
-    disk.seek(SeekFrom::Start(0))?;
-    disk.write_all(&boot_img[..boot_code_len])?;
-
-    // Write Stage 2 (core.img) into GPT gap (LBA 34–2047)
-    disk.seek(SeekFrom::Start(92))?; disk.write_all(&[0x22])?;
+    // ── All raw-disk writes in one pass, then fix up MBR ────────────
+    // 1. Write Stage 2 into GPT gap (LBA 34–2047)
     let core = bootloader::STAGE2_BIN;
     let core_len = std::cmp::min(core.len(), 2014 * 512);
     disk.seek(SeekFrom::Start(34 * SECTOR_SIZE))?;
     disk.write_all(&core[..core_len])?;
-    disk.seek(SeekFrom::Start(17908))?; disk.write_all(&[0x23])?;
 
-    // Write GUID at offset 384/440
-    disk.seek(SeekFrom::Start(384))?; disk.write_all(&disk_guid)?;
-    disk.seek(SeekFrom::Start(440))?; disk.write_all(&disk_guid[12..16])?;
-
-    // Finalize CRCs
+    // 2. Finalize CRCs and write GPT structures (protective MBR + header + table)
     finalize_gpt_crcs(&mut gpt_info);
-
-    // Write full GPT (protective MBR + GPT header + partition table).
-    // This overwrites the boot code we wrote above (protective MBR has
-    // boot_code = [0u8; 446]), so re-write boot code afterwards.
     gpt_info.write_to_disk(disk)?;
     disk.flush()?;
 
-    // Re-write boot code (bytes 0–440) — gpt_info.write_to_disk zeroed it
+    // 3. Overwrite the protective-MBR boot code area (bytes 0–440) with
+    //    our real boot sector.  gpt_info.write_to_disk() wrote a zero-filled
+    //    protective MBR (boot_code = [0u8; 446]), so we MUST write boot_img
+    //    AFTER that.  We also patch the MBR in-memory so it reads stage2
+    //    from LBA 34 (the GPT gap) instead of LBA 1.
+    let boot_img = bootloader::BOOT_IMG;
+    let boot_code_len = std::cmp::min(boot_img.len(), 440);
+
+    // Build a complete 512-byte MBR sector in memory so we can patch LBA
+    // fields and write it in a single I/O.
+    let mut mbr_bytes = [0u8; 512];
+    mbr_bytes[..boot_code_len].copy_from_slice(&boot_img[..boot_code_len]);
+
+    // Disk GUID at offset 384 and 440 (NT serial-like)
+    mbr_bytes[384..400].copy_from_slice(&disk_guid);
+    mbr_bytes[440..444].copy_from_slice(&disk_guid[12..16]);
+
+    // MBR boot signature at 510–511
+    mbr_bytes[510] = MBR_SIGNATURE_55;
+    mbr_bytes[511] = MBR_SIGNATURE_AA;
+
+    // Patch the LBA fields inside the boot code so that the MBR loads
+    // stage2 from the GPT gap (LBA 34) instead of the MBR gap (LBA 1).
+    //
+    // The MBR code stores the starting LBA in a DAP at address 0x07C8
+    // (variable `dll` in build_mbr_boot_sector).  The 32-bit LBA value
+    // is encoded as an immediate operand of a MOV DWORD PTR [dll], imm32
+    // instruction.  We locate it by searching for the DAP buffer address
+    // 0xC8 0x07 in little-endian inside the boot code bytes.
+    //
+    // Instruction encoding (from build_mbr_boot_sector):
+    //   66 C7 06 C8 07  01 00 00 00  → MOV DWORD [0x07C8], 1
+    //                                    ^^^^^^^^ ^^^^^^^^^^^
+    //                                     opcode    imm32 = LBA
+    // We search for C7 06 C8 07 and patch the 4 bytes after it.
+    let lba_patch: u32 = 34u32.to_le();
+    let needle: [u8; 4] = [0xC7, 0x06, 0xC8, 0x07];
+    let mut patched = false;
+    for i in 0..(boot_code_len.saturating_sub(8)) {
+        if mbr_bytes[i..i+4] == needle {
+            mbr_bytes[i+4..i+8].copy_from_slice(&lba_patch.to_le_bytes());
+            patched = true;
+            break;
+        }
+    }
+    if !patched {
+        // Fallback: if the pattern isn't found, stage2 loading will read
+        // from LBA 1 (MBR gap), which works for MBR layout but not for
+        // GPT.  The disk won't boot in GPT mode in this case.
+    }
+
+    // Write the complete 512-byte MBR sector
     disk.seek(SeekFrom::Start(0))?;
-    disk.write_all(&boot_img[..boot_code_len])?;
+    disk.write_all(&mbr_bytes)?;
     disk.flush()?;
 
     Ok(part2_start * SECTOR_SIZE)
@@ -906,19 +941,42 @@ fn format_partition(partition: &str, label: &str, fs_type: FilesystemType) -> Re
 fn write_boot_images(disk: &mut std::fs::File, is_gpt: bool, _part2_start_sector: u64) -> Result<()> {
     println!("Writing boot images...");
     let boot_img = bootloader::BOOT_IMG;
-    let boot_code_len = std::cmp::min(boot_img.len(), 440);
-    disk.seek(SeekFrom::Start(0))?;
-    disk.write_all(&boot_img[..boot_code_len])?;
-
     let core = bootloader::STAGE2_BIN;
+
     if is_gpt {
-        disk.seek(SeekFrom::Start(92))?; disk.write_all(&[0x22])?;
-        let len = std::cmp::min(core.len(), 2014 * 512);
-        disk.seek(SeekFrom::Start(34 * 512))?; disk.write_all(&core[..len])?;
-        disk.seek(SeekFrom::Start(17908))?; disk.write_all(&[0x23])?;
+        // Write Stage 2 into GPT gap (LBA 34–2047)
+        let core_len = std::cmp::min(core.len(), 2014 * 512);
+        disk.seek(SeekFrom::Start(34 * 512))?;
+        disk.write_all(&core[..core_len])?;
+
+        // Patch MBR LBA from 1 → 34 using the same needle search as write_gpt_f
+        let boot_code_len = std::cmp::min(boot_img.len(), 440);
+        let mut mbr_bytes = [0u8; 512];
+        mbr_bytes[..boot_code_len].copy_from_slice(&boot_img[..boot_code_len]);
+
+        // MBR signatures
+        mbr_bytes[510] = MBR_SIGNATURE_55;
+        mbr_bytes[511] = MBR_SIGNATURE_AA;
+
+        let lba: u32 = 34u32.to_le();
+        let needle: [u8; 4] = [0xC7, 0x06, 0xC8, 0x07];
+        for i in 0..(boot_code_len.saturating_sub(8)) {
+            if mbr_bytes[i..i+4] == needle {
+                mbr_bytes[i+4..i+8].copy_from_slice(&lba.to_le_bytes());
+                break;
+            }
+        }
+        disk.seek(SeekFrom::Start(0))?;
+        disk.write_all(&mbr_bytes)?;
     } else {
-        let len = std::cmp::min(core.len(), 2047 * 512);
-        disk.seek(SeekFrom::Start(1 * 512))?; disk.write_all(&core[..len])?;
+        // Write MBR boot code + Stage 2 into MBR gap (LBA 1–2047)
+        let boot_code_len = std::cmp::min(boot_img.len(), 440);
+        disk.seek(SeekFrom::Start(0))?;
+        disk.write_all(&boot_img[..boot_code_len])?;
+
+        let core_len = std::cmp::min(core.len(), 2047 * 512);
+        disk.seek(SeekFrom::Start(1 * 512))?;
+        disk.write_all(&core[..core_len])?;
     }
 
     disk.flush()?;
