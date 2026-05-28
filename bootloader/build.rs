@@ -143,7 +143,7 @@ fn build_mbr_boot_sector() -> Vec<u8> {
     let dsc: u16 = 0x07C2;
     let dll: u16 = 0x07C8;
     let da: u16 = 0x07C0;
-    let cookie_addr: u16 = 0x7DF0;
+    let cookie_addr: u16 = 0x7B00;
 
     c.mov_mem8_dl(dn);
 
