@@ -516,7 +516,7 @@ fn build_efi_binary(out_dir: &PathBuf) -> Vec<u8> {
 
     match s {
         Ok(st) if st.success() => {}
-        _ => { println!("cargo:warning=EFI build failed, placeholder"); return vec![0;512]; }
+        _ => panic!("EFI build failed"),
     }
     let path = efi_target.join("x86_64-unknown-uefi/release/choosable-efi.efi");
     fs::read(&path).unwrap_or_else(|_| vec![0;512])
