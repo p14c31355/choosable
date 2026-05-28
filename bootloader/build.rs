@@ -326,11 +326,7 @@ fn build_stage2_binary(kernel: &[u8]) -> Vec<u8> {
     c.emit(0xBF).emit32(pml4_phys);       // MOV EDI, pml4_phys
     c.emit(0xB9).emit32(1024);             // MOV ECX, 1024
     c.emit(0x31).emit(0xC0);               // XOR EAX, EAX
-    let z1 = c.offset() as usize;
-    c.emit(0xAB);                          // STOSD
-    c.emit(0x49);                          // DEC ECX
-    let z1j = c.offset(); c.emit(0x75).emit(0x00);
-    c.bytes[z1j as usize+1] = (z1 as u32).wrapping_sub(z1j as u32).wrapping_sub(2) as u8;
+    c.emit(0xF3).emit(0xAB);               // REP STOSD
 
     // Zero PDPT
     c.emit(0xBF).emit32(pdpt_phys);
