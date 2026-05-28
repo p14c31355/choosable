@@ -1011,6 +1011,11 @@ fn write_efi_bootloader(disk_path: &str, _part2_start_byte: u64) -> Result<()> {
     // page-cache data when mkfs.vfat wrote through the partition device.
     let part2 = get_partition_name(disk_path, 2);
 
+    // Unmount if the OS auto-mounter (udisks2) already mounted the partition
+    // after udev resumed.  Writing to a mounted block device via fatfs causes
+    // filesystem corruption.
+    check_umount(&part2);
+
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)

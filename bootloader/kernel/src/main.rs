@@ -18,9 +18,13 @@ fn vga_clear(attr: u8) {
 }
 
 fn vga_print(row: usize, col: usize, s: &[u8], attr: u8) {
-    let mut off = (row * VGA_COLS + col) * 2;
+    if row >= VGA_ROWS || col >= VGA_COLS { return; }
+    let base = (row * VGA_COLS + col) * 2;
+    let buf_end = VGA_COLS * VGA_ROWS * 2;
+    let mut off = base;
     for &ch in s {
         if ch == 0 { break; }
+        if off >= buf_end { break; }
         unsafe { *VGA.add(off) = ch; *VGA.add(off + 1) = attr; }
         off += 2;
     }
@@ -301,8 +305,16 @@ fn scan_directory(info: &ExfatInfo, root_cluster: u32, files: &mut [DirEntry], f
                     // resume parsing when the next sector is read.
                     if i + total_entries > entry_count {
                         let remaining = total - off;
-                        carry[..remaining].copy_from_slice(&entries[off..]);
-                        carry_len = remaining;
+                        // `secondary_count` comes from the disk and may be
+                        // invalid/corrupted. If the partial entry set is larger
+                        // than our carry-over buffer, discard it instead of
+                        // panicking.
+                        if remaining <= carry.len() {
+                            carry[..remaining].copy_from_slice(&entries[off..]);
+                            carry_len = remaining;
+                        } else {
+                            carry_len = 0;
+                        }
                         break; // wait for next sector
                     }
 
