@@ -203,36 +203,33 @@ pub fn non_destructive_install(disk_path: &str, label: &str, fs_type: Filesystem
     std::thread::sleep(std::time::Duration::from_millis(500));
     checks::wait_for_partitions(disk_path)?;
 
-    // Format EFI partition and write bootloader while udev is still
-    // stopped.  If udev is running, mkfs.vfat will fire change events
-    // that cause udisks2 to see half-initialised filesystems.
-    format_efi_partition(disk_path, 2)?;
-
-    write_efi_bootloader(disk_path, part2_start_sector * SECTOR_SIZE)?;
-
-    // Fix GPT attributes for GPT scheme
+    // Fix GPT attributes while udev is stopped (raw-disk operation)
     if is_gpt {
         fix_gpt_attributes(disk_path)?;
     }
 
-    if !secure_boot {
-        // Safe while udev is stopped — operates on the already-formatted
-        // FAT filesystem.
-        process_secure_boot_esp(disk_path, part2_start_sector * SECTOR_SIZE, false)?;
-    }
-
-    // All disk writes are complete.  Re-read kernel partition table,
-    // then resume udev so that udisks2 sees the final consistent state.
-    let _ = std::process::Command::new("sync")
-        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+    // ── Raw disk writes complete — resume udev now ──────────────────
+    // mkfs.vfat and FAT writes generate filesystem-change uevents that
+    // must be processed immediately by udev.  If udev is stopped, all
+    // uevents fire at once when it resumes and udisks2 drops D-Bus objects.
     notify_kernel_before_udev(disk_path);
 
-    // Resume udev event processing now.
     let _ = std::process::Command::new("udevadm")
         .args(&["control", "--start-exec-queue"])
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+    let _ = std::process::Command::new("udevadm").arg("settle")
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
 
-    // Trigger change events and let udisks2 pick up the final state.
+    // Filesystem-level operations — safe with udev running
+    format_efi_partition(disk_path, 2)?;
+
+    write_efi_bootloader(disk_path, part2_start_sector * SECTOR_SIZE)?;
+
+    if !secure_boot {
+        process_secure_boot_esp(disk_path, part2_start_sector * SECTOR_SIZE, false)?;
+    }
+
+    // Trigger change events so udisks2 re-reads the final partition state.
     notify_kernel_after_udev(disk_path);
 
     println!();
@@ -476,24 +473,22 @@ pub fn fix_gpt_attributes(disk_path: &str) -> Result<()> {
 
     if is_czblefi && current_attr != GPT_ATTR_CZBLEFI {
         println!("Fixing GPT attributes for CZBLEFI partition...");
+
+        // Save the real boot code (bytes 0–440) before write_to_disk()
+        // overwrites it with the zero-filled protective MBR.
+        disk.seek(SeekFrom::Start(0))?;
+        let mut saved_boot_code = [0u8; 440];
+        disk.read_exact(&mut saved_boot_code)?;
+
         entry.attributes = GPT_ATTR_CZBLEFI;
 
-        // Recalculate CRCs and write
+        // Recalculate CRCs and write GPT (primary + backup)
         finalize_gpt_crcs(&mut gpt);
         gpt.write_to_disk(&mut disk)?;
 
-        // Also write backup GPT
-        let backup_header = make_backup_gpt_header(&gpt);
-        let backup_offset = gpt.header.efi_backup_lba * SECTOR_SIZE;
-        disk.seek(SeekFrom::Start(backup_offset))?;
-        backup_header.write(&mut disk)?;
-
-        // Write backup partition table
-        let backup_pt_offset = (gpt.header.efi_backup_lba - 32) * SECTOR_SIZE;
-        disk.seek(SeekFrom::Start(backup_pt_offset))?;
-        let part_ptr = std::ptr::addr_of!(gpt.partitions) as *const u8;
-        let part_bytes = unsafe { std::slice::from_raw_parts(part_ptr, 128 * 128) };
-        disk.write_all(part_bytes)?;
+        // Restore the real boot code that write_to_disk() zeroed
+        disk.seek(SeekFrom::Start(0))?;
+        disk.write_all(&saved_boot_code)?;
 
         disk.flush()?;
         println!("GPT attributes fixed.");
@@ -700,10 +695,19 @@ pub fn install_choosable(
     std::thread::sleep(std::time::Duration::from_millis(500));
     checks::wait_for_partitions(disk_path)?;
 
-    // Format partitions and write EFI bootloader while udev is still
-    // stopped.  If udev is running, mkfs.* will fire change events that
-    // cause udisks2 to see half-initialised filesystems and produce
-    // "No object for D-bus interface" errors.
+    // ── Raw disk writes complete — resume udev now ──────────────────
+    // mkfs.* and FAT writes generate filesystem-change uevents that must
+    // be processed immediately by udev.  If udev is stopped, all uevents
+    // fire at once when it resumes and udisks2 drops D-Bus objects.
+    notify_kernel_before_udev(disk_path);
+
+    let _ = std::process::Command::new("udevadm")
+        .args(&["control", "--start-exec-queue"])
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+    let _ = std::process::Command::new("udevadm").arg("settle")
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+
+    // Filesystem-level operations — safe with udev running
     let part1 = get_partition_name(disk_path, 1);
     format_partition(&part1, label, fs_type)?;
     format_efi_partition(disk_path, 2)?;
@@ -711,23 +715,10 @@ pub fn install_choosable(
     write_efi_bootloader(disk_path, part2_start_sector)?;
 
     if !secure_boot {
-        // process_secure_boot_esp operates on the already-formatted FAT
-        // filesystem — safe while udev is stopped.
         process_secure_boot_esp(disk_path, part2_start_sector, false)?;
     }
 
-    // All disk writes are complete.  Re-read kernel partition table,
-    // then resume udev so that udisks2 sees the final consistent state.
-    let _ = std::process::Command::new("sync")
-        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
-    notify_kernel_before_udev(disk_path);
-
-    // Resume udev event processing now.
-    let _ = std::process::Command::new("udevadm")
-        .args(&["control", "--start-exec-queue"])
-        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
-
-    // Trigger change events and let udisks2 pick up the final state.
+    // Trigger change events so udisks2 re-reads the final partition state.
     notify_kernel_after_udev(disk_path);
 
     println!();
@@ -1109,35 +1100,70 @@ pub fn update_choosable(disk_path: &str, secure_boot: Option<bool>, yes: bool) -
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
 
     let part2_start = part2_start.unwrap();
+
+    // ── Write Stage2 (core.img) ─────────────────────────────────────
     let mut disk = open_disk_readwrite(disk_path)?;
-
-    let mut diskuuid = [0u8; 16];
-    disk.seek(SeekFrom::Start(384))?; disk.read_exact(&mut diskuuid)?;
-
-    let boot_img = bootloader::BOOT_IMG;
-    let boot_code_len = std::cmp::min(boot_img.len(), 440);
-    disk.seek(SeekFrom::Start(0))?; disk.write_all(&boot_img[..boot_code_len])?;
-    disk.seek(SeekFrom::Start(384))?; disk.write_all(&diskuuid)?;
-
-    let mut rsv_data = vec![0u8; 8 * 512];
-    disk.seek(SeekFrom::Start(2040 * 512))?; disk.read_exact(&mut rsv_data)?;
-
+    let core = bootloader::STAGE2_BIN;
     let is_gpt = mbr.is_gpt_protective();
 
     if is_gpt {
-        disk.seek(SeekFrom::Start(92))?; disk.write_all(&[0x22])?;
-        let core = bootloader::STAGE2_BIN;
         let len = std::cmp::min(core.len(), 2014 * 512);
-        disk.seek(SeekFrom::Start(34 * 512))?; disk.write_all(&core[..len])?;
-        disk.seek(SeekFrom::Start(17908))?; disk.write_all(&[0x23])?;
+        disk.seek(SeekFrom::Start(34 * 512))?;
+        disk.write_all(&core[..len])?;
     } else {
         if mbr.part1_active() == 0x00 && mbr.part2_active() == 0x80 {
             disk.seek(SeekFrom::Start(446))?; disk.write_all(&[PART_ACTIVE])?;
             disk.seek(SeekFrom::Start(462))?; disk.write_all(&[PART_INACTIVE])?;
         }
-        let core = bootloader::STAGE2_BIN;
         let len = std::cmp::min(core.len(), 2047 * 512);
-        disk.seek(SeekFrom::Start(1 * 512))?; disk.write_all(&core[..len])?;
+        disk.seek(SeekFrom::Start(1 * 512))?;
+        disk.write_all(&core[..len])?;
+    }
+    disk.flush()?;
+    drop(disk); // release before fix_gpt_attributes opens its own handle
+
+    // ── Fix GPT attributes (if needed) ──────────────────────────────
+    if is_gpt {
+        fix_gpt_attributes(disk_path)?;
+    }
+
+    // Re-open disk to write the boot code sector.
+    // Do this AFTER fix_gpt_attributes so the protective MBR doesn't
+    // overwrite our boot code.
+    let mut disk = open_disk_readwrite(disk_path)?;
+    let mut diskuuid = [0u8; 16];
+    disk.seek(SeekFrom::Start(384))?; disk.read_exact(&mut diskuuid)?;
+
+    let mut rsv_data = vec![0u8; 8 * 512];
+    disk.seek(SeekFrom::Start(2040 * 512))?; disk.read_exact(&mut rsv_data)?;
+
+    let boot_img = bootloader::BOOT_IMG;
+    let boot_code_len = std::cmp::min(boot_img.len(), 440);
+
+    if is_gpt {
+        // Build a complete MBR sector with LBA patched to 34
+        let mut mbr_bytes = [0u8; 512];
+        mbr_bytes[..boot_code_len].copy_from_slice(&boot_img[..boot_code_len]);
+        mbr_bytes[384..400].copy_from_slice(&diskuuid);
+        mbr_bytes[440..444].copy_from_slice(&diskuuid[12..16]);
+        mbr_bytes[510] = MBR_SIGNATURE_55;
+        mbr_bytes[511] = MBR_SIGNATURE_AA;
+
+        let lba: u32 = 34u32.to_le();
+        let needle: [u8; 4] = [0xC7, 0x06, 0xC8, 0x07];
+        for i in 0..(boot_code_len.saturating_sub(8)) {
+            if mbr_bytes[i..i+4] == needle {
+                mbr_bytes[i+4..i+8].copy_from_slice(&lba.to_le_bytes());
+                break;
+            }
+        }
+
+        disk.seek(SeekFrom::Start(0))?;
+        disk.write_all(&mbr_bytes)?;
+    } else {
+        disk.seek(SeekFrom::Start(0))?;
+        disk.write_all(&boot_img[..boot_code_len])?;
+        disk.seek(SeekFrom::Start(384))?; disk.write_all(&diskuuid)?;
     }
 
     disk.seek(SeekFrom::Start(2040 * 512))?; disk.write_all(&rsv_data)?;
@@ -1147,30 +1173,27 @@ pub fn update_choosable(disk_path: &str, secure_boot: Option<bool>, yes: bool) -
     let _ = std::process::Command::new("sync")
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
 
-    write_efi_bootloader(disk_path, part2_start)?;
-
-    if !use_secure_boot {
-        // Safe while udev is stopped — operates on the already-formatted
-        // FAT filesystem.
-        process_secure_boot_esp(disk_path, part2_start, false)?;
-    }
-
-    if is_gpt {
-        fix_gpt_attributes(disk_path)?;
-    }
-
-    // All disk writes are complete.  Re-read kernel partition table,
-    // then resume udev so that udisks2 sees the final consistent state.
-    let _ = std::process::Command::new("sync")
-        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+    // ── Raw disk writes complete — resume udev now ──────────────────
+    // Filesystem-level operations (write_efi_bootloader, secure_boot_esp)
+    // must run with udev active.  If udev is stopped, FAT writes queue
+    // filesystem-change uevents that all fire at once when udev resumes,
+    // causing udisks2 to drop and recreate D-Bus objects mid-flight and
+    // produce "No object for D-bus interface".
     notify_kernel_before_udev(disk_path);
 
-    // Resume udev event processing now.
     let _ = std::process::Command::new("udevadm")
         .args(&["control", "--start-exec-queue"])
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+    let _ = std::process::Command::new("udevadm").arg("settle")
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
 
-    // Trigger change events and let udisks2 pick up the final state.
+    write_efi_bootloader(disk_path, part2_start)?;
+
+    if !use_secure_boot {
+        process_secure_boot_esp(disk_path, part2_start, false)?;
+    }
+
+    // Trigger change events so udisks2 re-reads the final partition state.
     notify_kernel_after_udev(disk_path);
 
     println!();
