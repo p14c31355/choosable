@@ -952,11 +952,21 @@ fn write_efi_bootloader(disk_path: &str, _part2_start_byte: u64) -> Result<()> {
 pub fn update_choosable(disk_path: &str, secure_boot: Option<bool>, yes: bool) -> Result<()> {
     if !is_whole_disk(disk_path) { return Err(ChoosableError::IsPartition(disk_path.to_string())); }
 
+    // ═══════════════════════════════════════════════════════════════
+    //  Stop udev BEFORE any raw disk I/O (detect_choosable opens
+    //  the disk write+true and reads fatfs, which generates uevents
+    //  that confuse udisks2 when udev is running).
+    // ═══════════════════════════════════════════════════════════════
+    udev_stop();
+
     let size_bytes = get_disk_size(disk_path)?;
     let model = get_disk_model(disk_path);
     let (is_choosable, old_version, part2_start, _, mbr) = detect_choosable(disk_path, size_bytes)?;
 
-    if !is_choosable { return Err(ChoosableError::NotChoosableDisk); }
+    if !is_choosable {
+        udev_resume_and_notify_update(disk_path);
+        return Err(ChoosableError::NotChoosableDisk);
+    }
 
     checks::check_umount_disk(disk_path)?;
 
@@ -984,13 +994,12 @@ pub fn update_choosable(disk_path: &str, secure_boot: Option<bool>, yes: bool) -
         print!("Update Choosable {} ===> {}   Continue? (y/n) ", old_ver, cur_ver);
         std::io::stdout().flush().ok();
         let mut answer = String::new(); std::io::stdin().read_line(&mut answer).ok();
-        if answer.trim().to_lowercase() != "y" { println!("Aborted."); return Ok(()); }
+        if answer.trim().to_lowercase() != "y" {
+            udev_resume_and_notify_update(disk_path);
+            println!("Aborted.");
+            return Ok(());
+        }
     }
-
-    // ═══════════════════════════════════════════════════════════════
-    //  Stop udev, do EVERYTHING, then resume + notify ONCE.
-    // ═══════════════════════════════════════════════════════════════
-    udev_stop();
 
     let part2_start_val = part2_start.unwrap();
 
