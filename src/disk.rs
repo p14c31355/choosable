@@ -321,7 +321,7 @@ fn read_choosable_version(disk_path: &str, part2_start_byte: u64) -> Result<Opti
     file.seek(SeekFrom::Start(part2_start_byte))?;
     let slice = PartitionSlice::new(file, part2_start_byte, CHOOSABLE_EFI_PART_SIZE);
 
-    let fs = match fatfs::FileSystem::new(slice, fatfs::FsOptions::new()) {
+    let fs = match fatfs::FileSystem::new(slice, fatfs::FsOptions::new().read_only(true)) {
         Ok(fs) => fs,
         Err(_) => return Ok(None),
     };
