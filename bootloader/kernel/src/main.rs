@@ -263,96 +263,127 @@ fn scan_directory(info: &ExfatInfo, root_cluster: u32, files: &mut [DirEntry], f
     let mut cluster = root_cluster;
     let sectors_per_cluster = info.cluster_size_bytes / 512;
 
+    // An exFAT directory entry set can span a 512-byte sector boundary.
+    // Maximum set size: 1 File + 1 Stream Extension + 17 Name entries
+    // (255 UTF-16 code units ÷ 15 chars/entry) = 19 × 32 = 608 bytes.
+    // We keep a small carry-over buffer so that a partial set at the end
+    // of one sector is completed when the next sector arrives.
+    let mut carry = [0u8; 640];
+    let mut carry_len: usize = 0;
+
     'outer: loop {
         for sec in 0..sectors_per_cluster {
-            let mut buf = [0u8; 512];
-            if !read_cluster_sector(info, cluster, sec, &mut buf) { return; }
+            let mut sector = [0u8; 512];
+            if !read_cluster_sector(info, cluster, sec, &mut sector) { return; }
 
-            let entries = &buf; // 512 bytes = 16 x 32-byte entries
-            let mut i = 0;
-            while i < 16 {
+            // Concatenate any carry-over from the previous sector with
+            // the freshly-read sector so that entry sets spanning the
+            // boundary are fully visible.
+            let total = carry_len + 512;
+            let mut combined = [0u8; 640 + 512];
+            combined[..carry_len].copy_from_slice(&carry[..carry_len]);
+            combined[carry_len..total].copy_from_slice(&sector);
+            carry_len = 0; // consumed
+
+            let entries = &combined[..total];
+            let entry_count = total / 32;
+            let mut i = 0usize;
+            while i < entry_count {
                 let off = i * 32;
                 let entry_type = entries[off];
                 if entry_type == 0 { return; } // end of directory
                 if entry_type == EXFAT_ENTRY_FILE {
-                    let attrs = u16::from_le_bytes([entries[off+4], entries[off+5]]);
-                    let _is_dir = attrs & 0x10 != 0;
+                    let secondary_count = entries[off + 1] as usize;
+                    let total_entries = 1 + secondary_count;
+
+                    // If the full entry set doesn't fit in the current
+                    // combined buffer, save the tail into `carry` and
+                    // resume parsing when the next sector is read.
+                    if i + total_entries > entry_count {
+                        let remaining = total - off;
+                        carry[..remaining].copy_from_slice(&entries[off..]);
+                        carry_len = remaining;
+                        break; // wait for next sector
+                    }
 
                     // Stream Extension entry (0xC0) must follow the File entry
                     let stream_off = off + 32;
-                    if i + 2 < 16 && entries[stream_off] == 0xC0 {
-                        let start_cl = u32::from_le_bytes([
-                            entries[stream_off + 20],
-                            entries[stream_off + 21],
-                            entries[stream_off + 22],
-                            entries[stream_off + 23],
-                        ]);
-                        let size = u64::from_le_bytes([
-                            entries[stream_off + 24], entries[stream_off + 25],
-                            entries[stream_off + 26], entries[stream_off + 27],
-                            entries[stream_off + 28], entries[stream_off + 29],
-                            entries[stream_off + 30], entries[stream_off + 31],
-                        ]);
-
-                        // File Name entries (0xC1) follow the Stream Extension entry.
-                        // Names longer than 15 characters are split across multiple
-                        // consecutive File Name entries, with the total count given by
-                        // `secondary_count - 1` (the Stream Extension counts as one
-                        // secondary entry).
-                        let secondary_count = entries[off + 1] as usize;
-                        let name_entries_count = secondary_count.saturating_sub(1);
-                        let name_len = entries[stream_off + 3] as usize; // name length from Stream Extension
-                        let mut name_buf = [0u8; 256];
-                        let mut name_actual = 0usize;
-
-                        for entry_idx in 0..name_entries_count {
-                            let current_name_off = off + 64 + entry_idx * 32;
-                            if current_name_off + 32 > entries.len() {
-                                break;
-                            }
-                            if entries[current_name_off] != EXFAT_ENTRY_NAME {
-                                break;
-                            }
-                            let chars_to_copy = (name_len - name_actual).min(15);
-                            if chars_to_copy == 0 {
-                                break;
-                            }
-                            let copied = utf16le_to_ascii(
-                                &entries[current_name_off + 2..],
-                                chars_to_copy * 2,
-                                &mut name_buf[name_actual..],
-                            );
-                            name_actual += copied;
-                        }
-
-                        if name_actual > 0 {
-                            let name_str = &name_buf[..name_actual];
-
-                            // Check if it's an ISO file
-                            let is_iso = name_actual >= 4
-                                && (name_str[name_actual-4..].eq_ignore_ascii_case(b".iso")
-                                ||  name_str[name_actual-4..].eq_ignore_ascii_case(b".ISO"));
-
-                            if is_iso && *file_count < max_files {
-                                let mut n = [0u8; 256];
-                                n[..name_actual].copy_from_slice(name_str);
-                                files[*file_count] = DirEntry {
-                                    name: n,
-                                    name_len: name_actual,
-                                    is_iso: true,
-                                    start_cluster: start_cl,
-                                    file_size: size,
-                                };
-                                *file_count += 1;
-                            }
-                        }
-                        i += 1 + secondary_count; // skip the whole entry set
+                    if entries[stream_off] != 0xC0 {
+                        i += total_entries;
                         continue;
                     }
+
+                    let start_cl = u32::from_le_bytes([
+                        entries[stream_off + 20],
+                        entries[stream_off + 21],
+                        entries[stream_off + 22],
+                        entries[stream_off + 23],
+                    ]);
+                    let size = u64::from_le_bytes([
+                        entries[stream_off + 24], entries[stream_off + 25],
+                        entries[stream_off + 26], entries[stream_off + 27],
+                        entries[stream_off + 28], entries[stream_off + 29],
+                        entries[stream_off + 30], entries[stream_off + 31],
+                    ]);
+
+                    // File Name entries (0xC1) follow the Stream Extension entry.
+                    // Names longer than 15 characters are split across multiple
+                    // consecutive File Name entries, with the total count given by
+                    // `secondary_count - 1` (the Stream Extension counts as one
+                    // secondary entry).
+                    let name_entries_count = secondary_count.saturating_sub(1);
+                    let name_len = entries[stream_off + 3] as usize; // name length from Stream Extension
+                    let mut name_buf = [0u8; 256];
+                    let mut name_actual = 0usize;
+
+                    for entry_idx in 0..name_entries_count {
+                        let current_name_off = off + 64 + entry_idx * 32;
+                        if entries[current_name_off] != EXFAT_ENTRY_NAME {
+                            break;
+                        }
+                        let chars_to_copy = (name_len - name_actual).min(15);
+                        if chars_to_copy == 0 {
+                            break;
+                        }
+                        let copied = utf16le_to_ascii(
+                            &entries[current_name_off + 2..],
+                            chars_to_copy * 2,
+                            &mut name_buf[name_actual..],
+                        );
+                        name_actual += copied;
+                    }
+
+                    if name_actual > 0 {
+                        let name_str = &name_buf[..name_actual];
+
+                        // Check if it's an ISO file
+                        let is_iso = name_actual >= 4
+                            && (name_str[name_actual-4..].eq_ignore_ascii_case(b".iso")
+                            ||  name_str[name_actual-4..].eq_ignore_ascii_case(b".ISO"));
+
+                        if is_iso && *file_count < max_files {
+                            let mut n = [0u8; 256];
+                            n[..name_actual].copy_from_slice(name_str);
+                            files[*file_count] = DirEntry {
+                                name: n,
+                                name_len: name_actual,
+                                is_iso: true,
+                                start_cluster: start_cl,
+                                file_size: size,
+                            };
+                            *file_count += 1;
+                        }
+                    }
+                    i += total_entries; // skip the whole entry set
+                    continue;
                 }
                 i += 1;
             }
         }
+
+        // If there's still pending carry-over data but no more sectors
+        // in this cluster, it's a truncated entry set — discard it.
+        carry_len = 0;
 
         // Next cluster in chain
         let next = read_fat_entry(info, cluster);
