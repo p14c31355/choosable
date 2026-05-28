@@ -356,18 +356,27 @@ fn build_stage2_binary(kernel: &[u8]) -> Vec<u8> {
     c.emit(0xEA).emit32(kernel_phys).emit16(0x18);
 
     // ── Patch the 16-bit preamble to far-jump to the 32-bit code ────
-    // The 16-bit code occupies `c.bytes[0..preamble_len]`.
-    // We need to insert LGDT / MOV CR0 / JMP FAR32 right after the A20 enable.
-    // Save the 32-bit trampoline portion, put it aside, then rebuild
-    // the 16-bit preamble with the jump inserted.
+    // The 16-bit preamble + GDT is in `c.bytes[0..preamble_len]`.
+    // The 32-bit trampoline is everything after preamble_len.
+    // We need to insert LGDT / MOV CR0 / JMP FAR32 between them.
+    //
+    // After inserting LGDT (6) + MOV EAX,CR0 (3) + OR EAX,1 (6) +
+    // MOV CR0,EAX (3) + JMP FAR32 (8), the trampoline will start at
+    //   preamble_len + 26 bytes.
+    // prot32_phys must point to that location.
     let trampoline = c.bytes.split_off(preamble_len as usize);
     // Now c.bytes contains only the 16-bit preamble + GDT.
-    // Append LGDT + PE + far-jump:
+
     c.lgdt_mem16(0x7E00 + STAGE2_GDT_PTR_OFF);
     c.mov_eax_cr0();
     c.or_eax_imm32(1);
     c.mov_cr0_eax();                         // CR0.PE = 1 → protected mode
-    c.jmp_far32(0x08, prot32_phys);         // far jump to 32-bit selector + trampoline
+
+    // The far-jump target is where the trampoline will start after we
+    // re-append it.  The JMP FAR32 instruction itself is 8 bytes, so
+    // trampoline starts at current offset + 8.
+    let prot32_entry = 0x7E00u32 + c.offset() as u32 + 8;
+    c.jmp_far32(0x08, prot32_entry);        // far jump to 32-bit selector + trampoline
 
     // Re-append the trampoline after the patched preamble.
     c.bytes.extend_from_slice(&trampoline);
