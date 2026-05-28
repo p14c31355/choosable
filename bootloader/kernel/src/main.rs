@@ -79,6 +79,11 @@ fn ata_read_sector(lba: u32, buf: &mut [u8; 512]) -> bool {
     outb(ATA_LBA_HI,  (lba >> 16) as u8);
     outb(ATA_CMD, 0x20); // READ SECTORS
 
+    // 400ns delay (4 reads of status register) to allow drive to set BSY
+    for _ in 0..4 {
+        let _ = inb(ATA_STATUS);
+    }
+
     // Wait for data ready (BSY=0, DRQ=1, ERR=0)
     let mut timeout = 0xFFFFF;
     loop {
