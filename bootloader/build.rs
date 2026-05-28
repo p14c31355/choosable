@@ -168,7 +168,13 @@ fn build_mbr_boot_sector() -> Vec<u8> {
     let j1=c.jc_ph(); c.cmp_bx(0xAA55); let j2=c.jne_ph(); c.test_cl(0x01); let j3=c.jz_ph();
     c.mov_mem8_imm8(ul, 1);
     c.patch_rel8_here(j1); c.patch_rel8_here(j2); c.patch_rel8_here(j3);
-    c.mov_mem32_imm32(dll,1); c.mov_mem16_imm16(dsc,127);
+    c.mov_mem32_imm32(dll,1);
+    // Upper 32 bits of LBA (bytes 0x07CC–0x07CF) are NOT initialised
+    // after REP MOVSW — they contain boot code bytes from MBR offset
+    // 0x01CC.  Many BIOSes use the full 64-bit field and will fail
+    // the extended read if the upper bits are non-zero.
+    c.mov_mem32_imm32(dll+4,0);
+    c.mov_mem16_imm16(dsc,127);
     // ── Initialise DAP fields that are NOT written by the above ─────
     // 0x07C0 = packet size   (1 byte  → must be 0x10)
     // 0x07C1 = reserved      (1 byte  → must be 0x00; already zero from REP MOVSW)
