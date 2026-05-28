@@ -294,7 +294,7 @@ fn scan_directory(info: &ExfatInfo, root_cluster: u32, files: &mut [DirEntry], f
                         if entries[name_off] == EXFAT_ENTRY_NAME {
                             let name_len = entries[stream_off + 3] as usize; // name length from Stream Extension
                             let mut name_buf = [0u8; 256];
-                            let name_actual = utf16le_to_ascii(&entries[name_off + 2..], name_len * 2, &mut name_buf);
+                            let name_actual = utf16le_to_ascii(&entries[name_off + 2..], name_len.min(15) * 2, &mut name_buf);
                             let name_str = &name_buf[..name_actual];
 
                             // Check if it's an ISO file
