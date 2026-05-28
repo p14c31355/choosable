@@ -471,44 +471,43 @@ pub fn fix_gpt_attributes(disk_path: &str) -> Result<()> {
     let is_czblefi = entry.name[0] == 'C' as u16 && entry.name[1] == 'Z' as u16 && entry.name[2] == 'B' as u16 && entry.name[3] == 'L' as u16;
     let current_attr = entry.attributes;
 
-    if is_czblefi && current_attr != GPT_ATTR_CZBLEFI {
+    let needs_rewrite = if is_czblefi && current_attr != GPT_ATTR_CZBLEFI {
         println!("Fixing GPT attributes for CZBLEFI partition...");
         entry.attributes = GPT_ATTR_CZBLEFI;
+        true
+    } else if is_czblefi {
+        let mbr_entry = &gpt.protective_mbr.partitions[0];
+        mbr_entry.fs_flag != PART_TYPE_GPT_PROTECTIVE || mbr_entry.sector_count == 0
+    } else {
+        false
+    };
 
-        // Recalculate CRCs and write GPT (primary + backup).
-        // Before writing, ensure the protective MBR has a valid GPT
-        // protective partition entry (0xEE) at partition[0].  Previous
-        // bugs may have zero-filled the MBR, which would cause the disk
-        // to be unbootable even after the GPT table is fixed.
+    if needs_rewrite {
+        if current_attr == GPT_ATTR_CZBLEFI {
+            println!("Repairing GPT protective MBR entry...");
+        }
+        // Ensure the protective MBR entry is valid
         gpt.protective_mbr.partitions[0].fs_flag = PART_TYPE_GPT_PROTECTIVE;
         gpt.protective_mbr.partitions[0].start_lba = 1;
         gpt.protective_mbr.partitions[0].sector_count = 0xFFFFFFFF;
 
+        // Save the real boot code (bytes 0–440) before write_to_disk()
+        // overwrites it with the zero-filled protective MBR.
+        disk.seek(SeekFrom::Start(0))?;
+        let mut saved_boot_code = [0u8; 440];
+        disk.read_exact(&mut saved_boot_code)?;
+
         finalize_gpt_crcs(&mut gpt);
         gpt.write_to_disk(&mut disk)?;
 
-        // write_to_disk() writes the full protective MBR (boot_code
-        // is zero).  The caller (write_gpt_f / update_choosable etc.)
-        // will overwrite bytes 0–440 with the real boot code after
-        // this function returns.
+        // Restore the real boot code that write_to_disk() zeroed
+        disk.seek(SeekFrom::Start(0))?;
+        disk.write_all(&saved_boot_code)?;
         disk.flush()?;
-        println!("GPT attributes fixed.");
-    }
-    // Even when we don't change attributes, ensure the protective MBR
-    // has a valid GPT entry.  This repairs disks broken by old versions
-    // that zero-filled the MBR partition table.
-    else if is_czblefi {
-        // Verify the protective MBR entry is present
-        let mbr_entry = &gpt.protective_mbr.partitions[0];
-        if mbr_entry.fs_flag != PART_TYPE_GPT_PROTECTIVE || mbr_entry.sector_count == 0 {
-            println!("Repairing GPT protective MBR entry...");
-            gpt.protective_mbr.partitions[0].fs_flag = PART_TYPE_GPT_PROTECTIVE;
-            gpt.protective_mbr.partitions[0].start_lba = 1;
-            gpt.protective_mbr.partitions[0].sector_count = 0xFFFFFFFF;
 
-            finalize_gpt_crcs(&mut gpt);
-            gpt.write_to_disk(&mut disk)?;
-            disk.flush()?;
+        if current_attr != GPT_ATTR_CZBLEFI {
+            println!("GPT attributes fixed.");
+        } else {
             println!("GPT protective MBR repaired.");
         }
     }
