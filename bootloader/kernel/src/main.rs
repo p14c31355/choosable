@@ -97,7 +97,7 @@ fn ata_read_sector(lba: u32, buf: &mut [u8; 512]) -> bool {
     // Read 256 words
     let buf16 = buf.as_mut_ptr() as *mut u16;
     for i in 0..256 {
-        unsafe { *buf16.add(i) = inw(ATA_DATA); }
+        unsafe { core::ptr::write_unaligned(buf16.add(i), inw(ATA_DATA)); }
     }
     true
 }
