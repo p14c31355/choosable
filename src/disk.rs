@@ -1,8 +1,8 @@
+use crate::constants::*;
+use crate::disk_layout::{GptInfo, GptPartitionEntry, Mbr};
+use crate::error::{ChoosableError, Result};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use crate::constants::*;
-use crate::disk_layout::{GptPartitionEntry, Mbr, GptInfo};
-use crate::error::{ChoosableError, Result};
 
 /// Physical drive information
 #[derive(Debug, Clone)]
@@ -35,10 +35,10 @@ pub fn get_disk_size(path: &str) -> Result<u64> {
     let name = path.trim_start_matches("/dev/");
     let size_path = format!("/sys/class/block/{}/size", name);
     let size_str = std::fs::read_to_string(&size_path)
-        .map_err(|_| ChoosableError::DiskNotFound(
-            format!("Cannot read size for disk {}", path)
-        ))?;
-    let sectors: u64 = size_str.trim().parse()
+        .map_err(|_| ChoosableError::DiskNotFound(format!("Cannot read size for disk {}", path)))?;
+    let sectors: u64 = size_str
+        .trim()
+        .parse()
         .map_err(|_| ChoosableError::Generic(format!("Invalid size for disk {}", path)))?;
     Ok(sectors * SECTOR_SIZE)
 }
@@ -151,7 +151,8 @@ pub fn enumerate_disks() -> Result<Vec<PhyDriveInfo>> {
     }
 
     disks.sort_by(|a, b| {
-        b.is_usb.cmp(&a.is_usb)
+        b.is_usb
+            .cmp(&a.is_usb)
             .then(b.removable.cmp(&a.removable))
             .then(b.size_bytes.cmp(&a.size_bytes))
     });
@@ -165,18 +166,17 @@ pub fn enumerate_disks() -> Result<Vec<PhyDriveInfo>> {
 
 /// Read the MBR from a disk
 pub fn read_mbr(disk_path: &str) -> Result<Mbr> {
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .open(disk_path)?;
+    let mut file = std::fs::OpenOptions::new().read(true).open(disk_path)?;
 
     Mbr::read(&mut file)
 }
 
 /// Read the MBR and detect if it's a Choosable disk
-pub fn detect_choosable(disk_path: &str, _size_bytes: u64) -> Result<(bool, Option<String>, Option<u64>, Option<u64>, Mbr)> {
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .open(disk_path)?;
+pub fn detect_choosable(
+    disk_path: &str,
+    _size_bytes: u64,
+) -> Result<(bool, Option<String>, Option<u64>, Option<u64>, Mbr)> {
+    let mut file = std::fs::OpenOptions::new().read(true).open(disk_path)?;
 
     let mbr = match Mbr::read(&mut file) {
         Ok(m) => m,
@@ -196,12 +196,15 @@ pub fn detect_choosable(disk_path: &str, _size_bytes: u64) -> Result<(bool, Opti
         let efi_part_size_sectors = CHOOSABLE_EFI_PART_SIZE / SECTOR_SIZE;
 
         if gpt.partitions[1].start_lba != gpt.partitions[0].end_lba + 1
-            || (gpt.partitions[1].end_lba + 1 - gpt.partitions[1].start_lba) != efi_part_size_sectors
+            || (gpt.partitions[1].end_lba + 1 - gpt.partitions[1].start_lba)
+                != efi_part_size_sectors
         {
             return Ok((false, None, None, None, mbr));
         }
 
-        let expected = ['C' as u16, 'Z' as u16, 'B' as u16, 'L' as u16, 'E' as u16, 'F' as u16, 'I' as u16];
+        let expected = [
+            'C' as u16, 'Z' as u16, 'B' as u16, 'L' as u16, 'E' as u16, 'F' as u16, 'I' as u16,
+        ];
         let name_arr = gpt.partitions[1].name;
         if name_arr[..7] != expected {
             return Ok((false, None, None, None, mbr));
@@ -210,7 +213,13 @@ pub fn detect_choosable(disk_path: &str, _size_bytes: u64) -> Result<(bool, Opti
         let part2_start = gpt.partitions[1].start_lba * SECTOR_SIZE;
         let version = read_choosable_version(disk_path, part2_start)?;
 
-        Ok((true, version, Some(part2_start), Some(gpt.partitions[1].attributes), mbr))
+        Ok((
+            true,
+            version,
+            Some(part2_start),
+            Some(gpt.partitions[1].attributes),
+            mbr,
+        ))
     } else {
         if mbr.partitions[0].start_lba != CHOOSABLE_PART1_START_SECTOR as u32 {
             return Ok((false, None, None, None, mbr));
@@ -243,7 +252,12 @@ pub struct PartitionSlice<R> {
 
 impl<R: Read + Seek> PartitionSlice<R> {
     pub fn new(inner: R, start_offset: u64, size: u64) -> Self {
-        PartitionSlice { inner, start_offset, size, current_pos: 0 }
+        PartitionSlice {
+            inner,
+            start_offset,
+            size,
+            current_pos: 0,
+        }
     }
 }
 
@@ -285,7 +299,11 @@ impl<R: Write + Seek> Write for PartitionSlice<R> {
         self.inner.seek(SeekFrom::Start(target))?;
 
         let max_to_write = (self.size - self.current_pos) as usize;
-        let buf_to_write = if buf.len() > max_to_write { &buf[..max_to_write] } else { buf };
+        let buf_to_write = if buf.len() > max_to_write {
+            &buf[..max_to_write]
+        } else {
+            buf
+        };
         let bytes_written = self.inner.write(buf_to_write)?;
         self.current_pos += bytes_written as u64;
         Ok(bytes_written)
@@ -301,10 +319,14 @@ impl<R: Read + Seek> Seek for PartitionSlice<R> {
             SeekFrom::Start(offset) => self.start_offset + offset,
             SeekFrom::Current(offset) => (self.start_offset + self.current_pos)
                 .checked_add_signed(offset)
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid seek"))?,
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid seek")
+                })?,
             SeekFrom::End(offset) => (self.start_offset + self.size)
                 .checked_add_signed(offset)
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid seek"))?,
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid seek")
+                })?,
         };
         let actual = self.inner.seek(SeekFrom::Start(target))?;
         self.current_pos = actual.saturating_sub(self.start_offset);
@@ -360,9 +382,9 @@ pub fn open_disk_readwrite(disk_path: &str) -> Result<std::fs::File> {
         .read(true)
         .write(true)
         .open(disk_path)
-        .map_err(|e| ChoosableError::DiskNotFound(
-            format!("Cannot open {} for read/write: {}", disk_path, e)
-        ))
+        .map_err(|e| {
+            ChoosableError::DiskNotFound(format!("Cannot open {} for read/write: {}", disk_path, e))
+        })
 }
 
 /// Open disk for reading only
@@ -370,9 +392,9 @@ pub fn open_disk_readonly(disk_path: &str) -> Result<std::fs::File> {
     std::fs::OpenOptions::new()
         .read(true)
         .open(disk_path)
-        .map_err(|e| ChoosableError::DiskNotFound(
-            format!("Cannot open {} for reading: {}", disk_path, e)
-        ))
+        .map_err(|e| {
+            ChoosableError::DiskNotFound(format!("Cannot open {} for reading: {}", disk_path, e))
+        })
 }
 
 /// Write zeros to a range of sectors on a disk
@@ -441,11 +463,15 @@ pub fn get_partition_name(disk_path: &str, part_num: u32) -> String {
 pub fn get_partition_start_sector(part_path: &str) -> Result<u64> {
     let name = part_path.trim_start_matches("/dev/");
     let start_path = format!("/sys/class/block/{}/start", name);
-    let start_str = std::fs::read_to_string(&start_path)
-        .map_err(|_| ChoosableError::Generic(
-            format!("Cannot read start sector for partition {}", part_path)
-        ))?;
-    start_str.trim().parse::<u64>()
+    let start_str = std::fs::read_to_string(&start_path).map_err(|_| {
+        ChoosableError::Generic(format!(
+            "Cannot read start sector for partition {}",
+            part_path
+        ))
+    })?;
+    start_str
+        .trim()
+        .parse::<u64>()
         .map_err(|_| ChoosableError::Generic(format!("Invalid start sector for {}", part_path)))
 }
 
@@ -453,11 +479,12 @@ pub fn get_partition_start_sector(part_path: &str) -> Result<u64> {
 pub fn get_partition_size_sectors(part_path: &str) -> Result<u64> {
     let name = part_path.trim_start_matches("/dev/");
     let size_path = format!("/sys/class/block/{}/size", name);
-    let size_str = std::fs::read_to_string(&size_path)
-        .map_err(|_| ChoosableError::Generic(
-            format!("Cannot read size for partition {}", part_path)
-        ))?;
-    size_str.trim().parse::<u64>()
+    let size_str = std::fs::read_to_string(&size_path).map_err(|_| {
+        ChoosableError::Generic(format!("Cannot read size for partition {}", part_path))
+    })?;
+    size_str
+        .trim()
+        .parse::<u64>()
         .map_err(|_| ChoosableError::Generic(format!("Invalid size for {}", part_path)))
 }
 
@@ -473,6 +500,5 @@ pub fn human_readable_gb(size_bytes: u64) -> u64 {
 
 /// Read a file from disk (in the current working directory or installation directory)
 pub fn read_install_file(path: &str) -> Result<Vec<u8>> {
-    std::fs::read(path)
-        .map_err(|e| ChoosableError::Generic(format!("Cannot read {}: {}", path, e)))
+    std::fs::read(path).map_err(|e| ChoosableError::Generic(format!("Cannot read {}: {}", path, e)))
 }

@@ -1,5 +1,5 @@
-use clap::{Parser, Subcommand};
 use crate::constants::*;
+use clap::{Parser, Subcommand};
 
 /// choosable - A pure Rust implementation of Choosable
 /// Create bootable USB drives for ISO/WIM/IMG/VHD(x)/EFI files

@@ -4,8 +4,8 @@ mod constants;
 mod disk;
 mod disk_layout;
 mod error;
-mod installer;
 mod gui;
+mod installer;
 
 use clap::Parser;
 use cli::{Cli, Commands};
@@ -18,11 +18,14 @@ fn main() -> Result<()> {
         // Ensure XDG_RUNTIME_DIR for Wayland under sudo
         if std::env::var("XDG_RUNTIME_DIR").is_err() {
             if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
-                if let Some(uid) = status.lines()
+                if let Some(uid) = status
+                    .lines()
                     .find(|l| l.starts_with("Uid:"))
                     .and_then(|l| l.split_whitespace().nth(1))
                 {
-                    unsafe { std::env::set_var("XDG_RUNTIME_DIR", format!("/run/user/{}", uid)); }
+                    unsafe {
+                        std::env::set_var("XDG_RUNTIME_DIR", format!("/run/user/{}", uid));
+                    }
                 }
             }
         }
@@ -38,7 +41,9 @@ fn main() -> Result<()> {
     }
 
     // Handle --help / --version without requiring a subcommand
-    if args.len() == 2 && (args[1] == "--help" || args[1] == "-h" || args[1] == "--version" || args[1] == "-V") {
+    if args.len() == 2
+        && (args[1] == "--help" || args[1] == "-h" || args[1] == "--version" || args[1] == "-V")
+    {
         Cli::parse();
         return Ok(());
     }

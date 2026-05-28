@@ -10,11 +10,17 @@ fn is_partition_of(dev: &str, disk_path: &str) -> bool {
         if suffix.is_empty() {
             return false; // exact match handled by caller
         }
-        let disk_ends_with_digit = disk_path.chars().last().map_or(false, |c| c.is_ascii_digit());
+        let disk_ends_with_digit = disk_path
+            .chars()
+            .last()
+            .map_or(false, |c| c.is_ascii_digit());
         if disk_ends_with_digit {
             // NVMe / MMC naming: partition suffix must be 'p' followed by digit(s)
             if let Some(part_suffix) = suffix.strip_prefix('p') {
-                part_suffix.chars().next().map_or(false, |c| c.is_ascii_digit())
+                part_suffix
+                    .chars()
+                    .next()
+                    .map_or(false, |c| c.is_ascii_digit())
             } else {
                 false
             }
@@ -41,7 +47,8 @@ pub fn check_swap(disk_path: &str) -> Result<()> {
                 let is_sub_dev = dev == disk_path || is_partition_of(dev, disk_path);
                 if is_sub_dev {
                     return Err(ChoosableError::Generic(format!(
-                        "{} is used as swap, please swapoff it first!", disk_path
+                        "{} is used as swap, please swapoff it first!",
+                        disk_path
                     )));
                 }
             }
@@ -78,7 +85,8 @@ pub fn check_umount_disk(disk_path: &str) -> Result<()> {
                 let is_sub_dev = dev == disk_path || is_partition_of(dev, disk_path);
                 if is_sub_dev {
                     return Err(ChoosableError::Generic(format!(
-                        "{} is still mounted, please unmount it first!", disk_path
+                        "{} is still mounted, please unmount it first!",
+                        disk_path
                     )));
                 }
             }
@@ -100,9 +108,7 @@ pub fn check_tool_work_ok(fs_type: FilesystemType) -> Result<()> {
     match hexdump {
         Ok(s) if s.success() => {}
         _ => {
-            return Err(ChoosableError::ToolNotFound(
-                "hexdump".to_string()
-            ));
+            return Err(ChoosableError::ToolNotFound("hexdump".to_string()));
         }
     }
 
@@ -136,7 +142,7 @@ pub fn check_tool_work_ok(fs_type: FilesystemType) -> Result<()> {
             }
             if !found {
                 return Err(ChoosableError::ToolNotFound(
-                    "mkexfatfs or mkfs.exfat is required for exFAT formatting".to_string()
+                    "mkexfatfs or mkfs.exfat is required for exFAT formatting".to_string(),
                 ));
             }
         }
@@ -148,7 +154,7 @@ pub fn check_tool_work_ok(fs_type: FilesystemType) -> Result<()> {
                 .map_err(|_| ChoosableError::ToolNotFound("mkfs.vfat".to_string()))?;
             if !status.success() {
                 return Err(ChoosableError::ToolNotFound(
-                    "mkfs.vfat does not work on this system".to_string()
+                    "mkfs.vfat does not work on this system".to_string(),
                 ));
             }
         }
@@ -161,7 +167,7 @@ pub fn check_tool_work_ok(fs_type: FilesystemType) -> Result<()> {
                 .map_err(|_| ChoosableError::ToolNotFound("mkfs.ntfs".to_string()))?;
             if !status.success() {
                 return Err(ChoosableError::ToolNotFound(
-                    "mkfs.ntfs does not work on this system".to_string()
+                    "mkfs.ntfs does not work on this system".to_string(),
                 ));
             }
         }
@@ -177,9 +183,7 @@ pub fn check_tool_work_ok(fs_type: FilesystemType) -> Result<()> {
     match status {
         Ok(s) if s.success() => {}
         _ => {
-            return Err(ChoosableError::ToolNotFound(
-                "xzcat".to_string()
-            ));
+            return Err(ChoosableError::ToolNotFound("xzcat".to_string()));
         }
     }
 
@@ -195,7 +199,12 @@ pub fn wait_for_partitions(disk_path: &str) -> Result<()> {
         if Path::new(&part1).exists() && Path::new(&part2).exists() {
             return Ok(());
         }
-        println!("Waiting for partitions {} and {} ... (attempt {})", part1, part2, i + 1);
+        println!(
+            "Waiting for partitions {} and {} ... (attempt {})",
+            part1,
+            part2,
+            i + 1
+        );
         std::thread::sleep(std::time::Duration::from_secs(1));
 
         // Try to probe partitions
@@ -226,7 +235,8 @@ pub fn wait_for_partitions(disk_path: &str) -> Result<()> {
         Ok(())
     } else {
         Err(ChoosableError::Generic(format!(
-            "Partitions {} / {} do not exist after waiting", part1, part2
+            "Partitions {} / {} do not exist after waiting",
+            part1, part2
         )))
     }
 }
@@ -260,7 +270,10 @@ pub fn remove_partition_nodes(disk_path: &str) {
     let part2 = get_partition_name(disk_path, 2);
 
     if Path::new(&part1).exists() || Path::new(&part2).exists() {
-        println!("Removing existing partition nodes for {} via partx...", disk_path);
+        println!(
+            "Removing existing partition nodes for {} via partx...",
+            disk_path
+        );
         let _ = std::process::Command::new("partx")
             .args(&["-d", disk_path])
             .stdout(std::process::Stdio::null())

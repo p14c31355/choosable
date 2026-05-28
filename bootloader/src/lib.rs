@@ -8,9 +8,9 @@
 //! No external assembler dependencies — all machine code is generated
 //! by build.rs using a pure Rust x86 instruction encoder.
 
+pub mod efi;
 pub mod mbr;
 pub mod stage2;
-pub mod efi;
 
 // Include auto-generated constants from build.rs
 include!(concat!(env!("OUT_DIR"), "/generated.rs"));

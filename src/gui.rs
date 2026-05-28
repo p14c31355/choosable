@@ -2,9 +2,13 @@ use iced::widget::{button, checkbox, column, container, pick_list, row, text, te
 use iced::{Element, Length, Task};
 
 pub fn run_gui() -> crate::error::Result<()> {
-    iced::application("Choosable - Bootable USB Creator", ChoosableApp::update, ChoosableApp::view)
-        .run_with(|| (ChoosableApp::default(), Task::none()))
-        .map_err(|e| crate::error::ChoosableError::Generic(format!("GUI error: {}", e)))
+    iced::application(
+        "Choosable - Bootable USB Creator",
+        ChoosableApp::update,
+        ChoosableApp::view,
+    )
+    .run_with(|| (ChoosableApp::default(), Task::none()))
+    .map_err(|e| crate::error::ChoosableError::Generic(format!("GUI error: {}", e)))
 }
 
 #[derive(Debug, Clone)]
@@ -57,7 +61,12 @@ struct DiskEntry {
 
 impl std::fmt::Display for DiskEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} ({}, {} GiB{})", self.path, self.model, self.size_gb,
+        write!(
+            f,
+            "{} ({}, {} GiB{})",
+            self.path,
+            self.model,
+            self.size_gb,
             if self.is_usb { ", USB" } else { "" }
         )
     }
@@ -101,10 +110,7 @@ impl ChoosableApp {
             Message::RefreshDisks => {
                 self.loading = true;
                 self.status = String::from("Scanning disks...");
-                return Task::perform(
-                    refresh_disks(),
-                    Message::DisksLoaded,
-                );
+                return Task::perform(refresh_disks(), Message::DisksLoaded);
             }
             Message::DisksLoaded(disks) => {
                 self.disks = disks;
@@ -145,7 +151,16 @@ impl ChoosableApp {
                     self.status = String::from("Installing...");
 
                     return Task::perform(
-                        run_install(disk_path, gpt, secure_boot, force, label, fs_type, non_destructive, reserve),
+                        run_install(
+                            disk_path,
+                            gpt,
+                            secure_boot,
+                            force,
+                            label,
+                            fs_type,
+                            non_destructive,
+                            reserve,
+                        ),
                         Message::StatusMessage,
                     );
                 }
@@ -154,7 +169,11 @@ impl ChoosableApp {
             Message::UpdateClicked => {
                 if let Some(index) = self.selected_disk_index {
                     let disk_path = self.disks[index].path.clone();
-                    let secure_boot = if self.secure_boot { Some(true) } else { Some(false) };
+                    let secure_boot = if self.secure_boot {
+                        Some(true)
+                    } else {
+                        Some(false)
+                    };
                     self.loading = true;
                     self.status = String::from("Updating...");
 
@@ -171,10 +190,7 @@ impl ChoosableApp {
                     self.loading = true;
                     self.status = String::from("Reading info...");
 
-                    return Task::perform(
-                        run_list(disk_path),
-                        Message::StatusMessage,
-                    );
+                    return Task::perform(run_list(disk_path), Message::StatusMessage);
                 }
             }
             Message::StatusMessage(msg) => {
@@ -190,7 +206,10 @@ impl ChoosableApp {
             text("No disks found. Click Refresh to scan.").into()
         } else {
             let entries: Vec<String> = self.disks.iter().map(|d| d.to_string()).collect();
-            let selected = self.selected_disk_index.and_then(|i| entries.get(i)).cloned();
+            let selected = self
+                .selected_disk_index
+                .and_then(|i| entries.get(i))
+                .cloned();
 
             pick_list(entries, selected, Message::SelectDisk)
                 .placeholder("Select a disk...")
@@ -204,33 +223,46 @@ impl ChoosableApp {
             checkbox("GPT Partition Style", self.use_gpt).on_toggle(Message::ToggleGpt),
             checkbox("Secure Boot Support", self.secure_boot).on_toggle(Message::ToggleSecureBoot),
             checkbox("Force Install", self.force).on_toggle(Message::ToggleForce),
-            checkbox("Non-destructive Install", self.non_destructive).on_toggle(Message::NonDestructiveToggled),
+            checkbox("Non-destructive Install", self.non_destructive)
+                .on_toggle(Message::NonDestructiveToggled),
             row![
                 text("Filesystem: "),
                 pick_list(FsType::ALL, Some(self.fs_type), Message::FsTypeChanged),
-            ].spacing(8),
+            ]
+            .spacing(8),
             row![
                 text("Label: "),
-                text_input("Choosable", &self.label).on_input(Message::LabelChanged).width(Length::Fixed(150.0)),
-            ].spacing(8),
+                text_input("Choosable", &self.label)
+                    .on_input(Message::LabelChanged)
+                    .width(Length::Fixed(150.0)),
+            ]
+            .spacing(8),
             row![
                 text("Reserve (MiB): "),
-                text_input("0", &self.reserve_space).on_input(Message::ReserveSpaceChanged).width(Length::Fixed(100.0)),
-            ].spacing(8),
-        ].spacing(8);
+                text_input("0", &self.reserve_space)
+                    .on_input(Message::ReserveSpaceChanged)
+                    .width(Length::Fixed(100.0)),
+            ]
+            .spacing(8),
+        ]
+        .spacing(8);
 
         let actions = if self.loading {
             column![
                 button(text("Install")).style(button::danger),
                 button(text("Update")),
                 button(text("List Info")),
-            ].spacing(4)
+            ]
+            .spacing(4)
         } else {
             column![
-                button(text("Install")).on_press(Message::InstallClicked).style(button::danger),
+                button(text("Install"))
+                    .on_press(Message::InstallClicked)
+                    .style(button::danger),
                 button(text("Update")).on_press(Message::UpdateClicked),
                 button(text("List Info")).on_press(Message::ListClicked),
-            ].spacing(4)
+            ]
+            .spacing(4)
         };
 
         let status_text = if self.loading {
@@ -240,14 +272,16 @@ impl ChoosableApp {
         };
 
         let content = column![
-            row![
-                text("Choosable").size(24),
-            ].padding(8),
-            row![disk_picker, refresh_btn].spacing(8).align_y(iced::Alignment::Center),
+            row![text("Choosable").size(24),].padding(8),
+            row![disk_picker, refresh_btn]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
             options,
             row![actions].spacing(8),
             status_text,
-        ].spacing(12).padding(16);
+        ]
+        .spacing(12)
+        .padding(16);
 
         container(content).center_x(Length::Fill).into()
     }
@@ -257,15 +291,16 @@ impl ChoosableApp {
 
 async fn refresh_disks() -> Vec<DiskEntry> {
     match crate::disk::enumerate_disks() {
-        Ok(disks) => {
-            disks.into_iter().map(|d| DiskEntry {
+        Ok(disks) => disks
+            .into_iter()
+            .map(|d| DiskEntry {
                 path: d.disk_path,
                 model: d.model,
                 size_gb: crate::disk::human_readable_gb(d.size_bytes),
                 is_usb: d.is_usb,
                 removable: d.removable,
-            }).collect()
-        }
+            })
+            .collect(),
         Err(_) => Vec::new(),
     }
 }
@@ -289,7 +324,16 @@ async fn run_install(
     let result = if non_destructive {
         crate::installer::non_destructive_install(&disk_path, &label, ft, secure_boot, true)
     } else {
-        crate::installer::install_choosable(&disk_path, gpt, secure_boot, reserve, &label, ft, force, true)
+        crate::installer::install_choosable(
+            &disk_path,
+            gpt,
+            secure_boot,
+            reserve,
+            &label,
+            ft,
+            force,
+            true,
+        )
     };
 
     match result {
@@ -297,7 +341,9 @@ async fn run_install(
         Err(e) => {
             let mut msg = format!("Installation failed: {}", e);
             if format!("{}", e).contains("Permission denied") {
-                msg.push_str("\nHint: Run Choosable with sudo (sudo choosable) to get disk access.");
+                msg.push_str(
+                    "\nHint: Run Choosable with sudo (sudo choosable) to get disk access.",
+                );
             }
             msg
         }

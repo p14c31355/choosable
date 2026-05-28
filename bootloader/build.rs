@@ -52,40 +52,96 @@ pub const EFI_BIN: &[u8] = &{efi_bin:?};
 //  x86 instruction encoder
 // ═══════════════════════════════════════════════════════════════════════════
 
-struct CodeBuf { bytes: Vec<u8> }
+struct CodeBuf {
+    bytes: Vec<u8>,
+}
 
 impl CodeBuf {
-    fn new() -> Self { CodeBuf { bytes: Vec::with_capacity(512) } }
-    fn offset(&self) -> u16 { self.bytes.len() as u16 }
-    fn emit(&mut self, b: u8) -> &mut Self { self.bytes.push(b); self }
-    fn emit16(&mut self, w: u16) -> &mut Self { self.emit(w as u8).emit((w >> 8) as u8) }
+    fn new() -> Self {
+        CodeBuf {
+            bytes: Vec::with_capacity(512),
+        }
+    }
+    fn offset(&self) -> u16 {
+        self.bytes.len() as u16
+    }
+    fn emit(&mut self, b: u8) -> &mut Self {
+        self.bytes.push(b);
+        self
+    }
+    fn emit16(&mut self, w: u16) -> &mut Self {
+        self.emit(w as u8).emit((w >> 8) as u8)
+    }
     fn emit32(&mut self, d: u32) -> &mut Self {
-        self.emit(d as u8).emit((d>>8) as u8).emit((d>>16) as u8).emit((d>>24) as u8)
+        self.emit(d as u8)
+            .emit((d >> 8) as u8)
+            .emit((d >> 16) as u8)
+            .emit((d >> 24) as u8)
     }
     fn emit64(&mut self, q: u64) -> &mut Self {
-        self.emit32(q as u32).emit32((q>>32) as u32)
+        self.emit32(q as u32).emit32((q >> 32) as u32)
     }
 
-    fn cli(&mut self) -> &mut Self { self.emit(0xFA) }
-    fn sti(&mut self) -> &mut Self { self.emit(0xFB) }
-    fn cld(&mut self) -> &mut Self { self.emit(0xFC) }
-    fn hlt(&mut self) -> &mut Self { self.emit(0xF4) }
-    fn nop(&mut self) -> &mut Self { self.emit(0x90) }
-    fn ret(&mut self) -> &mut Self { self.emit(0xC3) }
-    fn xor_ax_ax(&mut self) -> &mut Self { self.emit(0x31).emit(0xC0) }
-    fn xor_bx_bx(&mut self) -> &mut Self { self.emit(0x31).emit(0xDB) }
-    fn mov_ss_ax(&mut self) -> &mut Self { self.emit(0x8E).emit(0xD0) }
-    fn mov_ds_ax(&mut self) -> &mut Self { self.emit(0x8E).emit(0xD8) }
-    fn mov_es_ax(&mut self) -> &mut Self { self.emit(0x8E).emit(0xC0) }
-    fn mov_sp(&mut self, v: u16) -> &mut Self { self.emit(0xBC).emit16(v) }
-    fn mov_si(&mut self, v: u16) -> &mut Self { self.emit(0xBE).emit16(v) }
-    fn mov_di(&mut self, v: u16) -> &mut Self { self.emit(0xBF).emit16(v) }
-    fn mov_cx(&mut self, v: u16) -> &mut Self { self.emit(0xB9).emit16(v) }
-    fn mov_bx(&mut self, v: u16) -> &mut Self { self.emit(0xBB).emit16(v) }
-    fn mov_ah(&mut self, v: u8) -> &mut Self { self.emit(0xB4).emit(v) }
-    fn mov_al(&mut self, v: u8) -> &mut Self { self.emit(0xB0).emit(v) }
-    fn mov_mem8_dl(&mut self, addr: u16) -> &mut Self { self.emit(0x88).emit(0x16).emit16(addr) }
-    fn mov_dl_mem16(&mut self, addr: u16) -> &mut Self { self.emit(0x8A).emit(0x16).emit16(addr) }
+    fn cli(&mut self) -> &mut Self {
+        self.emit(0xFA)
+    }
+    fn sti(&mut self) -> &mut Self {
+        self.emit(0xFB)
+    }
+    fn cld(&mut self) -> &mut Self {
+        self.emit(0xFC)
+    }
+    fn hlt(&mut self) -> &mut Self {
+        self.emit(0xF4)
+    }
+    fn nop(&mut self) -> &mut Self {
+        self.emit(0x90)
+    }
+    fn ret(&mut self) -> &mut Self {
+        self.emit(0xC3)
+    }
+    fn xor_ax_ax(&mut self) -> &mut Self {
+        self.emit(0x31).emit(0xC0)
+    }
+    fn xor_bx_bx(&mut self) -> &mut Self {
+        self.emit(0x31).emit(0xDB)
+    }
+    fn mov_ss_ax(&mut self) -> &mut Self {
+        self.emit(0x8E).emit(0xD0)
+    }
+    fn mov_ds_ax(&mut self) -> &mut Self {
+        self.emit(0x8E).emit(0xD8)
+    }
+    fn mov_es_ax(&mut self) -> &mut Self {
+        self.emit(0x8E).emit(0xC0)
+    }
+    fn mov_sp(&mut self, v: u16) -> &mut Self {
+        self.emit(0xBC).emit16(v)
+    }
+    fn mov_si(&mut self, v: u16) -> &mut Self {
+        self.emit(0xBE).emit16(v)
+    }
+    fn mov_di(&mut self, v: u16) -> &mut Self {
+        self.emit(0xBF).emit16(v)
+    }
+    fn mov_cx(&mut self, v: u16) -> &mut Self {
+        self.emit(0xB9).emit16(v)
+    }
+    fn mov_bx(&mut self, v: u16) -> &mut Self {
+        self.emit(0xBB).emit16(v)
+    }
+    fn mov_ah(&mut self, v: u8) -> &mut Self {
+        self.emit(0xB4).emit(v)
+    }
+    fn mov_al(&mut self, v: u8) -> &mut Self {
+        self.emit(0xB0).emit(v)
+    }
+    fn mov_mem8_dl(&mut self, addr: u16) -> &mut Self {
+        self.emit(0x88).emit(0x16).emit16(addr)
+    }
+    fn mov_dl_mem16(&mut self, addr: u16) -> &mut Self {
+        self.emit(0x8A).emit(0x16).emit16(addr)
+    }
     fn mov_mem8_imm8(&mut self, addr: u16, v: u8) -> &mut Self {
         self.emit(0xC6).emit(0x06).emit16(addr).emit(v)
     }
@@ -98,33 +154,90 @@ impl CodeBuf {
     fn cmp_mem8_imm8(&mut self, addr: u16, v: u8) -> &mut Self {
         self.emit(0x80).emit(0x3E).emit16(addr).emit(v)
     }
-    fn cmp_bx(&mut self, v: u16) -> &mut Self { self.emit(0x81).emit(0xFB).emit16(v) }
-    fn test_cl(&mut self, v: u8) -> &mut Self { self.emit(0xF6).emit(0xC1).emit(v) }
-    fn shr_mem16_1(&mut self, addr: u16) -> &mut Self { self.emit(0xD1).emit(0x2E).emit16(addr) }
-    fn rep_movsw(&mut self) -> &mut Self { self.emit(0xF3).emit(0xA5) }
-    fn lodsb(&mut self) -> &mut Self { self.emit(0xAC) }
-    fn test_al_al(&mut self) -> &mut Self { self.emit(0x08).emit(0xC0) }
-    fn int(&mut self, n: u8) -> &mut Self { self.emit(0xCD).emit(n) }
-    fn jmp_short(&mut self, rel: i8) -> &mut Self { self.emit(0xEB).emit(rel as u8) }
-    fn jmp_far(&mut self, seg: u16, off: u16) -> &mut Self { self.emit(0xEA).emit16(off).emit16(seg) }
-    fn pusha(&mut self) -> &mut Self { self.emit(0x60) }
-    fn popa(&mut self) -> &mut Self { self.emit(0x61) }
-    fn lgdt_mem16(&mut self, addr: u16) -> &mut Self { self.emit(0x0F).emit(0x01).emit(0x16).emit16(addr) }
-    fn mov_eax_cr0(&mut self) -> &mut Self { self.emit(0x0F).emit(0x20).emit(0xC0) }
-    fn mov_cr0_eax(&mut self) -> &mut Self { self.emit(0x0F).emit(0x22).emit(0xC0) }
-    fn or_eax_imm32(&mut self, v: u32) -> &mut Self { self.emit(0x66).emit(0x0D).emit32(v) }
-    fn jmp_far32(&mut self, sel: u16, off: u32) -> &mut Self { self.emit(0x66).emit(0xEA).emit32(off).emit16(sel) }
-    // Conditional jumps with placeholder
-    fn jc_ph(&mut self) -> u16 { let p=self.offset(); self.emit(0x72).emit(0x00); p }
-    fn jnc_ph(&mut self) -> u16 { let p=self.offset(); self.emit(0x73).emit(0x00); p }
-    fn jne_ph(&mut self) -> u16 { let p=self.offset(); self.emit(0x75).emit(0x00); p }
-    fn jz_ph(&mut self) -> u16 { let p=self.offset(); self.emit(0x74).emit(0x00); p }
-    fn patch_rel8_here(&mut self, pos: u16) {
-        let t = self.offset(); self.bytes[pos as usize+1] = (t as i32 - pos as i32 - 2) as i8 as u8;
+    fn cmp_bx(&mut self, v: u16) -> &mut Self {
+        self.emit(0x81).emit(0xFB).emit16(v)
     }
-    fn call_rel16_ph(&mut self) -> u16 { let p=self.offset()+1; self.emit(0xE8).emit16(0); p } // returns offset of rel16 field
-    fn label(&self) -> u16 { self.offset() }
-    fn extend(&mut self, data: &[u8]) { self.bytes.extend_from_slice(data); }
+    fn test_cl(&mut self, v: u8) -> &mut Self {
+        self.emit(0xF6).emit(0xC1).emit(v)
+    }
+    fn shr_mem16_1(&mut self, addr: u16) -> &mut Self {
+        self.emit(0xD1).emit(0x2E).emit16(addr)
+    }
+    fn rep_movsw(&mut self) -> &mut Self {
+        self.emit(0xF3).emit(0xA5)
+    }
+    fn lodsb(&mut self) -> &mut Self {
+        self.emit(0xAC)
+    }
+    fn test_al_al(&mut self) -> &mut Self {
+        self.emit(0x08).emit(0xC0)
+    }
+    fn int(&mut self, n: u8) -> &mut Self {
+        self.emit(0xCD).emit(n)
+    }
+    fn jmp_short(&mut self, rel: i8) -> &mut Self {
+        self.emit(0xEB).emit(rel as u8)
+    }
+    fn jmp_far(&mut self, seg: u16, off: u16) -> &mut Self {
+        self.emit(0xEA).emit16(off).emit16(seg)
+    }
+    fn pusha(&mut self) -> &mut Self {
+        self.emit(0x60)
+    }
+    fn popa(&mut self) -> &mut Self {
+        self.emit(0x61)
+    }
+    fn lgdt_mem16(&mut self, addr: u16) -> &mut Self {
+        self.emit(0x0F).emit(0x01).emit(0x16).emit16(addr)
+    }
+    fn mov_eax_cr0(&mut self) -> &mut Self {
+        self.emit(0x0F).emit(0x20).emit(0xC0)
+    }
+    fn mov_cr0_eax(&mut self) -> &mut Self {
+        self.emit(0x0F).emit(0x22).emit(0xC0)
+    }
+    fn or_eax_imm32(&mut self, v: u32) -> &mut Self {
+        self.emit(0x66).emit(0x0D).emit32(v)
+    }
+    fn jmp_far32(&mut self, sel: u16, off: u32) -> &mut Self {
+        self.emit(0x66).emit(0xEA).emit32(off).emit16(sel)
+    }
+    // Conditional jumps with placeholder
+    fn jc_ph(&mut self) -> u16 {
+        let p = self.offset();
+        self.emit(0x72).emit(0x00);
+        p
+    }
+    fn jnc_ph(&mut self) -> u16 {
+        let p = self.offset();
+        self.emit(0x73).emit(0x00);
+        p
+    }
+    fn jne_ph(&mut self) -> u16 {
+        let p = self.offset();
+        self.emit(0x75).emit(0x00);
+        p
+    }
+    fn jz_ph(&mut self) -> u16 {
+        let p = self.offset();
+        self.emit(0x74).emit(0x00);
+        p
+    }
+    fn patch_rel8_here(&mut self, pos: u16) {
+        let t = self.offset();
+        self.bytes[pos as usize + 1] = (t as i32 - pos as i32 - 2) as i8 as u8;
+    }
+    fn call_rel16_ph(&mut self) -> u16 {
+        let p = self.offset() + 1;
+        self.emit(0xE8).emit16(0);
+        p
+    } // returns offset of rel16 field
+    fn label(&self) -> u16 {
+        self.offset()
+    }
+    fn extend(&mut self, data: &[u8]) {
+        self.bytes.extend_from_slice(data);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -133,10 +246,21 @@ impl CodeBuf {
 
 fn build_mbr_boot_sector() -> Vec<u8> {
     let mut c = CodeBuf::new();
-    c.cli(); c.xor_ax_ax(); c.mov_ss_ax(); c.mov_sp(0x7C00); c.mov_ds_ax(); c.mov_es_ax(); c.cld();
-    c.mov_si(0x7C00); c.mov_di(0x0600); c.mov_cx(0x0100); c.rep_movsw();
+    c.cli();
+    c.xor_ax_ax();
+    c.mov_ss_ax();
+    c.mov_sp(0x7C00);
+    c.mov_ds_ax();
+    c.mov_es_ax();
+    c.cld();
+    c.mov_si(0x7C00);
+    c.mov_di(0x0600);
+    c.mov_cx(0x0100);
+    c.rep_movsw();
     c.jmp_far(0x0000, 0x061E_u16);
-    while c.offset() < 0x001E { c.nop(); }
+    while c.offset() < 0x001E {
+        c.nop();
+    }
     c.sti();
     let dn: u16 = 0x07B0;
     let ul: u16 = 0x07B1;
@@ -152,29 +276,41 @@ fn build_mbr_boot_sector() -> Vec<u8> {
     // This is a warm reboot from the kernel after loading an ISO boot image.
     // MOV EAX, [cookie_addr]  (32-bit load: 66 A1 + addr16)
     c.emit(0x66).emit(0xA1).emit16(cookie_addr); // MOV EAX, [cookie_addr]
-    // CMP EAX, 0x544F4F42
+                                                 // CMP EAX, 0x544F4F42
     c.emit(0x66).emit(0x3D).emit32(0x544F4F42u32); // CMP EAX, BOOT_COOKIE_MAGIC
     let jne_normal = c.jne_ph();
     // Boot cookie found! DL already has disk number. Jump to 0x7C00.
     // First clear the cookie so subsequent resets don't loop
-    c.emit(0x66).emit(0xC7).emit(0x06).emit16(cookie_addr).emit32(0); // MOV DWORD [cookie], 0
+    c.emit(0x66)
+        .emit(0xC7)
+        .emit(0x06)
+        .emit16(cookie_addr)
+        .emit32(0); // MOV DWORD [cookie], 0
     c.mov_dl_mem16(dn); // restore DL (may have been clobbered)
     c.jmp_far(0x0000, 0x7C00);
 
     // ── Normal boot path ────────────────────────────────────────────
     c.patch_rel8_here(jne_normal);
 
-    c.mov_ah(0x41); c.mov_bx(0x55AA); c.int(0x13);
-    let j1=c.jc_ph(); c.cmp_bx(0xAA55); let j2=c.jne_ph(); c.test_cl(0x01); let j3=c.jz_ph();
+    c.mov_ah(0x41);
+    c.mov_bx(0x55AA);
+    c.int(0x13);
+    let j1 = c.jc_ph();
+    c.cmp_bx(0xAA55);
+    let j2 = c.jne_ph();
+    c.test_cl(0x01);
+    let j3 = c.jz_ph();
     c.mov_mem8_imm8(ul, 1);
-    c.patch_rel8_here(j1); c.patch_rel8_here(j2); c.patch_rel8_here(j3);
-    c.mov_mem32_imm32(dll,1);
+    c.patch_rel8_here(j1);
+    c.patch_rel8_here(j2);
+    c.patch_rel8_here(j3);
+    c.mov_mem32_imm32(dll, 1);
     // Upper 32 bits of LBA (bytes 0x07CC–0x07CF) are NOT initialised
     // after REP MOVSW — they contain boot code bytes from MBR offset
     // 0x01CC.  Many BIOSes use the full 64-bit field and will fail
     // the extended read if the upper bits are non-zero.
-    c.mov_mem32_imm32(dll+4,0);
-    c.mov_mem16_imm16(dsc,127);
+    c.mov_mem32_imm32(dll + 4, 0);
+    c.mov_mem16_imm16(dsc, 127);
     // ── Initialise DAP fields that are NOT written by the above ─────
     // 0x07C0 = packet size   (1 byte  → must be 0x10)
     // 0x07C1 = reserved      (1 byte  → must be 0x00; already zero from REP MOVSW)
@@ -193,18 +329,42 @@ fn build_mbr_boot_sector() -> Vec<u8> {
     // instruction).  Explicitly zero it so BIOS reads Stage2 to
     // segment:offset = 0x0000:0x7E00 (physical 0x7E00).
     c.mov_mem16_imm16(0x07C6, 0x0000);
-    c.cmp_mem8_imm8(ul,1); let j4=c.jne_ph();
-    c.mov_ah(0x42); c.mov_dl_mem16(dn); c.mov_si(da); c.int(0x13);
-    let j5=c.jnc_ph(); c.shr_mem16_1(dsc); let j6=c.jne_ph();
-    c.patch_rel8_here(j4); c.mov_si(0x07B2);
-    let cp=c.call_rel16_ph(); let crp=c.offset(); c.jmp_short(-2i8);
+    c.cmp_mem8_imm8(ul, 1);
+    let j4 = c.jne_ph();
+    c.mov_ah(0x42);
+    c.mov_dl_mem16(dn);
+    c.mov_si(da);
+    c.int(0x13);
+    let j5 = c.jnc_ph();
+    c.shr_mem16_1(dsc);
+    let j6 = c.jne_ph();
+    c.patch_rel8_here(j4);
+    c.mov_si(0x07B2);
+    let cp = c.call_rel16_ph();
+    let crp = c.offset();
+    c.jmp_short(-2i8);
     c.patch_rel8_here(j6);
-    c.patch_rel8_here(j5); c.mov_dl_mem16(dn); c.jmp_far(0x0000,0x7E00);
-    let pl=c.label(); let ci=crp-2;
-    c.bytes[ci as usize]=(pl-crp) as u8; c.bytes[ci as usize+1]=((pl-crp)>>8) as u8;
-    c.pusha(); c.mov_ah(0x0E); c.xor_bx_bx(); c.lodsb(); c.test_al_al();
-    let pz=c.jz_ph(); c.int(0x10); c.jmp_short(-9i8); c.popa(); c.ret(); c.patch_rel8_here(pz);
-    while c.bytes.len()<440 { c.emit(0x00); }
+    c.patch_rel8_here(j5);
+    c.mov_dl_mem16(dn);
+    c.jmp_far(0x0000, 0x7E00);
+    let pl = c.label();
+    let ci = crp - 2;
+    c.bytes[ci as usize] = (pl - crp) as u8;
+    c.bytes[ci as usize + 1] = ((pl - crp) >> 8) as u8;
+    c.pusha();
+    c.mov_ah(0x0E);
+    c.xor_bx_bx();
+    c.lodsb();
+    c.test_al_al();
+    let pz = c.jz_ph();
+    c.int(0x10);
+    c.jmp_short(-9i8);
+    c.popa();
+    c.ret();
+    c.patch_rel8_here(pz);
+    while c.bytes.len() < 440 {
+        c.emit(0x00);
+    }
     c.bytes
 }
 
@@ -239,8 +399,9 @@ fn build_stage2_binary(kernel: &[u8]) -> Vec<u8> {
 
     // ── 16-bit real mode entry (phys 0x7E00) ───────────────────────
     c.cli();
-    c.xor_ax_ax(); c.mov_ss_ax(); // SS ← 0
-    c.mov_sp(0x7E00);             // stack at top of stage2 area
+    c.xor_ax_ax();
+    c.mov_ss_ax(); // SS ← 0
+    c.mov_sp(0x7E00); // stack at top of stage2 area
 
     c.mov_mem8_dl(0x7DFE); // save disk number
 
@@ -251,36 +412,66 @@ fn build_stage2_binary(kernel: &[u8]) -> Vec<u8> {
     // the fast A20 port.
     //
     // 1) Keyboard controller (8042)
-    c.mov_al(0xD1); c.emit(0xE6).emit(0x64); // OUT 0x64, AL (write cmd)
-    c.mov_al(0xDF); c.emit(0xE6).emit(0x60); // OUT 0x60, AL (enable A20)
-    //　wait a moment (loop ~65536 times)
+    c.mov_al(0xD1);
+    c.emit(0xE6).emit(0x64); // OUT 0x64, AL (write cmd)
+    c.mov_al(0xDF);
+    c.emit(0xE6).emit(0x60); // OUT 0x60, AL (enable A20)
+                             //　wait a moment (loop ~65536 times)
     c.mov_cx(0xFFFF);
     let wait1 = c.label();
     c.emit(0xE2).emit(0xFD); // LOOP $-3
 
     // 2) BIOS call (INT 15h AH=2401h)
-    c.mov_ah(0x24); c.mov_al(0x01); c.int(0x15);
+    c.mov_ah(0x24);
+    c.mov_al(0x01);
+    c.int(0x15);
 
     // 3) Fast A20 gate via System Control Port A (I/O 0x92)
-    c.mov_al(0x02); c.emit(0xE6).emit(0x92); // OUT 0x92, 2
+    c.mov_al(0x02);
+    c.emit(0xE6).emit(0x92); // OUT 0x92, 2
 
     // ── GDT pseudo-descriptor (must be at STAGE2_GDT_PTR_OFF) ──────
-    while c.offset() < STAGE2_GDT_PTR_OFF { c.emit(0x90); }
-    c.emit16(5 * 8 - 1);                         // limit
+    while c.offset() < STAGE2_GDT_PTR_OFF {
+        c.emit(0x90);
+    }
+    c.emit16(5 * 8 - 1); // limit
     c.emit32(0x7E00 + STAGE2_GDT_ENTS_OFF as u32); // base
 
     // ── GDT entries (at STAGE2_GDT_ENTS_OFF) ────────────────────────
-    while c.offset() < STAGE2_GDT_ENTS_OFF { c.emit(0x00); }
+    while c.offset() < STAGE2_GDT_ENTS_OFF {
+        c.emit(0x00);
+    }
     // [0] null descriptor
-    c.emit32(0); c.emit32(0);
+    c.emit32(0);
+    c.emit32(0);
     // [1] 32-bit code (selector 0x08): base=0, limit=4 GiB, D=1
-    c.emit16(0xFFFF); c.emit16(0x0000); c.emit(0x00); c.emit(0x9A); c.emit(0xCF); c.emit(0x00);
+    c.emit16(0xFFFF);
+    c.emit16(0x0000);
+    c.emit(0x00);
+    c.emit(0x9A);
+    c.emit(0xCF);
+    c.emit(0x00);
     // [2] 32-bit data (selector 0x10): base=0, limit=4 GiB, writable
-    c.emit16(0xFFFF); c.emit16(0x0000); c.emit(0x00); c.emit(0x92); c.emit(0xCF); c.emit(0x00);
+    c.emit16(0xFFFF);
+    c.emit16(0x0000);
+    c.emit(0x00);
+    c.emit(0x92);
+    c.emit(0xCF);
+    c.emit(0x00);
     // [3] 64-bit code (selector 0x18): L=1, D=0
-    c.emit16(0x0000); c.emit16(0x0000); c.emit(0x00); c.emit(0x9A); c.emit(0x20); c.emit(0x00);
+    c.emit16(0x0000);
+    c.emit16(0x0000);
+    c.emit(0x00);
+    c.emit(0x9A);
+    c.emit(0x20);
+    c.emit(0x00);
     // [4] 64-bit data (selector 0x20)
-    c.emit16(0x0000); c.emit16(0x0000); c.emit(0x00); c.emit(0x92); c.emit(0x00); c.emit(0x00);
+    c.emit16(0x0000);
+    c.emit16(0x0000);
+    c.emit(0x00);
+    c.emit(0x92);
+    c.emit(0x00);
+    c.emit(0x00);
 
     // ── 32-bit protected mode entry (immediately after GDT entries) ─
     // Record the physical address so the 16-bit code can far-jump here.
@@ -320,72 +511,79 @@ fn build_stage2_binary(kernel: &[u8]) -> Vec<u8> {
     // The kernel flat binary lives at stage2+0x2000 (phys 0x9E00).
     // We relocate it to 1 MiB to avoid collision with boot images
     // loaded at 0x7C00 and to give the kernel room to grow.
-    c.emit(0xBE).emit32(0x9E00);      // MOV ESI, 0x9E00 (source)
-    c.emit(0xBF).emit32(0x100000);    // MOV EDI, 0x100000 (dest)
-    c.emit(0xB9).emit32(0x20000);     // MOV ECX, 128*1024 (up to 512 KiB)
-    c.emit(0xFC);                      // CLD
-    c.emit(0xF3).emit(0xA5);          // REP MOVSD
+    c.emit(0xBE).emit32(0x9E00); // MOV ESI, 0x9E00 (source)
+    c.emit(0xBF).emit32(0x100000); // MOV EDI, 0x100000 (dest)
+    c.emit(0xB9).emit32(0x20000); // MOV ECX, 128*1024 (up to 512 KiB)
+    c.emit(0xFC); // CLD
+    c.emit(0xF3).emit(0xA5); // REP MOVSD
 
     // ── build page tables ───────────────────────────────────────────
     // PML4 at phys 0x8000 (binary offset 0x200)
     let pml4_phys: u32 = 0x90000;
     let pdpt_phys: u32 = 0x90200;
-    let pd_phys: u32   = 0x90400;
+    let pd_phys: u32 = 0x90400;
 
     // Zero PML4 (EDI = pml4_phys, ECX = 1024, EAX = 0, REP STOSD)
-    c.emit(0xBF).emit32(pml4_phys);       // MOV EDI, pml4_phys
-    c.emit(0xB9).emit32(1024);             // MOV ECX, 1024
-    c.emit(0x31).emit(0xC0);               // XOR EAX, EAX
-    c.emit(0xF3).emit(0xAB);               // REP STOSD
+    c.emit(0xBF).emit32(pml4_phys); // MOV EDI, pml4_phys
+    c.emit(0xB9).emit32(1024); // MOV ECX, 1024
+    c.emit(0x31).emit(0xC0); // XOR EAX, EAX
+    c.emit(0xF3).emit(0xAB); // REP STOSD
 
     // Zero PDPT
     c.emit(0xBF).emit32(pdpt_phys);
     c.emit(0xB9).emit32(1024);
     c.emit(0x31).emit(0xC0);
-    c.emit(0xF3).emit(0xAB);               // REP STOSD
+    c.emit(0xF3).emit(0xAB); // REP STOSD
 
     // PML4[0] = pdpt_phys | 0x03
-    c.emit(0xC7).emit(0x05).emit32(pml4_phys).emit32(pdpt_phys | 0x03);
+    c.emit(0xC7)
+        .emit(0x05)
+        .emit32(pml4_phys)
+        .emit32(pdpt_phys | 0x03);
 
     // PDPT[0] = pd_phys | 0x03
-    c.emit(0xC7).emit(0x05).emit32(pdpt_phys).emit32(pd_phys | 0x03);
+    c.emit(0xC7)
+        .emit(0x05)
+        .emit32(pdpt_phys)
+        .emit32(pd_phys | 0x03);
 
     // Fill PD with 512 × 2 MiB entries: PD[i] = (i*2MB) | 0x83
-    c.emit(0xBF).emit32(pd_phys);           // MOV EDI, pd_phys
-    c.emit(0xB9).emit32(512);               // MOV ECX, 512
-    c.emit(0x31).emit(0xF6);                // XOR ESI, ESI
+    c.emit(0xBF).emit32(pd_phys); // MOV EDI, pd_phys
+    c.emit(0xB9).emit32(512); // MOV ECX, 512
+    c.emit(0x31).emit(0xF6); // XOR ESI, ESI
     let fl = c.offset() as usize;
-    c.emit(0x89).emit(0xF0);                // MOV EAX, ESI
-    c.emit(0xC1).emit(0xE0).emit(21);       // SHL EAX, 21
-    c.emit(0x0D).emit32(0x83);              // OR EAX, 0x83
-    c.emit(0xAB);                            // STOSD (lo 32)
-    c.emit(0x31).emit(0xC0);                // XOR EAX, EAX
-    c.emit(0xAB);                            // STOSD (hi 32)
-    c.emit(0x46);                            // INC ESI
-    c.emit(0x49);                            // DEC ECX
-    let fj = c.offset(); c.emit(0x75).emit(0x00);
-    c.bytes[fj as usize+1] = (fl as u32).wrapping_sub(fj as u32).wrapping_sub(2) as u8;
+    c.emit(0x89).emit(0xF0); // MOV EAX, ESI
+    c.emit(0xC1).emit(0xE0).emit(21); // SHL EAX, 21
+    c.emit(0x0D).emit32(0x83); // OR EAX, 0x83
+    c.emit(0xAB); // STOSD (lo 32)
+    c.emit(0x31).emit(0xC0); // XOR EAX, EAX
+    c.emit(0xAB); // STOSD (hi 32)
+    c.emit(0x46); // INC ESI
+    c.emit(0x49); // DEC ECX
+    let fj = c.offset();
+    c.emit(0x75).emit(0x00);
+    c.bytes[fj as usize + 1] = (fl as u32).wrapping_sub(fj as u32).wrapping_sub(2) as u8;
 
     // Enable PAE (CR4.PAE = bit 5)
-    c.emit(0x0F).emit(0x20).emit(0xE0);     // MOV EAX, CR4
-    c.emit(0x83).emit(0xC8).emit(0x20);      // OR EAX, 0x20
-    c.emit(0x0F).emit(0x22).emit(0xE0);     // MOV CR4, EAX
+    c.emit(0x0F).emit(0x20).emit(0xE0); // MOV EAX, CR4
+    c.emit(0x83).emit(0xC8).emit(0x20); // OR EAX, 0x20
+    c.emit(0x0F).emit(0x22).emit(0xE0); // MOV CR4, EAX
 
     // Load CR3
-    c.emit(0xB8).emit32(pml4_phys);          // MOV EAX, pml4
-    c.emit(0x0F).emit(0x22).emit(0xD8);     // MOV CR3, EAX
+    c.emit(0xB8).emit32(pml4_phys); // MOV EAX, pml4
+    c.emit(0x0F).emit(0x22).emit(0xD8); // MOV CR3, EAX
 
     // Enable EFER.LME via MSR 0xC0000080
-    c.emit(0xB9).emit32(0xC000_0080u32);     // MOV ECX, 0xC0000080
-    c.emit(0x0F).emit(0x32);                 // RDMSR
-    c.emit(0x0D).emit32(0x100);              // OR EAX, 0x100
-    c.emit(0x0F).emit(0x30);                 // WRMSR
+    c.emit(0xB9).emit32(0xC000_0080u32); // MOV ECX, 0xC0000080
+    c.emit(0x0F).emit(0x32); // RDMSR
+    c.emit(0x0D).emit32(0x100); // OR EAX, 0x100
+    c.emit(0x0F).emit(0x30); // WRMSR
 
     // Enable paging (CR0.PG | CR0.PE) — PE already set
     // CR0 |= 0x80000000
-    c.emit(0x0F).emit(0x20).emit(0xC0);     // MOV EAX, CR0
-    c.emit(0x0D).emit32(0x8000_0000u32);     // OR EAX, 0x80000000
-    c.emit(0x0F).emit(0x22).emit(0xC0);     // MOV CR0, EAX
+    c.emit(0x0F).emit(0x20).emit(0xC0); // MOV EAX, CR0
+    c.emit(0x0D).emit32(0x8000_0000u32); // OR EAX, 0x80000000
+    c.emit(0x0F).emit(0x22).emit(0xC0); // MOV CR0, EAX
 
     // Far jump to 64-bit kernel entry (selector 0x18)
     // We're in 32-bit compat mode.  Opcode EA + 32-bit offset + 16-bit sel
@@ -408,19 +606,21 @@ fn build_stage2_binary(kernel: &[u8]) -> Vec<u8> {
     c.lgdt_mem16(0x7E00 + STAGE2_GDT_PTR_OFF);
     c.mov_eax_cr0();
     c.or_eax_imm32(1);
-    c.mov_cr0_eax();                         // CR0.PE = 1 → protected mode
+    c.mov_cr0_eax(); // CR0.PE = 1 → protected mode
 
     // The far-jump target is where the trampoline will start after we
     // re-append it.  The JMP FAR32 instruction itself is 8 bytes, so
     // trampoline starts at current offset + 8.
     let prot32_entry = 0x7E00u32 + c.offset() as u32 + 8;
-    c.jmp_far32(0x08, prot32_entry);        // far jump to 32-bit selector + trampoline
+    c.jmp_far32(0x08, prot32_entry); // far jump to 32-bit selector + trampoline
 
     // Re-append the trampoline after the patched preamble.
     c.bytes.extend_from_slice(&trampoline);
 
     // Pad to STAGE2_KERNEL_OFFSET, then append kernel flat binary.
-    while (c.offset() as usize) < STAGE2_KERNEL_OFFSET { c.emit(0x00); }
+    while (c.offset() as usize) < STAGE2_KERNEL_OFFSET {
+        c.emit(0x00);
+    }
     c.extend(kernel);
 
     c.bytes
@@ -437,8 +637,12 @@ fn build_kernel_binary(out_dir: &PathBuf) -> Vec<u8> {
     println!("cargo:warning=Building kernel for x86_64-unknown-none...");
     let status = std::process::Command::new("cargo")
         .args(&["build", "--target", "x86_64-unknown-none", "--release"])
-        .env("RUSTFLAGS", "-C link-arg=-Ttext=0x100000 -C relocation-model=static -C code-model=small")
-        .arg("--target-dir").arg(&ktarget)
+        .env(
+            "RUSTFLAGS",
+            "-C link-arg=-Ttext=0x100000 -C relocation-model=static -C code-model=small",
+        )
+        .arg("--target-dir")
+        .arg(&ktarget)
         .current_dir(&kdir)
         .status();
 
@@ -454,12 +658,17 @@ fn build_kernel_binary(out_dir: &PathBuf) -> Vec<u8> {
             println!("cargo:warning=Kernel ELF size: {} bytes", elf.len());
             extract_flat_from_elf(&elf)
         }
-        Err(e) => { println!("cargo:warning=Read kernel ELF: {}", e); vec![0; 512] }
+        Err(e) => {
+            println!("cargo:warning=Read kernel ELF: {}", e);
+            vec![0; 512]
+        }
     }
 }
 
 fn extract_flat_from_elf(elf: &[u8]) -> Vec<u8> {
-    if elf.len() < 64 { return vec![0;512]; }
+    if elf.len() < 64 {
+        return vec![0; 512];
+    }
 
     // Parse ELF64 header
     let e_phoff = u64::from_le_bytes(elf[32..40].try_into().unwrap());
@@ -468,16 +677,22 @@ fn extract_flat_from_elf(elf: &[u8]) -> Vec<u8> {
     let mut lo_segments: Vec<(u64, usize, usize)> = Vec::new(); // (vaddr, file_offset, file_size)
     for i in 0..e_phnum as u64 {
         let off = (e_phoff + i * 56) as usize;
-        if off + 56 > elf.len() { break; }
-        let p_type = u32::from_le_bytes(elf[off..off+4].try_into().unwrap());
-        if p_type != 1 { continue; } // PT_LOAD
-        let p_offset = u64::from_le_bytes(elf[off+8..off+16].try_into().unwrap());
-        let p_vaddr = u64::from_le_bytes(elf[off+16..off+24].try_into().unwrap());
-        let p_filesz = u64::from_le_bytes(elf[off+32..off+40].try_into().unwrap());
+        if off + 56 > elf.len() {
+            break;
+        }
+        let p_type = u32::from_le_bytes(elf[off..off + 4].try_into().unwrap());
+        if p_type != 1 {
+            continue;
+        } // PT_LOAD
+        let p_offset = u64::from_le_bytes(elf[off + 8..off + 16].try_into().unwrap());
+        let p_vaddr = u64::from_le_bytes(elf[off + 16..off + 24].try_into().unwrap());
+        let p_filesz = u64::from_le_bytes(elf[off + 32..off + 40].try_into().unwrap());
         lo_segments.push((p_vaddr, p_offset as usize, p_filesz as usize));
     }
 
-    if lo_segments.is_empty() { return vec![0;512]; }
+    if lo_segments.is_empty() {
+        return vec![0; 512];
+    }
 
     // Skip GNU EFI stub headers (vaddr=0x0, small size).
     // Stage2 loads the kernel at physical 0x9E00, so the first real
@@ -485,13 +700,19 @@ fn extract_flat_from_elf(elf: &[u8]) -> Vec<u8> {
     // as min_vaddr would offset the flat binary by 0x200, causing
     // Stage2's far-jump to land on the header instead of _start.
     lo_segments.retain(|(va, _, sz)| *va >= 0x1000 || *sz >= 0x1000);
-    if lo_segments.is_empty() { return vec![0;512]; }
+    if lo_segments.is_empty() {
+        return vec![0; 512];
+    }
 
     lo_segments.sort_by_key(|s| s.0);
     let min_vaddr = lo_segments[0].0;
 
     // Find max end address
-    let max_end = lo_segments.iter().map(|(va, _, sz)| (va - min_vaddr) as usize + sz).max().unwrap_or(512);
+    let max_end = lo_segments
+        .iter()
+        .map(|(va, _, sz)| (va - min_vaddr) as usize + sz)
+        .max()
+        .unwrap_or(512);
     let mut flat = vec![0u8; max_end.max(512)];
 
     for (vaddr, foff, fsz) in &lo_segments {
@@ -517,13 +738,15 @@ fn build_efi_binary(out_dir: &PathBuf) -> Vec<u8> {
     println!("cargo:warning=Building EFI for x86_64-unknown-uefi...");
     let s = std::process::Command::new("cargo")
         .args(&["build", "--target", "x86_64-unknown-uefi", "--release"])
-        .arg("--target-dir").arg(&efi_target)
-        .current_dir(&efi_dir).status();
+        .arg("--target-dir")
+        .arg(&efi_target)
+        .current_dir(&efi_dir)
+        .status();
 
     match s {
         Ok(st) if st.success() => {}
         _ => panic!("EFI build failed"),
     }
     let path = efi_target.join("x86_64-unknown-uefi/release/choosable-efi.efi");
-    fs::read(&path).unwrap_or_else(|_| vec![0;512])
+    fs::read(&path).unwrap_or_else(|_| vec![0; 512])
 }
