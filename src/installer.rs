@@ -84,59 +84,65 @@ fn udev_stop() {
         .status();
 }
 
-/// Resume udev: let queued events drain, then send ONE synthetic "change"
-/// event on the parent disk so udisks2 creates D-Bus objects for the
-/// final partition state.
+/// Resume udev after a LAYOUT-CHANGING operation (install / non-destructive).
 ///
-/// This is the ONLY place where udevadm trigger is called.  Doing it
-/// multiple times (or at intermediate states) causes udisks2 to drop and
-/// recreate D-Bus objects while desktop components are still accessing
-/// them → "No object for D-bus interface".
-fn udev_resume_and_notify(disk_path: &str) {
-    // 1. Flush kernel caches
+/// After `install` or `non_destructive_install` the partition table has
+/// changed fundamentally (new MBR/GPT, new partition sizes).  The kernel
+/// must be told to re-read the partition table so that udisks2 sees the
+/// correct layout.
+fn udev_resume_and_notify_with_reload(disk_path: &str) {
     let _ = std::process::Command::new("sync")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
 
-    // 2. Tell kernel to re-read partition table
+    // Tell kernel to re-read partition table — needed after layout change.
     let _ = std::process::Command::new("partx")
         .args(&["-u", disk_path])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
 
-    // 3. Resume udev — queued events start processing
     let _ = std::process::Command::new("udevadm")
         .args(&["control", "--start-exec-queue"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
 
-    // 4. Wait for all queued events to be processed by udev
     let _ = std::process::Command::new("udevadm")
         .arg("settle")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
 
-    // 5. Send ONE final "change" event so udisks2 creates fresh,
-    //    complete D-Bus objects for all partitions
-    let _ = std::process::Command::new("udevadm")
-        .args(&["trigger", "--action=change", "--name-match", disk_path])
+    std::thread::sleep(std::time::Duration::from_secs(1));
+}
+
+/// Resume udev after a LAYOUT-PRESERVING operation (update).
+///
+/// `update_choosable` only touches the boot sector, stage2 gap, and EFI
+/// FAT files — it does NOT modify the partition table.  Calling `partx -u`
+/// here would cause the kernel to emit PARTITION_CHANGE events for
+/// unchanged partitions, which makes udisks2 drop and recreate all D-Bus
+/// objects → "No object for D-bus interface".
+fn udev_resume_and_notify_update(_disk_path: &str) {
+    let _ = std::process::Command::new("sync")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
 
-    // 6. Wait for udev + udisks2 to finish processing the trigger
+    let _ = std::process::Command::new("udevadm")
+        .args(&["control", "--start-exec-queue"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
     let _ = std::process::Command::new("udevadm")
         .arg("settle")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
 
-    // 7. Brief sleep to let udisks2 finish creating D-Bus objects
-    //    (udevadm settle doesn't wait for D-Bus)
     std::thread::sleep(std::time::Duration::from_secs(1));
 }
 
@@ -280,7 +286,7 @@ pub fn non_destructive_install(disk_path: &str, _label: &str, _fs_type: Filesyst
     }
 
     // ALL operations complete — resume udev and notify ONCE
-    udev_resume_and_notify(disk_path);
+    udev_resume_and_notify_with_reload(disk_path);
 
     println!();
     println!("\x1b[32mChoosable non-destructive installation on {} successfully finished.\x1b[0m", disk_path);
@@ -697,7 +703,7 @@ pub fn install_choosable(
     }
 
     // ALL operations complete — resume udev and notify ONCE
-    udev_resume_and_notify(disk_path);
+    udev_resume_and_notify_with_reload(disk_path);
 
     println!();
     println!("\x1b[32mChoosable installed successfully to {}.\x1b[0m", disk_path);
@@ -1065,7 +1071,7 @@ pub fn update_choosable(disk_path: &str, secure_boot: Option<bool>, yes: bool) -
     }
 
     // ALL operations complete — resume udev and notify ONCE
-    udev_resume_and_notify(disk_path);
+    udev_resume_and_notify_update(disk_path);
 
     println!();
     println!("\x1b[32mChoosable updated successfully on {}.\x1b[0m", disk_path);
