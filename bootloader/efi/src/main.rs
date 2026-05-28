@@ -188,7 +188,7 @@ enum MemoryType {
 // ─── UEFI Protocol GUIDs ────────────────────────────────────────────────
 
 const SIMPLE_FILE_SYSTEM_GUID: Guid = Guid {
-    data1: 0x0964e5b22,
+    data1: 0x0964e5b2,
     data2: 0x6459,
     data3: 0x11d2,
     data4: [0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
