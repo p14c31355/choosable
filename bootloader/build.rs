@@ -351,7 +351,7 @@ fn build_stage2_binary(kernel: &[u8]) -> Vec<u8> {
     let fl = c.offset() as usize;
     c.emit(0x89).emit(0xF0);                // MOV EAX, ESI
     c.emit(0xC1).emit(0xE0).emit(21);       // SHL EAX, 21
-    c.emit(0x83).emit(0xC8).emit(0x83);     // OR EAX, 0x83
+    c.emit(0x0D).emit32(0x83);              // OR EAX, 0x83
     c.emit(0xAB);                            // STOSD (lo 32)
     c.emit(0x31).emit(0xC0);                // XOR EAX, EAX
     c.emit(0xAB);                            // STOSD (hi 32)
