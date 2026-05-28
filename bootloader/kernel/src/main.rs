@@ -485,6 +485,11 @@ fn boot_iso(file: &DirEntry, _part_lba: u32, info: &ExfatInfo) -> ! {
     vga_print(2, 5, b"Loading ISO boot sector...", 0x0F);
 
     // Calculate the starting LBA of the ISO file on disk
+    if file.start_cluster < 2 {
+        vga_print(4, 2, b"Invalid start cluster in directory entry.", 0x0C);
+        kbd_wait_key();
+        show_menu(&[], 0, 0, info);
+    }
     let iso_start_lba = info.cluster_heap_offset_sectors
         + (file.start_cluster as u64 - 2) * (info.cluster_size_bytes as u64 / 512);
 
