@@ -584,7 +584,14 @@ pub fn process_secure_boot_esp(disk_path: &str, _part2_start_byte: u64, enable_s
         let _ = root.remove("ENROLL_THIS_KEY_IN_MOKMANAGER.cer");
     }
 
-    notify_kernel(disk_path);
+    // NOTE: Do NOT call notify_kernel/notify_kernel_after_udev here.
+    // udev exec-queue may be stopped by the caller (install/update/
+    // non-destructive paths all use --stop-exec-queue).  Calling
+    // udevadm settle while udev is stopped will deadlock.
+    //
+    // The caller is responsible for re-reading the partition table,
+    // resuming udev, and triggering change events after all disk
+    // operations are complete.
     Ok(())
 }
 
