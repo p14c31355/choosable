@@ -8,11 +8,11 @@ const OPEN_PROTOCOL_GET_PROTOCOL: u32 = 2;
 /// UEFI entry point — NEVER returns.
 #[no_mangle]
 extern "efiapi" fn efi_main(
-    image_handle: *mut core::ffi::c_void,
+    image_handle_arg: *mut core::ffi::c_void,
     system_table: *mut SystemTable,
 ) -> ! {
     // Save image_handle for open_protocol fallback
-    unsafe { IMAGE_HANDLE = image_handle; }
+    unsafe { OUR_IMAGE_HANDLE = image_handle_arg; }
 
     let st = unsafe { &mut *system_table };
     let bs = unsafe { &mut *st.boot_services };
@@ -20,18 +20,17 @@ extern "efiapi" fn efi_main(
     if !st.con_out.is_null() {
         let con = unsafe { &mut *(st.con_out as *mut SimpleTextOutput) };
         con.output_string(b"\r\n========================================\r\n\0");
-        con.output_string(b"    Choosable UEFI Bootloader v0.1      \r\n\0");
+        con.output_string(b"    Choosable UEFI Bootloader v0.2      \r\n\0");
         con.output_string(b"========================================\r\n\0");
         con.output_string(b"\r\nScanning for bootable images...\r\n\0");
     }
 
-    // Step 1: Get LoadedImageProtocol on our image handle.
-    let loaded_image = unsafe { get_protocol::<LoadedImageProtocol>(bs, image_handle, &LOADED_IMAGE_PROTOCOL_GUID) };
+    // Step 1: Get LoadedImageProtocol.
+    let loaded_image = unsafe { get_protocol::<LoadedImageProtocol>(bs, image_handle_arg, &LOADED_IMAGE_PROTOCOL_GUID) };
     let loaded_image = match loaded_image {
         Some(lip) => lip,
         None => {
             print_error(st, b"ERROR: Failed to get LoadedImageProtocol.\r\n\0");
-            print_error(st, b"Boot failed -- halting.\r\n\0");
             halt_or_reboot(st);
         }
     };
@@ -39,18 +38,16 @@ extern "efiapi" fn efi_main(
     let device_handle = unsafe { (*loaded_image).device_handle };
     if device_handle.is_null() {
         print_error(st, b"ERROR: LoadedImage has no device handle.\r\n\0");
-        print_error(st, b"Boot failed -- halting.\r\n\0");
         halt_or_reboot(st);
     }
 
-    // Step 2: Get SimpleFileSystem protocol on the device handle.
-    //
-    // Some firmware (notably NEC OEM) fails handle_protocol for SFS.
-    // Try handle_protocol first, then open_protocol as fallback.
-    let fs: *mut core::ffi::c_void = unsafe { get_protocol_raw(bs, device_handle, &SIMPLE_FILE_SYSTEM_GUID) };
+    // Step 2: Get SimpleFileSystem protocol — three-stage fallback.
+    //         1. handle_protocol on device_handle (fast path)
+    //         2. open_protocol on device_handle (for buggy firmware)
+    //         3. locate_handle_buffer + handle_protocol (global search)
+    let fs = unsafe { acquire_simple_file_system(st, bs, device_handle) };
     if fs.is_null() {
         print_error(st, b"ERROR: Failed to open filesystem.\r\n\0");
-        print_error(st, b"Boot failed -- halting.\r\n\0");
         halt_or_reboot(st);
     }
 
@@ -60,46 +57,94 @@ extern "efiapi" fn efi_main(
     halt_or_reboot(st);
 }
 
-// ─── Protocol acquisition (two-stage fallback) ──────────────────────────
+// ─── Three-stage SFS acquisition ────────────────────────────────────────
 
-/// Get a typed protocol interface.
-/// Tries handle_protocol first, then open_protocol as fallback.
-unsafe fn get_protocol<T>(bs: &mut BootServices, handle: *mut core::ffi::c_void, guid: &Guid) -> Option<*mut T> {
-    let ptr = get_protocol_raw(bs, handle, guid);
-    if ptr.is_null() { None } else { Some(ptr as *mut T) }
-}
-
-/// Get a raw protocol interface pointer (handle_protocol → open_protocol fallback).
-unsafe fn get_protocol_raw(
+unsafe fn acquire_simple_file_system(
+    st: &mut SystemTable,
     bs: &mut BootServices,
-    handle: *mut core::ffi::c_void,
-    guid: &Guid,
+    device_handle: *mut core::ffi::c_void,
 ) -> *mut core::ffi::c_void {
-    // 1. Try handle_protocol (UEFI 2.0+ fast path)
+    let guid = &SIMPLE_FILE_SYSTEM_GUID;
+
+    // Stage 1: handle_protocol on the device handle (UEFI 2.0+ fast path)
     let mut iface: *mut core::ffi::c_void = core::ptr::null_mut();
-    let status = (bs.handle_protocol)(handle, guid, &mut iface);
+    let status = (bs.handle_protocol)(device_handle, guid, &mut iface);
     if status == 0 && !iface.is_null() {
         return iface;
     }
+    print_hex32(st, b"  handle_protocol status: 0x", status);
+    print_raw(st, b"\r\n\0");
 
-    // 2. Fallback: open_protocol with GET_PROTOCOL attribute
-    //    (works on buggy firmware where handle_protocol is broken for SFS)
+    // Stage 2: open_protocol with GET_PROTOCOL on device_handle
     iface = core::ptr::null_mut();
-    let agent_handle: *mut core::ffi::c_void = core::ptr::null_mut();
-    let controller_handle: *mut core::ffi::c_void = core::ptr::null_mut();
     let status = (bs.open_protocol)(
-        handle,
-        guid,
-        &mut iface,
-        IMAGE_HANDLE,
-        controller_handle,
+        device_handle, guid, &mut iface,
+        OUR_IMAGE_HANDLE, core::ptr::null_mut(),
         OPEN_PROTOCOL_GET_PROTOCOL,
     );
     if status == 0 && !iface.is_null() {
         return iface;
     }
+    print_hex32(st, b"  open_protocol  status: 0x", status);
+    print_raw(st, b"\r\n\0");
+
+    // Stage 3: locate_handle_buffer to find ANY handle with SFS,
+    //          then handle_protocol on the first one found.
+    //          (Works on firmware where the device_handle has no
+    //           explicit SFS binding but the partition does.)
+    let mut num_handles: usize = 0;
+    let mut handle_buf: *mut *mut core::ffi::c_void = core::ptr::null_mut();
+    let status = (bs.locate_handle_buffer)(
+        LocateSearchType::ByProtocol,
+        guid,
+        core::ptr::null_mut(),  // SearchKey (not used for ByProtocol)
+        &mut num_handles,
+        &mut handle_buf,
+    );
+    print_hex32(st, b"  locate_handle   status: 0x", status);
+    print_raw(st, b"\r\n\0");
+
+    if status == 0 && !handle_buf.is_null() && num_handles > 0 {
+        // Try each handle — the first one that gives us SFS wins.
+        for i in 0..num_handles {
+            let h = unsafe { *handle_buf.add(i) };
+            iface = core::ptr::null_mut();
+            let s = (bs.handle_protocol)(h, guid, &mut iface);
+            if s == 0 && !iface.is_null() {
+                // Found one! Free the buffer and return.
+                (bs.free_pool)(handle_buf as *mut core::ffi::c_void);
+                return iface;
+            }
+        }
+        (bs.free_pool)(handle_buf as *mut core::ffi::c_void);
+    }
 
     core::ptr::null_mut()
+}
+
+// ─── Protocol acquisition (used for LoadedImageProtocol only) ───────────
+
+unsafe fn get_protocol<T>(
+    bs: &mut BootServices,
+    handle: *mut core::ffi::c_void,
+    guid: &Guid,
+) -> Option<*mut T> {
+    let mut iface: *mut core::ffi::c_void = core::ptr::null_mut();
+    let status = (bs.handle_protocol)(handle, guid, &mut iface);
+    if status == 0 && !iface.is_null() {
+        return Some(iface as *mut T);
+    }
+    // Fallback: open_protocol
+    iface = core::ptr::null_mut();
+    let status = (bs.open_protocol)(
+        handle, guid, &mut iface,
+        OUR_IMAGE_HANDLE, core::ptr::null_mut(),
+        OPEN_PROTOCOL_GET_PROTOCOL,
+    );
+    if status == 0 && !iface.is_null() {
+        return Some(iface as *mut T);
+    }
+    None
 }
 
 // ─── Output helpers ─────────────────────────────────────────────────────
@@ -113,6 +158,29 @@ fn print_raw(st: &mut SystemTable, s: &[u8]) {
 
 fn print_error(st: &mut SystemTable, s: &[u8]) { print_raw(st, s); }
 fn print_info(st: &mut SystemTable, s: &[u8]) { print_raw(st, s); }
+
+fn print_hex32(st: &mut SystemTable, prefix: &[u8], val: usize) {
+    print_raw(st, prefix);
+    let hex = b"0123456789ABCDEF";
+    let mut buf = [0u8; 10];
+    buf[8] = hex[(val >> 4) & 0xF];
+    buf[9] = hex[val & 0xF];
+    buf[6] = hex[(val >> 12) & 0xF];
+    buf[7] = hex[(val >> 8) & 0xF];
+    buf[4] = hex[(val >> 20) & 0xF];
+    buf[5] = hex[(val >> 16) & 0xF];
+    buf[2] = hex[(val >> 28) & 0xF];
+    buf[3] = hex[(val >> 24) & 0xF];
+    // Strip leading zeros but keep at least "0x0"
+    let start = if val >= 0x1000_0000 { 0 }
+        else if val >= 0x100_0000 { 2 }
+        else if val >= 0x10_0000 { 4 }
+        else if val >= 0x10000 { 5 }
+        else { 6 };
+    buf[start] = b'0';
+    buf[start + 1] = b'x';
+    print_raw(st, &buf[start..10]);
+}
 
 // ─── Halt / reboot ──────────────────────────────────────────────────────
 
@@ -147,8 +215,7 @@ fn panic(_info: &PanicInfo) -> ! {
 
 // ─── UEFI Type Definitions ──────────────────────────────────────────────
 
-// We need image_handle at file scope for open_protocol fallback.
-static mut IMAGE_HANDLE: *mut core::ffi::c_void = core::ptr::null_mut();
+static mut OUR_IMAGE_HANDLE: *mut core::ffi::c_void = core::ptr::null_mut();
 
 #[repr(C)]
 struct SystemTable {
@@ -223,7 +290,7 @@ struct BootServices {
     _free_pages: *mut core::ffi::c_void,
     _get_memory_map: *mut core::ffi::c_void,
     _allocate_pool: *mut core::ffi::c_void,
-    _free_pool: *mut core::ffi::c_void,
+    free_pool: unsafe extern "efiapi" fn(*mut core::ffi::c_void) -> usize,
     _create_event: *mut core::ffi::c_void,
     _set_timer: *mut core::ffi::c_void,
     _wait_for_event: *mut core::ffi::c_void,
@@ -234,13 +301,19 @@ struct BootServices {
     _reinstall_protocol_interface: *mut core::ffi::c_void,
     _uninstall_protocol_interface: *mut core::ffi::c_void,
     handle_protocol: unsafe extern "efiapi" fn(
-        *mut core::ffi::c_void,   // Handle
-        *const Guid,               // Protocol
-        *mut *mut core::ffi::c_void, // Interface
+        *mut core::ffi::c_void,
+        *const Guid,
+        *mut *mut core::ffi::c_void,
     ) -> usize,
     _reserved: *mut core::ffi::c_void,
     _register_protocol_notify: *mut core::ffi::c_void,
-    _locate_handle: *mut core::ffi::c_void,
+    locate_handle_buffer: unsafe extern "efiapi" fn(
+        LocateSearchType,
+        *const Guid,
+        *mut core::ffi::c_void,
+        *mut usize,
+        *mut *mut *mut core::ffi::c_void,
+    ) -> usize,
     _locate_device_path: *mut core::ffi::c_void,
     _install_configuration_table: *mut core::ffi::c_void,
     _image_load: *mut core::ffi::c_void,
@@ -254,19 +327,14 @@ struct BootServices {
     _connect_controller: *mut core::ffi::c_void,
     _disconnect_controller: *mut core::ffi::c_void,
     open_protocol: unsafe extern "efiapi" fn(
-        *mut core::ffi::c_void,   // Handle
-        *const Guid,               // Protocol
-        *mut *mut core::ffi::c_void, // Interface
-        *mut core::ffi::c_void,   // AgentHandle
-        *mut core::ffi::c_void,   // ControllerHandle
-        u32,                       // Attributes
-    ) -> usize,
-    close_protocol: unsafe extern "efiapi" fn(
         *mut core::ffi::c_void,
         *const Guid,
+        *mut *mut core::ffi::c_void,
         *mut core::ffi::c_void,
         *mut core::ffi::c_void,
+        u32,
     ) -> usize,
+    _close_protocol: *mut core::ffi::c_void,
     _open_protocol_information: *mut core::ffi::c_void,
     _protocols_per_handle: *mut core::ffi::c_void,
     _locate_handle_buffer: *mut core::ffi::c_void,
@@ -320,9 +388,12 @@ struct Guid {
 #[repr(u32)]
 enum ResetType {
     ResetCold = 0,
-    ResetWarm = 1,
-    ResetShutdown = 2,
-    ResetPlatformSpecific = 3,
+}
+
+#[derive(Clone, Copy)]
+#[repr(u32)]
+enum LocateSearchType {
+    ByProtocol = 2,
 }
 
 // ─── UEFI Protocol GUIDs ────────────────────────────────────────────────
