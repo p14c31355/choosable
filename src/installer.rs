@@ -494,7 +494,7 @@ pub fn fix_gpt_attributes(disk_path: &str) -> Result<()> {
         // Save the real boot code (bytes 0–440) before write_to_disk()
         // overwrites it with the zero-filled protective MBR.
         disk.seek(SeekFrom::Start(0))?;
-        let mut saved_boot_code = [0u8; 440];
+        let mut saved_boot_code = [0u8; 446];
         disk.read_exact(&mut saved_boot_code)?;
 
         finalize_gpt_crcs(&mut gpt);
