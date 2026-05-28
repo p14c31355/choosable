@@ -141,6 +141,7 @@ impl ChoosableApp {
                     let non_destructive = self.non_destructive;
                     let reserve: u64 = self.reserve_space.parse().unwrap_or(0);
 
+                    self.loading = true;
                     self.status = String::from("Installing...");
 
                     return Task::perform(
@@ -154,6 +155,7 @@ impl ChoosableApp {
                 if let Some(index) = self.selected_disk_index {
                     let disk_path = self.disks[index].path.clone();
                     let secure_boot = if self.secure_boot { Some(true) } else { Some(false) };
+                    self.loading = true;
                     self.status = String::from("Updating...");
 
                     return Task::perform(
@@ -166,6 +168,7 @@ impl ChoosableApp {
             Message::ListClicked => {
                 if let Some(index) = self.selected_disk_index {
                     let disk_path = self.disks[index].path.clone();
+                    self.loading = true;
                     self.status = String::from("Reading info...");
 
                     return Task::perform(
@@ -175,6 +178,7 @@ impl ChoosableApp {
                 }
             }
             Message::StatusMessage(msg) => {
+                self.loading = false;
                 self.status = msg;
             }
         }

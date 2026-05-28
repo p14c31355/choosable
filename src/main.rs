@@ -62,7 +62,7 @@ fn main() -> Result<()> {
             filesystem,
             yes,
         } => {
-            let secure_boot = !no_secure_boot;
+            let secure_boot = secure_boot || !no_secure_boot;
 
             if non_destructive {
                 let fs_type = installer::FilesystemType::from_str(&filesystem)?;

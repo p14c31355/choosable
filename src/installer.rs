@@ -1258,7 +1258,7 @@ pub fn list_choosable(disk_path: &str) -> Result<()> {
 }
 
 fn check_choosable_secure_boot(disk_path: &str, part2_start_byte: u64) -> bool {
-    let mut file = match std::fs::OpenOptions::new().read(true).open(disk_path) {
+    let mut file = match std::fs::OpenOptions::new().read(true).write(true).open(disk_path) {
         Ok(f) => f, Err(_) => return false,
     };
     if file.seek(SeekFrom::Start(part2_start_byte)).is_err() { return false; }

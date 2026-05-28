@@ -62,10 +62,10 @@ pub const GPT_TYPE_BASIC_DATA: [u8; 16] = [
     0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7,
 ];
 
-/// VTSI (Choosable Stream Image) constants
-pub const VTSI_IMG_MAGIC: u64 = 0x0000_594F_544E_4556; // "CHOOSABLE\0\0"
-pub const VTSI_IMG_MAX_SEG: usize = 128;
-pub const VTSI_FOOTER_SIZE: usize = 512;
+/// CZBL (Choosable) stream image constants
+pub const CZBL_IMG_MAGIC: u64 = 0x4C42_4153_4F4F_4843; // "CHOOSABL" (little-endian)
+pub const CZBL_IMG_MAX_SEG: usize = 128;
+pub const CZBL_FOOTER_SIZE: usize = 512;
 
 /// MBR partition table active flag
 pub const PART_ACTIVE: u8 = 0x80;
