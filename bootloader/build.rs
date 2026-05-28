@@ -336,10 +336,7 @@ fn build_stage2_binary(kernel: &[u8]) -> Vec<u8> {
     c.emit(0xBF).emit32(pdpt_phys);
     c.emit(0xB9).emit32(1024);
     c.emit(0x31).emit(0xC0);
-    let z2 = c.offset() as usize;
-    c.emit(0xAB); c.emit(0x49);
-    let z2j = c.offset(); c.emit(0x75).emit(0x00);
-    c.bytes[z2j as usize+1] = (z2 as u32).wrapping_sub(z2j as u32).wrapping_sub(2) as u8;
+    c.emit(0xF3).emit(0xAB);               // REP STOSD
 
     // PML4[0] = pdpt_phys | 0x03
     c.emit(0xC7).emit(0x05).emit32(pml4_phys).emit32(pdpt_phys | 0x03);
