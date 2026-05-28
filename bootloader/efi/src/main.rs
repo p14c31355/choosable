@@ -3,21 +3,20 @@
 
 use core::panic::PanicInfo;
 
-/// UEFI entry point
-///
-/// NEVER returns — either boots an image or halts+reboots.
-/// Returning from efi_main tells the firmware to fall back to the next
-/// boot option (e.g. SSD), which is why we saw the "fallback" behaviour.
+const OPEN_PROTOCOL_GET_PROTOCOL: u32 = 2;
+
+/// UEFI entry point — NEVER returns.
 #[no_mangle]
 extern "efiapi" fn efi_main(
     image_handle: *mut core::ffi::c_void,
     system_table: *mut SystemTable,
 ) -> ! {
-    // Safety: UEFI guarantees that system_table is valid.
+    // Save image_handle for open_protocol fallback
+    unsafe { IMAGE_HANDLE = image_handle; }
+
     let st = unsafe { &mut *system_table };
     let bs = unsafe { &mut *st.boot_services };
 
-    // Print banner — guard against ConOut being NULL (some headless firmware).
     if !st.con_out.is_null() {
         let con = unsafe { &mut *(st.con_out as *mut SimpleTextOutput) };
         con.output_string(b"\r\n========================================\r\n\0");
@@ -26,21 +25,16 @@ extern "efiapi" fn efi_main(
         con.output_string(b"\r\nScanning for bootable images...\r\n\0");
     }
 
-    // Step 1: Get LoadedImageProtocol on our image handle to find the
-    //         device handle that our EFI binary was loaded from.
-    let mut loaded_image: *mut LoadedImageProtocol = core::ptr::null_mut();
-    let status = unsafe {
-        (bs.handle_protocol)(
-            image_handle,
-            &LOADED_IMAGE_PROTOCOL_GUID,
-            &mut loaded_image as *mut _ as *mut *mut core::ffi::c_void,
-        )
+    // Step 1: Get LoadedImageProtocol on our image handle.
+    let loaded_image = unsafe { get_protocol::<LoadedImageProtocol>(bs, image_handle, &LOADED_IMAGE_PROTOCOL_GUID) };
+    let loaded_image = match loaded_image {
+        Some(lip) => lip,
+        None => {
+            print_error(st, b"ERROR: Failed to get LoadedImageProtocol.\r\n\0");
+            print_error(st, b"Boot failed -- halting.\r\n\0");
+            halt_or_reboot(st);
+        }
     };
-    if status != 0 || loaded_image.is_null() {
-        print_error(st, b"ERROR: Failed to get LoadedImageProtocol.\r\n\0");
-        print_error(st, b"Boot failed -- halting.\r\n\0");
-        halt_or_reboot(st);
-    }
 
     let device_handle = unsafe { (*loaded_image).device_handle };
     if device_handle.is_null() {
@@ -50,13 +44,11 @@ extern "efiapi" fn efi_main(
     }
 
     // Step 2: Get SimpleFileSystem protocol on the device handle.
-    //         The image_handle itself does NOT have SFS installed —
-    //         only the device handle (the block-device partition) does.
-    let mut fs: *mut core::ffi::c_void = core::ptr::null_mut();
-    let status = unsafe {
-        (bs.handle_protocol)(device_handle, &SIMPLE_FILE_SYSTEM_GUID, &mut fs)
-    };
-    if status != 0 || fs.is_null() {
+    //
+    // Some firmware (notably NEC OEM) fails handle_protocol for SFS.
+    // Try handle_protocol first, then open_protocol as fallback.
+    let fs: *mut core::ffi::c_void = unsafe { get_protocol_raw(bs, device_handle, &SIMPLE_FILE_SYSTEM_GUID) };
+    if fs.is_null() {
         print_error(st, b"ERROR: Failed to open filesystem.\r\n\0");
         print_error(st, b"Boot failed -- halting.\r\n\0");
         halt_or_reboot(st);
@@ -68,7 +60,49 @@ extern "efiapi" fn efi_main(
     halt_or_reboot(st);
 }
 
-// ─── Output helpers (null-safe) ─────────────────────────────────────────
+// ─── Protocol acquisition (two-stage fallback) ──────────────────────────
+
+/// Get a typed protocol interface.
+/// Tries handle_protocol first, then open_protocol as fallback.
+unsafe fn get_protocol<T>(bs: &mut BootServices, handle: *mut core::ffi::c_void, guid: &Guid) -> Option<*mut T> {
+    let ptr = get_protocol_raw(bs, handle, guid);
+    if ptr.is_null() { None } else { Some(ptr as *mut T) }
+}
+
+/// Get a raw protocol interface pointer (handle_protocol → open_protocol fallback).
+unsafe fn get_protocol_raw(
+    bs: &mut BootServices,
+    handle: *mut core::ffi::c_void,
+    guid: &Guid,
+) -> *mut core::ffi::c_void {
+    // 1. Try handle_protocol (UEFI 2.0+ fast path)
+    let mut iface: *mut core::ffi::c_void = core::ptr::null_mut();
+    let status = (bs.handle_protocol)(handle, guid, &mut iface);
+    if status == 0 && !iface.is_null() {
+        return iface;
+    }
+
+    // 2. Fallback: open_protocol with GET_PROTOCOL attribute
+    //    (works on buggy firmware where handle_protocol is broken for SFS)
+    iface = core::ptr::null_mut();
+    let agent_handle: *mut core::ffi::c_void = core::ptr::null_mut();
+    let controller_handle: *mut core::ffi::c_void = core::ptr::null_mut();
+    let status = (bs.open_protocol)(
+        handle,
+        guid,
+        &mut iface,
+        IMAGE_HANDLE,
+        controller_handle,
+        OPEN_PROTOCOL_GET_PROTOCOL,
+    );
+    if status == 0 && !iface.is_null() {
+        return iface;
+    }
+
+    core::ptr::null_mut()
+}
+
+// ─── Output helpers ─────────────────────────────────────────────────────
 
 fn print_raw(st: &mut SystemTable, s: &[u8]) {
     if !st.con_out.is_null() {
@@ -77,81 +111,51 @@ fn print_raw(st: &mut SystemTable, s: &[u8]) {
     }
 }
 
-fn print_error(st: &mut SystemTable, s: &[u8]) {
-    print_raw(st, s);
-}
-
-fn print_info(st: &mut SystemTable, s: &[u8]) {
-    print_raw(st, s);
-}
+fn print_error(st: &mut SystemTable, s: &[u8]) { print_raw(st, s); }
+fn print_info(st: &mut SystemTable, s: &[u8]) { print_raw(st, s); }
 
 // ─── Halt / reboot ──────────────────────────────────────────────────────
 
-/// Cold-reboot the machine through RuntimeServices.
-/// Never returns.
 fn system_reset(st: &mut SystemTable) -> ! {
     let rt = unsafe { &mut *st.runtime_services };
-    // EFI_RESET_COLD = 0
-    unsafe {
-        (rt.reset_system)(ResetType::ResetCold, 0, 0, core::ptr::null_mut());
-    }
-    // If reset fails, halt.
-    loop {
-        unsafe { core::arch::asm!("hlt") }
-    }
+    unsafe { (rt.reset_system)(ResetType::ResetCold, 0, 0, core::ptr::null_mut()); }
+    loop { unsafe { core::arch::asm!("hlt") } }
 }
 
-/// Halt or reboot — preferred path is cold reboot so the user gets a
-/// fresh boot menu.  If ConsoleIn is available we wait for a key first
-/// so the user can read any error messages.
 fn halt_or_reboot(st: &mut SystemTable) -> ! {
     let bs = unsafe { &mut *st.boot_services };
 
-    // If we have a console input, wait for a keypress before rebooting
-    // so the user can read error messages.
     if !st.con_in.is_null() {
         let con_in = unsafe { &mut *(st.con_in as *mut SimpleTextInput) };
-
         print_info(st, b"Press any key to reboot.\r\n\0");
-
-        // Wait for a key (poll-based so we don't hang if
-        // WaitForKey/ReadKeyStroke are unimplemented).
         for _ in 0..300 {
-            // 100 ms stall
             unsafe { (bs.stall)(100_000) };
-
             let mut key = Key { scan_code: 0, unicode_char: 0 };
-            let status = unsafe {
-                (con_in.read_key_stroke)(con_in as *mut SimpleTextInput, &mut key)
-            };
+            let status = unsafe { (con_in.read_key_stroke)(con_in as *mut SimpleTextInput, &mut key) };
             if status == 0 {
-                // Key pressed — reboot
                 system_reset(st);
             }
         }
     }
-
-    // No key pressed (or no console) — reboot anyway after ~30 s.
     system_reset(st);
 }
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
-    // We can't do much in a UEFI panic.  Halt so the firmware
-    // might reset us after its watchdog expires.
-    loop {
-        unsafe { core::arch::asm!("hlt") }
-    }
+    loop { unsafe { core::arch::asm!("hlt") } }
 }
 
-// ─── UEFI Type Definitions (manual, no uefi crate) ─────────────────────
+// ─── UEFI Type Definitions ──────────────────────────────────────────────
+
+// We need image_handle at file scope for open_protocol fallback.
+static mut IMAGE_HANDLE: *mut core::ffi::c_void = core::ptr::null_mut();
 
 #[repr(C)]
 struct SystemTable {
     hdr: TableHeader,
     firmware_vendor: *const u16,
     firmware_revision: u32,
-    _pad: u32, // align next pointer to 8 bytes
+    _pad: u32,
     _console_in_handle: *mut core::ffi::c_void,
     con_in: *mut core::ffi::c_void,
     _console_out_handle: *mut core::ffi::c_void,
@@ -215,48 +219,64 @@ struct BootServices {
     hdr: TableHeader,
     _raise_tpl: *mut core::ffi::c_void,
     _restore_tpl: *mut core::ffi::c_void,
-    allocate_pages: unsafe extern "efiapi" fn(AllocateType, MemoryType, usize, *mut u64) -> usize,
-    free_pages: *mut core::ffi::c_void,
-    get_memory_map: unsafe extern "efiapi" fn(*mut usize, *mut MemoryDescriptor, *mut usize, *mut usize, *mut u32) -> usize,
-    allocate_pool: unsafe extern "efiapi" fn(MemoryType, usize, *mut *mut core::ffi::c_void) -> usize,
-    free_pool: *mut core::ffi::c_void,
-    create_event: *mut core::ffi::c_void,
-    set_timer: *mut core::ffi::c_void,
-    wait_for_event: *mut core::ffi::c_void,
-    signal_event: *mut core::ffi::c_void,
-    close_event: *mut core::ffi::c_void,
-    check_event: *mut core::ffi::c_void,
-    install_protocol_interface: *mut core::ffi::c_void,
-    reinstall_protocol_interface: *mut core::ffi::c_void,
-    uninstall_protocol_interface: *mut core::ffi::c_void,
-    handle_protocol: unsafe extern "efiapi" fn(*mut core::ffi::c_void, *const Guid, *mut *mut core::ffi::c_void) -> usize,
+    _allocate_pages: *mut core::ffi::c_void,
+    _free_pages: *mut core::ffi::c_void,
+    _get_memory_map: *mut core::ffi::c_void,
+    _allocate_pool: *mut core::ffi::c_void,
+    _free_pool: *mut core::ffi::c_void,
+    _create_event: *mut core::ffi::c_void,
+    _set_timer: *mut core::ffi::c_void,
+    _wait_for_event: *mut core::ffi::c_void,
+    _signal_event: *mut core::ffi::c_void,
+    _close_event: *mut core::ffi::c_void,
+    _check_event: *mut core::ffi::c_void,
+    _install_protocol_interface: *mut core::ffi::c_void,
+    _reinstall_protocol_interface: *mut core::ffi::c_void,
+    _uninstall_protocol_interface: *mut core::ffi::c_void,
+    handle_protocol: unsafe extern "efiapi" fn(
+        *mut core::ffi::c_void,   // Handle
+        *const Guid,               // Protocol
+        *mut *mut core::ffi::c_void, // Interface
+    ) -> usize,
     _reserved: *mut core::ffi::c_void,
-    register_protocol_notify: *mut core::ffi::c_void,
-    locate_handle: *mut core::ffi::c_void,
-    locate_device_path: *mut core::ffi::c_void,
-    install_configuration_table: *mut core::ffi::c_void,
-    image_load: *mut core::ffi::c_void,
-    image_start: *mut core::ffi::c_void,
-    exit: *mut core::ffi::c_void,
-    image_unload: *mut core::ffi::c_void,
-    exit_boot_services: unsafe extern "efiapi" fn(*mut core::ffi::c_void, usize) -> usize,
-    get_next_monotonic_count: *mut core::ffi::c_void,
+    _register_protocol_notify: *mut core::ffi::c_void,
+    _locate_handle: *mut core::ffi::c_void,
+    _locate_device_path: *mut core::ffi::c_void,
+    _install_configuration_table: *mut core::ffi::c_void,
+    _image_load: *mut core::ffi::c_void,
+    _image_start: *mut core::ffi::c_void,
+    _exit: *mut core::ffi::c_void,
+    _image_unload: *mut core::ffi::c_void,
+    _exit_boot_services: *mut core::ffi::c_void,
+    _get_next_monotonic_count: *mut core::ffi::c_void,
     stall: unsafe extern "efiapi" fn(usize) -> usize,
-    set_watchdog_timer: *mut core::ffi::c_void,
-    connect_controller: *mut core::ffi::c_void,
-    disconnect_controller: *mut core::ffi::c_void,
-    open_protocol: *mut core::ffi::c_void,
-    close_protocol: *mut core::ffi::c_void,
-    open_protocol_information: *mut core::ffi::c_void,
-    protocols_per_handle: *mut core::ffi::c_void,
-    locate_handle_buffer: *mut core::ffi::c_void,
-    locate_protocol: unsafe extern "efiapi" fn(*const Guid, *mut core::ffi::c_void, *mut *mut core::ffi::c_void) -> usize,
-    install_multiple_protocol_interfaces: *mut core::ffi::c_void,
-    uninstall_multiple_protocol_interfaces: *mut core::ffi::c_void,
-    calculate_crc32: *mut core::ffi::c_void,
-    copy_mem: *mut core::ffi::c_void,
-    set_mem: *mut core::ffi::c_void,
-    create_event_ex: *mut core::ffi::c_void,
+    _set_watchdog_timer: *mut core::ffi::c_void,
+    _connect_controller: *mut core::ffi::c_void,
+    _disconnect_controller: *mut core::ffi::c_void,
+    open_protocol: unsafe extern "efiapi" fn(
+        *mut core::ffi::c_void,   // Handle
+        *const Guid,               // Protocol
+        *mut *mut core::ffi::c_void, // Interface
+        *mut core::ffi::c_void,   // AgentHandle
+        *mut core::ffi::c_void,   // ControllerHandle
+        u32,                       // Attributes
+    ) -> usize,
+    close_protocol: unsafe extern "efiapi" fn(
+        *mut core::ffi::c_void,
+        *const Guid,
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+    ) -> usize,
+    _open_protocol_information: *mut core::ffi::c_void,
+    _protocols_per_handle: *mut core::ffi::c_void,
+    _locate_handle_buffer: *mut core::ffi::c_void,
+    _locate_protocol: *mut core::ffi::c_void,
+    _install_multiple_protocol_interfaces: *mut core::ffi::c_void,
+    _uninstall_multiple_protocol_interfaces: *mut core::ffi::c_void,
+    _calculate_crc32: *mut core::ffi::c_void,
+    _copy_mem: *mut core::ffi::c_void,
+    _set_mem: *mut core::ffi::c_void,
+    _create_event_ex: *mut core::ffi::c_void,
 }
 
 #[repr(C)]
@@ -298,26 +318,6 @@ struct Guid {
 
 #[derive(Clone, Copy)]
 #[repr(u32)]
-enum AllocateType {
-    AllocateAnyPages = 0,
-    AllocateMaxAddress = 1,
-    AllocateAddress = 2,
-}
-
-#[derive(Clone, Copy)]
-#[repr(u32)]
-enum MemoryType {
-    EfiLoaderData = 1,
-    EfiLoaderCode = 4,
-    EfiBootServicesData = 2,
-    EfiBootServicesCode = 3,
-    EfiRuntimeServicesData = 5,
-    EfiRuntimeServicesCode = 6,
-    EfiConventionalMemory = 7,
-}
-
-#[derive(Clone, Copy)]
-#[repr(u32)]
 enum ResetType {
     ResetCold = 0,
     ResetWarm = 1,
@@ -327,8 +327,6 @@ enum ResetType {
 
 // ─── UEFI Protocol GUIDs ────────────────────────────────────────────────
 
-/// EFI_LOADED_IMAGE_PROTOCOL_GUID
-/// {5B1B31A1-9562-11D2-8E3F-00A0C969723B}
 const LOADED_IMAGE_PROTOCOL_GUID: Guid = Guid {
     data1: 0x5B1B31A1,
     data2: 0x9562,
@@ -336,8 +334,6 @@ const LOADED_IMAGE_PROTOCOL_GUID: Guid = Guid {
     data4: [0x8E, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B],
 };
 
-/// EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID
-/// {0964E5B2-6459-11D2-8E39-00A0C969723B}
 const SIMPLE_FILE_SYSTEM_GUID: Guid = Guid {
     data1: 0x0964e5b2,
     data2: 0x6459,
