@@ -953,22 +953,26 @@ pub fn update_choosable(disk_path: &str, secure_boot: Option<bool>, yes: bool) -
     if !is_whole_disk(disk_path) { return Err(ChoosableError::IsPartition(disk_path.to_string())); }
 
     // ═══════════════════════════════════════════════════════════════
-    //  Stop udev BEFORE any raw disk I/O (detect_choosable opens
-    //  the disk write+true and reads fatfs, which generates uevents
-    //  that confuse udisks2 when udev is running).
+    //  UPDATE DOES NOT STOP UDEV.
+    //
+    //  Unlike install, update preserves the partition layout.
+    //  Stopping+resuming udev creates a burst of queued events that
+    //  udisks2 races to process, causing "No object for D-bus
+    //  interface".  Instead we:
+    //
+    //  1. Unmount partitions (check_umount_disk).
+    //  2. Do raw-sector writes with sync in between.
+    //  3. Do FAT writes (write_efi_bootloader) — these generate
+    //     filesystem uevents that udev processes naturally.
+    //  4. sync + udevadm settle to let udisks2 catch up.
     // ═══════════════════════════════════════════════════════════════
-    udev_stop();
+    checks::check_umount_disk(disk_path)?;
 
     let size_bytes = get_disk_size(disk_path)?;
     let model = get_disk_model(disk_path);
     let (is_choosable, old_version, part2_start, _, mbr) = detect_choosable(disk_path, size_bytes)?;
 
-    if !is_choosable {
-        udev_resume_and_notify_update(disk_path);
-        return Err(ChoosableError::NotChoosableDisk);
-    }
-
-    checks::check_umount_disk(disk_path)?;
+    if !is_choosable { return Err(ChoosableError::NotChoosableDisk); }
 
     let old_ver = old_version.unwrap_or_else(|| "Unknown".to_string());
     let cur_ver = get_current_version()?;
@@ -994,93 +998,101 @@ pub fn update_choosable(disk_path: &str, secure_boot: Option<bool>, yes: bool) -
         print!("Update Choosable {} ===> {}   Continue? (y/n) ", old_ver, cur_ver);
         std::io::stdout().flush().ok();
         let mut answer = String::new(); std::io::stdin().read_line(&mut answer).ok();
-        if answer.trim().to_lowercase() != "y" {
-            udev_resume_and_notify_update(disk_path);
-            println!("Aborted.");
-            return Ok(());
-        }
+        if answer.trim().to_lowercase() != "y" { println!("Aborted."); return Ok(()); }
     }
 
     let part2_start_val = part2_start.unwrap();
-
-    let mut disk = open_disk_readwrite(disk_path)?;
-    let core = bootloader::STAGE2_BIN;
     let is_gpt = mbr.is_gpt_protective();
 
-    if is_gpt {
-        let len = std::cmp::min(core.len(), 2014 * 512);
-        disk.seek(SeekFrom::Start(34 * 512))?;
-        disk.write_all(&core[..len])?;
-    } else {
-        if mbr.part1_active() == 0x00 && mbr.part2_active() == 0x80 {
-            disk.seek(SeekFrom::Start(446))?; disk.write_all(&[PART_ACTIVE])?;
-            disk.seek(SeekFrom::Start(462))?; disk.write_all(&[PART_INACTIVE])?;
-        }
-        let len = std::cmp::min(core.len(), 2047 * 512);
-        disk.seek(SeekFrom::Start(1 * 512))?;
-        disk.write_all(&core[..len])?;
-    }
-    disk.flush()?;
-    drop(disk);
+    // ── Phase 1: Raw-sector writes (MBR + Stage2 gap) ─────────────
+    //    These touch only sectors that are NOT part of any partition,
+    //    so they never generate filesystem uevents.
+    {
+        let mut disk = open_disk_readwrite(disk_path)?;
+        let core = bootloader::STAGE2_BIN;
 
-    if is_gpt {
-        fix_gpt_attributes(disk_path)?;
-    }
-
-    let mut disk = open_disk_readwrite(disk_path)?;
-    let mut diskuuid = [0u8; 16];
-    disk.seek(SeekFrom::Start(384))?; disk.read_exact(&mut diskuuid)?;
-
-    let mut rsv_data = vec![0u8; 8 * 512];
-    disk.seek(SeekFrom::Start(2040 * 512))?; disk.read_exact(&mut rsv_data)?;
-
-    let boot_img = bootloader::BOOT_IMG;
-    let boot_code_len = std::cmp::min(boot_img.len(), 440);
-
-    if is_gpt {
-        let mut mbr_bytes = [0u8; 512];
-        disk.seek(SeekFrom::Start(0))?;
-        disk.read_exact(&mut mbr_bytes)?;
-
-        mbr_bytes[..boot_code_len].copy_from_slice(&boot_img[..boot_code_len]);
-        mbr_bytes[384..400].copy_from_slice(&diskuuid);
-        mbr_bytes[440..444].copy_from_slice(&diskuuid[12..16]);
-        mbr_bytes[510] = MBR_SIGNATURE_55;
-        mbr_bytes[511] = MBR_SIGNATURE_AA;
-
-        let lba: u32 = 34u32.to_le();
-        let needle: [u8; 4] = [0xC7, 0x06, 0xC8, 0x07];
-        for i in 0..(boot_code_len.saturating_sub(8)) {
-            if mbr_bytes[i..i+4] == needle {
-                mbr_bytes[i+4..i+8].copy_from_slice(&lba.to_le_bytes());
-                break;
+        if is_gpt {
+            let len = std::cmp::min(core.len(), 2014 * 512);
+            disk.seek(SeekFrom::Start(34 * 512))?;
+            disk.write_all(&core[..len])?;
+        } else {
+            if mbr.part1_active() == 0x00 && mbr.part2_active() == 0x80 {
+                disk.seek(SeekFrom::Start(446))?; disk.write_all(&[PART_ACTIVE])?;
+                disk.seek(SeekFrom::Start(462))?; disk.write_all(&[PART_INACTIVE])?;
             }
+            let len = std::cmp::min(core.len(), 2047 * 512);
+            disk.seek(SeekFrom::Start(1 * 512))?;
+            disk.write_all(&core[..len])?;
         }
-
-        disk.seek(SeekFrom::Start(0))?;
-        disk.write_all(&mbr_bytes)?;
-    } else {
-        disk.seek(SeekFrom::Start(0))?;
-        disk.write_all(&boot_img[..boot_code_len])?;
-        disk.seek(SeekFrom::Start(384))?; disk.write_all(&diskuuid)?;
+        disk.flush()?;
+        drop(disk);
     }
 
-    disk.seek(SeekFrom::Start(2040 * 512))?; disk.write_all(&rsv_data)?;
-    disk.flush()?;
-    drop(disk);
+    if is_gpt { fix_gpt_attributes(disk_path)?; }
 
+    {
+        let mut disk = open_disk_readwrite(disk_path)?;
+        let mut diskuuid = [0u8; 16];
+        disk.seek(SeekFrom::Start(384))?; disk.read_exact(&mut diskuuid)?;
+
+        let mut rsv_data = vec![0u8; 8 * 512];
+        disk.seek(SeekFrom::Start(2040 * 512))?; disk.read_exact(&mut rsv_data)?;
+
+        let boot_img = bootloader::BOOT_IMG;
+        let boot_code_len = std::cmp::min(boot_img.len(), 440);
+
+        if is_gpt {
+            let mut mbr_bytes = [0u8; 512];
+            disk.seek(SeekFrom::Start(0))?;
+            disk.read_exact(&mut mbr_bytes)?;
+
+            mbr_bytes[..boot_code_len].copy_from_slice(&boot_img[..boot_code_len]);
+            mbr_bytes[384..400].copy_from_slice(&diskuuid);
+            mbr_bytes[440..444].copy_from_slice(&diskuuid[12..16]);
+            mbr_bytes[510] = MBR_SIGNATURE_55;
+            mbr_bytes[511] = MBR_SIGNATURE_AA;
+
+            let lba: u32 = 34u32.to_le();
+            let needle: [u8; 4] = [0xC7, 0x06, 0xC8, 0x07];
+            for i in 0..(boot_code_len.saturating_sub(8)) {
+                if mbr_bytes[i..i+4] == needle {
+                    mbr_bytes[i+4..i+8].copy_from_slice(&lba.to_le_bytes());
+                    break;
+                }
+            }
+            disk.seek(SeekFrom::Start(0))?;
+            disk.write_all(&mbr_bytes)?;
+        } else {
+            disk.seek(SeekFrom::Start(0))?;
+            disk.write_all(&boot_img[..boot_code_len])?;
+            disk.seek(SeekFrom::Start(384))?; disk.write_all(&diskuuid)?;
+        }
+        disk.seek(SeekFrom::Start(2040 * 512))?; disk.write_all(&rsv_data)?;
+        disk.flush()?;
+        drop(disk);
+    }
+
+    // sync after raw writes — no uevents involved
     let _ = std::process::Command::new("sync")
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
 
-    // Write EFI bootloader — still udev-stopped
+    // ── Phase 2: FAT writes (BOOTX64.EFI + ESP renames) ───────────
+    //    These happen with udev running normally.  udisks2 will
+    //    see the filesystem change uevents and update its D-Bus
+    //    objects gracefully because there was no stop/resume gap.
     write_efi_bootloader(disk_path, part2_start_val)?;
 
     if !use_secure_boot {
         process_secure_boot_esp(disk_path, part2_start_val, false)?;
     }
 
-    // ALL operations complete — resume udev and notify ONCE
-    udev_resume_and_notify_update(disk_path);
+    // ── Phase 3: Wait for udisks2 to stabilise ─────────────────────
+    let _ = std::process::Command::new("sync")
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+    let _ = std::process::Command::new("udevadm")
+        .arg("settle")
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+    std::thread::sleep(std::time::Duration::from_secs(2));
 
     println!();
     println!("\x1b[32mChoosable updated successfully on {}.\x1b[0m", disk_path);
