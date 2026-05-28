@@ -872,7 +872,7 @@ fn write_gpt_f(disk: &mut std::fs::File, _disk_path: &str, disk_size_bytes: u64,
     mbr_bytes[511] = MBR_SIGNATURE_AA;
 
     // Patch LBA from 1 → 34 so MBR loads stage2 from GPT gap (LBA 34)
-    let lba_patch: u32 = 34u32.to_le();
+    let lba_patch: u32 = 34;
     let needle: [u8; 4] = [0xC7, 0x06, 0xC8, 0x07];
     for i in 0..(boot_code_len.saturating_sub(8)) {
         if mbr_bytes[i..i+4] == needle {
