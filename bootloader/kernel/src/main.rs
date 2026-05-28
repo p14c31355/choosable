@@ -325,7 +325,7 @@ fn scan_directory(info: &ExfatInfo, root_cluster: u32, files: &mut [DirEntry], f
 
         // Next cluster in chain
         let next = read_fat_entry(info, cluster);
-        if next >= 0xFFFFFFF8 { break; }
+        if next < 2 || next >= 0xFFFFFFF8 { break; }
         cluster = next;
     }
 }
