@@ -69,7 +69,7 @@ const ATA_CMD:      u16 = ATA_PRIMARY_BASE + 7;
 fn ata_read_sector(lba: u32, buf: &mut [u8; 512]) -> bool {
     // Wait for drive ready (BSY=0, DRQ=0)
     while inb(ATA_STATUS) & 0x80 != 0 {}  // BSY
-    while inb(ATA_STATUS) & 0x08 == 0 {}  // wait DRQ=0? Actually wait until ready
+    while inb(ATA_STATUS) & 0x08 != 0 {}  // wait DRQ=0
 
     // Select drive, LBA mode
     outb(ATA_DRIVE, 0xE0 | ((lba >> 24) as u8 & 0x0F));
