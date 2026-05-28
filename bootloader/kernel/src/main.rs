@@ -239,14 +239,15 @@ struct DirEntry {
 fn utf16le_to_ascii(src: &[u8], max_bytes: usize, dst: &mut [u8]) -> usize {
     let mut di = 0;
     let mut si = 0;
-    while si + 1 < src.len() && di < dst.len() {
+    let limit = src.len().min(max_bytes);
+    while si + 1 < limit && di < dst.len() {
         let lo = src[si];
         let hi = src[si+1];
         let cp = lo as u16 | ((hi as u16) << 8);
         si += 2;
         if cp == 0 { break; }
         if cp < 0x80 { dst[di] = cp as u8; di += 1; }
-        else { dst[di] = b'?'; di += 1; } // non-ASCII → ?
+        else { dst[di] = b'?'; di += 1; }
     }
     di
 }
