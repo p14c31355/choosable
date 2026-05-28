@@ -429,7 +429,7 @@ const ET_BOOT_RECORD_SECTOR: u64 = 17;
 const BIOS_BOOT_ADDR: u32 = 0x7C00;
 
 /// Boot cookie address and magic value
-const BOOT_COOKIE_ADDR: u32 = 0x7DF0;
+const BOOT_COOKIE_ADDR: u32 = 0x7B00;
 const BOOT_COOKIE_MAGIC: u32 = 0x544F4F42; // "BOOT" (little-endian)
 
 /// Read `sector_count` sectors starting at ISO cluster offset `cluster_lba` into a physical buffer
