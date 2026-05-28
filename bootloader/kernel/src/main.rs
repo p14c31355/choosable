@@ -204,6 +204,7 @@ fn parse_exfat_vbr(part_start_lba: u32) -> Option<ExfatInfo> {
 
 // Read a sector from within a cluster chain
 fn read_cluster_sector(info: &ExfatInfo, cluster: u32, sector_in_cluster: u32, buf: &mut [u8; 512]) -> bool {
+    if cluster < 2 { return false; }
     let sector = info.cluster_heap_offset_sectors
         + (cluster - 2) as u64 * (info.cluster_size_bytes as u64 / 512)
         + sector_in_cluster as u64;
