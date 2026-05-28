@@ -4,27 +4,144 @@
 use core::panic::PanicInfo;
 
 /// UEFI entry point
+///
+/// NEVER returns — either boots an image or halts+reboots.
+/// Returning from efi_main tells the firmware to fall back to the next
+/// boot option (e.g. SSD), which is why we saw the "fallback" behaviour.
 #[no_mangle]
 extern "efiapi" fn efi_main(
     image_handle: *mut core::ffi::c_void,
     system_table: *mut SystemTable,
-) -> usize {
+) -> ! {
+    // Safety: UEFI guarantees that system_table is valid.
     let st = unsafe { &mut *system_table };
-    let con = unsafe { &mut *(st.con_out as *mut SimpleTextOutput) };
+    let bs = unsafe { &mut *st.boot_services };
 
-    // Print banner
-    con.output_string(b"\r\nChoosable UEFI Bootloader\r\n\0");
-    con.output_string(b"Scanning for ISO files...\r\n\0");
+    // Print banner — guard against ConOut being NULL (some headless firmware).
+    if !st.con_out.is_null() {
+        let con = unsafe { &mut *(st.con_out as *mut SimpleTextOutput) };
+        con.output_string(b"\r\n========================================\r\n\0");
+        con.output_string(b"    Choosable UEFI Bootloader v0.1      \r\n\0");
+        con.output_string(b"========================================\r\n\0");
+        con.output_string(b"\r\nScanning for bootable images...\r\n\0");
+    }
 
-    // Scan filesystem and show menu
-    show_boot_menu(st, image_handle, con);
+    // Step 1: Get LoadedImageProtocol on our image handle to find the
+    //         device handle that our EFI binary was loaded from.
+    let mut loaded_image: *mut LoadedImageProtocol = core::ptr::null_mut();
+    let status = unsafe {
+        (bs.handle_protocol)(
+            image_handle,
+            &LOADED_IMAGE_PROTOCOL_GUID,
+            &mut loaded_image as *mut _ as *mut *mut core::ffi::c_void,
+        )
+    };
+    if status != 0 || loaded_image.is_null() {
+        print_error(st, b"ERROR: Failed to get LoadedImageProtocol.\r\n\0");
+        print_error(st, b"Boot failed -- halting.\r\n\0");
+        halt_or_reboot(st);
+    }
 
-    0
+    let device_handle = unsafe { (*loaded_image).device_handle };
+    if device_handle.is_null() {
+        print_error(st, b"ERROR: LoadedImage has no device handle.\r\n\0");
+        print_error(st, b"Boot failed -- halting.\r\n\0");
+        halt_or_reboot(st);
+    }
+
+    // Step 2: Get SimpleFileSystem protocol on the device handle.
+    //         The image_handle itself does NOT have SFS installed —
+    //         only the device handle (the block-device partition) does.
+    let mut fs: *mut core::ffi::c_void = core::ptr::null_mut();
+    let status = unsafe {
+        (bs.handle_protocol)(device_handle, &SIMPLE_FILE_SYSTEM_GUID, &mut fs)
+    };
+    if status != 0 || fs.is_null() {
+        print_error(st, b"ERROR: Failed to open filesystem.\r\n\0");
+        print_error(st, b"Boot failed -- halting.\r\n\0");
+        halt_or_reboot(st);
+    }
+
+    print_info(st, b"Filesystem opened successfully!\r\n\0");
+    print_info(st, b"Boot menu coming in a future update.\r\n\0");
+
+    halt_or_reboot(st);
+}
+
+// ─── Output helpers (null-safe) ─────────────────────────────────────────
+
+fn print_raw(st: &mut SystemTable, s: &[u8]) {
+    if !st.con_out.is_null() {
+        let con = unsafe { &mut *(st.con_out as *mut SimpleTextOutput) };
+        con.output_string(s);
+    }
+}
+
+fn print_error(st: &mut SystemTable, s: &[u8]) {
+    print_raw(st, s);
+}
+
+fn print_info(st: &mut SystemTable, s: &[u8]) {
+    print_raw(st, s);
+}
+
+// ─── Halt / reboot ──────────────────────────────────────────────────────
+
+/// Cold-reboot the machine through RuntimeServices.
+/// Never returns.
+fn system_reset(st: &mut SystemTable) -> ! {
+    let rt = unsafe { &mut *st.runtime_services };
+    // EFI_RESET_COLD = 0
+    unsafe {
+        (rt.reset_system)(ResetType::ResetCold, 0, 0, core::ptr::null_mut());
+    }
+    // If reset fails, halt.
+    loop {
+        unsafe { core::arch::asm!("hlt") }
+    }
+}
+
+/// Halt or reboot — preferred path is cold reboot so the user gets a
+/// fresh boot menu.  If ConsoleIn is available we wait for a key first
+/// so the user can read any error messages.
+fn halt_or_reboot(st: &mut SystemTable) -> ! {
+    let bs = unsafe { &mut *st.boot_services };
+
+    // If we have a console input, wait for a keypress before rebooting
+    // so the user can read error messages.
+    if !st.con_in.is_null() {
+        let con_in = unsafe { &mut *(st.con_in as *mut SimpleTextInput) };
+
+        print_info(st, b"Press any key to reboot.\r\n\0");
+
+        // Wait for a key (poll-based so we don't hang if
+        // WaitForKey/ReadKeyStroke are unimplemented).
+        for _ in 0..300 {
+            // 100 ms stall
+            unsafe { (bs.stall)(100_000) };
+
+            let mut key = Key { scan_code: 0, unicode_char: 0 };
+            let status = unsafe {
+                (con_in.read_key_stroke)(con_in as *mut SimpleTextInput, &mut key)
+            };
+            if status == 0 {
+                // Key pressed — reboot
+                system_reset(st);
+            }
+        }
+    }
+
+    // No key pressed (or no console) — reboot anyway after ~30 s.
+    system_reset(st);
 }
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
-    loop { unsafe { core::arch::asm!("hlt") } }
+    // We can't do much in a UEFI panic.  Halt so the firmware
+    // might reset us after its watchdog expires.
+    loop {
+        unsafe { core::arch::asm!("hlt") }
+    }
 }
 
 // ─── UEFI Type Definitions (manual, no uefi crate) ─────────────────────
@@ -34,10 +151,11 @@ struct SystemTable {
     hdr: TableHeader,
     firmware_vendor: *const u16,
     firmware_revision: u32,
+    _pad: u32, // align next pointer to 8 bytes
     _console_in_handle: *mut core::ffi::c_void,
-    con_in: *mut core::ffi::c_void,  // SimpleTextInput *
+    con_in: *mut core::ffi::c_void,
     _console_out_handle: *mut core::ffi::c_void,
-    con_out: *mut core::ffi::c_void,  // SimpleTextOutput *
+    con_out: *mut core::ffi::c_void,
     _stderr_handle: *mut core::ffi::c_void,
     stderr: *mut core::ffi::c_void,
     runtime_services: *mut RuntimeServices,
@@ -77,6 +195,19 @@ struct SimpleTextOutputMode {
     _cursor_column: i32,
     _cursor_row: i32,
     _cursor_visible: bool,
+}
+
+#[repr(C)]
+struct SimpleTextInput {
+    _reset: unsafe extern "efiapi" fn(*mut Self, bool) -> usize,
+    read_key_stroke: unsafe extern "efiapi" fn(*mut Self, *mut Key) -> usize,
+    _wait_for_key: *mut core::ffi::c_void,
+}
+
+#[repr(C)]
+struct Key {
+    scan_code: u16,
+    unicode_char: u16,
 }
 
 #[repr(C)]
@@ -141,7 +272,7 @@ struct RuntimeServices {
     _get_next_variable_name: *mut core::ffi::c_void,
     _set_variable: *mut core::ffi::c_void,
     _get_next_high_monotonic_count: *mut core::ffi::c_void,
-    _reset_system: *mut core::ffi::c_void,
+    reset_system: unsafe extern "efiapi" fn(ResetType, usize, usize, *mut core::ffi::c_void) -> !,
     _update_capsule: *mut core::ffi::c_void,
     _query_capsule_capabilities: *mut core::ffi::c_void,
     _query_variable_info: *mut core::ffi::c_void,
@@ -185,6 +316,15 @@ enum MemoryType {
     EfiConventionalMemory = 7,
 }
 
+#[derive(Clone, Copy)]
+#[repr(u32)]
+enum ResetType {
+    ResetCold = 0,
+    ResetWarm = 1,
+    ResetShutdown = 2,
+    ResetPlatformSpecific = 3,
+}
+
 // ─── UEFI Protocol GUIDs ────────────────────────────────────────────────
 
 /// EFI_LOADED_IMAGE_PROTOCOL_GUID
@@ -207,13 +347,11 @@ const SIMPLE_FILE_SYSTEM_GUID: Guid = Guid {
 
 // ─── EFI_LOADED_IMAGE_PROTOCOL ──────────────────────────────────────────
 
-/// Minimal definition — we only need DeviceHandle (offset 0x18 → 5th pointer-sized field).
 #[repr(C)]
 struct LoadedImageProtocol {
     _revision: u32,
     _parent_handle: *mut core::ffi::c_void,
     _system_table: *mut core::ffi::c_void,
-    // device_handle: fourth pointer-sized field
     device_handle: *mut core::ffi::c_void,
 }
 
@@ -221,7 +359,6 @@ struct LoadedImageProtocol {
 
 impl SimpleTextOutput {
     fn output_string(&mut self, s: &[u8]) {
-        // UEFI strings are UTF-16. Convert ASCII to wide chars on the fly.
         let mut buf = [0u16; 256];
         let len = s.len().min(255);
         for (i, &b) in s[..len].iter().enumerate() {
@@ -230,49 +367,4 @@ impl SimpleTextOutput {
         buf[len] = 0;
         unsafe { (self.output_string)(self as *mut Self, buf.as_ptr()) };
     }
-}
-
-// ─── Boot Menu ──────────────────────────────────────────────────────────
-
-fn show_boot_menu(
-    st: &mut SystemTable,
-    image_handle: *mut core::ffi::c_void,
-    con: &mut SimpleTextOutput,
-) {
-    let bs = unsafe { &mut *st.boot_services };
-
-    // Step 1: Get LoadedImageProtocol on our image handle to find the
-    //         device handle that our EFI binary was loaded from.
-    let mut loaded_image: *mut LoadedImageProtocol = core::ptr::null_mut();
-    let status = unsafe {
-        (bs.handle_protocol)(
-            image_handle,
-            &LOADED_IMAGE_PROTOCOL_GUID,
-            &mut loaded_image as *mut _ as *mut *mut core::ffi::c_void,
-        )
-    };
-    if status != 0 || loaded_image.is_null() {
-        con.output_string(b"Failed to get LoadedImageProtocol.\r\n\0");
-        return;
-    }
-
-    let device_handle = unsafe { (*loaded_image).device_handle };
-    if device_handle.is_null() {
-        con.output_string(b"LoadedImage has no device handle.\r\n\0");
-        return;
-    }
-
-    // Step 2: Get SimpleFileSystem protocol on the device handle.
-    //         The image_handle itself does NOT have SFS installed —
-    //         only the device handle (the partition block device) does.
-    let mut fs: *mut core::ffi::c_void = core::ptr::null_mut();
-    let status = unsafe {
-        (bs.handle_protocol)(device_handle, &SIMPLE_FILE_SYSTEM_GUID, &mut fs)
-    };
-    if status != 0 || fs.is_null() {
-        con.output_string(b"Failed to open file system.\r\n\0");
-        return;
-    }
-
-    con.output_string(b"Filesystem opened. Boot menu coming soon.\r\n\0");
 }

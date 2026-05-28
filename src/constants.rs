@@ -14,8 +14,8 @@ pub const CHOOSABLE_EFI_PART_SIZE: u64 = 32 * SIZE_1MB;
 /// Choosable partition 1 start sector (in 512-byte sectors)
 pub const CHOOSABLE_PART1_START_SECTOR: u64 = 2048;
 
-/// Choosable EFI partition GPT attribute (hidden + required)
-pub const CHOOSABLE_EFI_PART_ATTR: u64 = 0x8000_0000_0000_0000;
+/// Choosable EFI partition GPT attribute (Required Partition)
+pub const CHOOSABLE_EFI_PART_ATTR: u64 = 0x0000_0000_0000_0001;
 
 /// Choosable image file section count in 512-byte sectors
 pub const CHOOSABLE_SECTOR_NUM: u64 = 65536; // 32 MiB (Ventoy: VENTOY_SECTOR_NUM=65536)
