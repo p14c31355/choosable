@@ -176,8 +176,12 @@ fn build_mbr_boot_sector() -> Vec<u8> {
     // 0x07C6 = buffer segment(2 bytes → 0x0000)
     c.mov_mem8_imm8(0x07C0, 0x10);
     c.mov_mem16_imm16(0x07C4, 0x7E00);
-    // 0x07C6 is already zero from the initial REP MOVSW that cleared
-    // the area from 0x0600 to 0x07FF, so buffer segment = 0x0000 ✓
+    // The buffer segment at 0x07C6-0x07C7 is NOT zero after REP MOVSW!
+    // REP MOVSW copies the MBR code from 0x7C00→0x0600, so byte 0x07C6
+    // contains whatever was in the MBR at offset 0x1C6 (a boot code
+    // instruction).  Explicitly zero it so BIOS reads Stage2 to
+    // segment:offset = 0x0000:0x7E00 (physical 0x7E00).
+    c.mov_mem16_imm16(0x07C6, 0x0000);
     c.cmp_mem8_imm8(ul,1); let j4=c.jne_ph();
     c.mov_ah(0x42); c.mov_dl_mem16(dn); c.mov_si(da); c.int(0x13);
     let j5=c.jnc_ph(); c.shr_mem16_1(dsc); let j6=c.jne_ph();
