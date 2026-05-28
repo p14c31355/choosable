@@ -169,9 +169,10 @@ pub fn non_destructive_install(disk_path: &str, label: &str, fs_type: Filesystem
         align_to_4k(part1_end - (CHOOSABLE_EFI_PART_SIZE / SECTOR_SIZE))
     };
 
-    // Stop udev while we modify the partition table and write raw disk data.
-    // If udev fires in the middle it will see a half-initialised state and
-    // produce "No object for D-bus interface" errors.
+    // Stop udev while we modify the partition table, format partitions,
+    // and install the bootloader.  If udev fires in the middle it will
+    // see a half-initialised state and produce "No object for D-bus
+    // interface" errors.
     let _ = std::process::Command::new("udevadm")
         .args(&["control", "--stop-exec-queue"])
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
@@ -202,15 +203,9 @@ pub fn non_destructive_install(disk_path: &str, label: &str, fs_type: Filesystem
     std::thread::sleep(std::time::Duration::from_millis(500));
     checks::wait_for_partitions(disk_path)?;
 
-    // Resume udev event processing now that all raw disk writes and partition
-    // node creation are complete.
-    let _ = std::process::Command::new("udevadm")
-        .args(&["control", "--start-exec-queue"])
-        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
-    let _ = std::process::Command::new("udevadm").arg("settle")
-        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
-
-    // Format EFI partition (FAT16 "CZBLEFI") — udev is running again
+    // Format EFI partition and write bootloader while udev is still
+    // stopped.  If udev is running, mkfs.vfat will fire change events
+    // that cause udisks2 to see half-initialised filesystems.
     format_efi_partition(disk_path, 2)?;
 
     write_efi_bootloader(disk_path, part2_start_sector * SECTOR_SIZE)?;
@@ -221,11 +216,24 @@ pub fn non_destructive_install(disk_path: &str, label: &str, fs_type: Filesystem
     }
 
     if !secure_boot {
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        // Safe while udev is stopped — operates on the already-formatted
+        // FAT filesystem.
         process_secure_boot_esp(disk_path, part2_start_sector * SECTOR_SIZE, false)?;
     }
 
-    notify_kernel(disk_path);
+    // All disk writes are complete.  Re-read kernel partition table,
+    // then resume udev so that udisks2 sees the final consistent state.
+    let _ = std::process::Command::new("sync")
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+    notify_kernel_before_udev(disk_path);
+
+    // Resume udev event processing now.
+    let _ = std::process::Command::new("udevadm")
+        .args(&["control", "--start-exec-queue"])
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+
+    // Trigger change events and let udisks2 pick up the final state.
+    notify_kernel_after_udev(disk_path);
 
     println!();
     println!("\x1b[32mChoosable non-destructive installation on {} successfully finished.\x1b[0m", disk_path);
@@ -496,16 +504,20 @@ pub fn fix_gpt_attributes(disk_path: &str) -> Result<()> {
 
 // ─── Kernel notification ────────────────────────────────────────────────
 
-fn notify_kernel(disk_path: &str) {
-    //   sync
-    //   udevadm trigger --action=change --name-match="${DISK}"
-    //   vtoy_sleep 3
-    //   partx -u "${DISK}"
-
-    // Sync pending writes to disk
+/// Kernel-side notification only (sync + partx -u).
+/// Called BEFORE udev is resumed — no trigger/change events are fired.
+fn notify_kernel_before_udev(disk_path: &str) {
     let _ = std::process::Command::new("sync")
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
 
+    // Make sure kernel partition nodes are up-to-date
+    let _ = std::process::Command::new("partx").args(&["-u", disk_path])
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+}
+
+/// Udev-side notification (trigger + settle).
+/// Called AFTER udev is resumed so that udisks2 can pick up the final state.
+fn notify_kernel_after_udev(disk_path: &str) {
     // Trigger a "change" event on the parent disk so that udisks2
     // re-reads the partition table and creates D-Bus objects for every
     // partition at once.  Per-partition triggers are NOT used because
@@ -518,10 +530,13 @@ fn notify_kernel(disk_path: &str) {
     std::thread::sleep(std::time::Duration::from_secs(3));
     let _ = std::process::Command::new("udevadm").arg("settle")
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+}
 
-    // Make sure kernel partition nodes are up-to-date
-    let _ = std::process::Command::new("partx").args(&["-u", disk_path])
-        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+/// Full kernel notification: sync, trigger, settle, partx -u.
+/// Used by code paths that don't split udev stop/start.
+fn notify_kernel(disk_path: &str) {
+    notify_kernel_before_udev(disk_path);
+    notify_kernel_after_udev(disk_path);
 }
 
 // ─── Secure Boot ESP processing ─────────────────────────────────────────
@@ -678,29 +693,35 @@ pub fn install_choosable(
     std::thread::sleep(std::time::Duration::from_millis(500));
     checks::wait_for_partitions(disk_path)?;
 
-    // Resume udev event processing now that all raw disk writes and partition
-    // node creation are complete.  udisks2 will only see the final consistent
-    // state when it processes the accumulated uevents.
-    let _ = std::process::Command::new("udevadm")
-        .args(&["control", "--start-exec-queue"])
-        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
-    let _ = std::process::Command::new("udevadm").arg("settle")
-        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
-
-    // Format partitions (udev is running again; change events are safe now)
+    // Format partitions and write EFI bootloader while udev is still
+    // stopped.  If udev is running, mkfs.* will fire change events that
+    // cause udisks2 to see half-initialised filesystems and produce
+    // "No object for D-bus interface" errors.
     let part1 = get_partition_name(disk_path, 1);
     format_partition(&part1, label, fs_type)?;
     format_efi_partition(disk_path, 2)?;
 
-    // Write EFI bootloader into partition 2
     write_efi_bootloader(disk_path, part2_start_sector)?;
 
     if !secure_boot {
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        // process_secure_boot_esp operates on the already-formatted FAT
+        // filesystem — safe while udev is stopped.
         process_secure_boot_esp(disk_path, part2_start_sector, false)?;
     }
 
-    notify_kernel(disk_path);
+    // All disk writes are complete.  Re-read kernel partition table,
+    // then resume udev so that udisks2 sees the final consistent state.
+    let _ = std::process::Command::new("sync")
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+    notify_kernel_before_udev(disk_path);
+
+    // Resume udev event processing now.
+    let _ = std::process::Command::new("udevadm")
+        .args(&["control", "--start-exec-queue"])
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+
+    // Trigger change events and let udisks2 pick up the final state.
+    notify_kernel_after_udev(disk_path);
 
     println!();
     println!("\x1b[32mChoosable installed successfully to {}.\x1b[0m", disk_path);
