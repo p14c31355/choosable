@@ -316,6 +316,16 @@ fn build_stage2_binary(kernel: &[u8]) -> Vec<u8> {
     // MOV ESP, 0x80000  (BC 00 00 08 00)
     c.emit(0xBC).emit32(0x0008_0000u32);
 
+    // ── copy kernel from 0x9E00 to 0x100000 ─────────────────────
+    // The kernel flat binary lives at stage2+0x2000 (phys 0x9E00).
+    // We relocate it to 1 MiB to avoid collision with boot images
+    // loaded at 0x7C00 and to give the kernel room to grow.
+    c.emit(0xBE).emit32(0x9E00);      // MOV ESI, 0x9E00 (source)
+    c.emit(0xBF).emit32(0x100000);    // MOV EDI, 0x100000 (dest)
+    c.emit(0xB9).emit32(0x20000);     // MOV ECX, 128*1024 (up to 512 KiB)
+    c.emit(0xFC);                      // CLD
+    c.emit(0xF3).emit(0xA5);          // REP MOVSD
+
     // ── build page tables ───────────────────────────────────────────
     // PML4 at phys 0x8000 (binary offset 0x200)
     let pml4_phys: u32 = 0x90000;
@@ -380,7 +390,7 @@ fn build_stage2_binary(kernel: &[u8]) -> Vec<u8> {
     // Far jump to 64-bit kernel entry (selector 0x18)
     // We're in 32-bit compat mode.  Opcode EA + 32-bit offset + 16-bit sel
     // is legal — offset truncated to 32 bits, which is fine since kernel < 4 GiB.
-    let kernel_phys = (0x7E00u64 + STAGE2_KERNEL_OFFSET as u64) as u32;
+    let kernel_phys = 0x100000u32;
     c.emit(0xEA).emit32(kernel_phys).emit16(0x18);
 
     // ── Patch the 16-bit preamble to far-jump to the 32-bit code ────
@@ -427,7 +437,7 @@ fn build_kernel_binary(out_dir: &PathBuf) -> Vec<u8> {
     println!("cargo:warning=Building kernel for x86_64-unknown-none...");
     let status = std::process::Command::new("cargo")
         .args(&["build", "--target", "x86_64-unknown-none", "--release"])
-        .env("RUSTFLAGS", "-C link-arg=-Ttext=0x9E00 -C relocation-model=static -C code-model=small")
+        .env("RUSTFLAGS", "-C link-arg=-Ttext=0x100000 -C relocation-model=static -C code-model=small")
         .arg("--target-dir").arg(&ktarget)
         .current_dir(&kdir)
         .status();

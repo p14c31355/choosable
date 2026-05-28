@@ -294,12 +294,38 @@ fn scan_directory(info: &ExfatInfo, root_cluster: u32, files: &mut [DirEntry], f
                             entries[stream_off + 30], entries[stream_off + 31],
                         ]);
 
-                        // File Name entry (0xC1) follows the Stream Extension entry
-                        let name_off = off + 64;
-                        if entries[name_off] == EXFAT_ENTRY_NAME {
-                            let name_len = entries[stream_off + 3] as usize; // name length from Stream Extension
-                            let mut name_buf = [0u8; 256];
-                            let name_actual = utf16le_to_ascii(&entries[name_off + 2..], name_len.min(15) * 2, &mut name_buf);
+                        // File Name entries (0xC1) follow the Stream Extension entry.
+                        // Names longer than 15 characters are split across multiple
+                        // consecutive File Name entries, with the total count given by
+                        // `secondary_count - 1` (the Stream Extension counts as one
+                        // secondary entry).
+                        let secondary_count = entries[off + 1] as usize;
+                        let name_entries_count = secondary_count.saturating_sub(1);
+                        let name_len = entries[stream_off + 3] as usize; // name length from Stream Extension
+                        let mut name_buf = [0u8; 256];
+                        let mut name_actual = 0usize;
+
+                        for entry_idx in 0..name_entries_count {
+                            let current_name_off = off + 64 + entry_idx * 32;
+                            if current_name_off + 32 > entries.len() {
+                                break;
+                            }
+                            if entries[current_name_off] != EXFAT_ENTRY_NAME {
+                                break;
+                            }
+                            let chars_to_copy = (name_len - name_actual).min(15);
+                            if chars_to_copy == 0 {
+                                break;
+                            }
+                            let copied = utf16le_to_ascii(
+                                &entries[current_name_off + 2..],
+                                chars_to_copy * 2,
+                                &mut name_buf[name_actual..],
+                            );
+                            name_actual += copied;
+                        }
+
+                        if name_actual > 0 {
                             let name_str = &name_buf[..name_actual];
 
                             // Check if it's an ISO file
@@ -319,9 +345,9 @@ fn scan_directory(info: &ExfatInfo, root_cluster: u32, files: &mut [DirEntry], f
                                 };
                                 *file_count += 1;
                             }
-                            i += 3; // skip file + stream + name entries
-                            continue;
                         }
+                        i += 1 + secondary_count; // skip the whole entry set
+                        continue;
                     }
                 }
                 i += 1;
