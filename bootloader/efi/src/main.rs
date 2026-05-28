@@ -200,10 +200,11 @@ impl SimpleTextOutput {
     fn output_string(&mut self, s: &[u8]) {
         // UEFI strings are UTF-16. Convert ASCII to wide chars on the fly.
         let mut buf = [0u16; 256];
-        for (i, &b) in s.iter().enumerate() {
+        let len = s.len().min(255);
+        for (i, &b) in s[..len].iter().enumerate() {
             buf[i] = b as u16;
         }
-        buf[s.len()] = 0;
+        buf[len] = 0;
         unsafe { (self.output_string)(self as *mut Self, buf.as_ptr()) };
     }
 }

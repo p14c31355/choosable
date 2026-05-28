@@ -271,39 +271,51 @@ fn scan_directory(info: &ExfatInfo, root_cluster: u32, files: &mut [DirEntry], f
                 if entry_type == EXFAT_ENTRY_FILE {
                     let attrs = u16::from_le_bytes([entries[off+4], entries[off+5]]);
                     let _is_dir = attrs & 0x10 != 0;
-                    let start_cl = u32::from_le_bytes([entries[off+20], entries[off+21], entries[off+22], entries[off+23]]);
-                    let size = u64::from_le_bytes([
-                        entries[off+24], entries[off+25], entries[off+26], entries[off+27],
-                        entries[off+28], entries[off+29], entries[off+30], entries[off+31],
-                    ]);
 
-                    // Next entry should be a name entry
-                    if i + 1 < 16 && entries[off+32] == EXFAT_ENTRY_NAME {
-                        let name_off = off + 32;
-                        let name_len = entries[name_off + 1] as usize; // number of characters (each = 2 bytes)
-                        let mut name_buf = [0u8; 256];
-                        let name_actual = utf16le_to_ascii(&entries[name_off + 2..], name_len * 2, &mut name_buf);
-                        let name_str = &name_buf[..name_actual];
+                    // Stream Extension entry (0xC0) must follow the File entry
+                    let stream_off = off + 32;
+                    if i + 2 < 16 && entries[stream_off] == 0xC0 {
+                        let start_cl = u32::from_le_bytes([
+                            entries[stream_off + 20],
+                            entries[stream_off + 21],
+                            entries[stream_off + 22],
+                            entries[stream_off + 23],
+                        ]);
+                        let size = u64::from_le_bytes([
+                            entries[stream_off + 24], entries[stream_off + 25],
+                            entries[stream_off + 26], entries[stream_off + 27],
+                            entries[stream_off + 28], entries[stream_off + 29],
+                            entries[stream_off + 30], entries[stream_off + 31],
+                        ]);
 
-                        // Check if it's an ISO file
-                        let is_iso = name_actual >= 4
-                            && (name_str[name_actual-4..].eq_ignore_ascii_case(b".iso")
-                            ||  name_str[name_actual-4..].eq_ignore_ascii_case(b".ISO"));
+                        // File Name entry (0xC1) follows the Stream Extension entry
+                        let name_off = off + 64;
+                        if entries[name_off] == EXFAT_ENTRY_NAME {
+                            let name_len = entries[stream_off + 3] as usize; // name length from Stream Extension
+                            let mut name_buf = [0u8; 256];
+                            let name_actual = utf16le_to_ascii(&entries[name_off + 2..], name_len * 2, &mut name_buf);
+                            let name_str = &name_buf[..name_actual];
 
-                        if is_iso && *file_count < max_files {
-                            let mut n = [0u8; 256];
-                            n[..name_actual].copy_from_slice(name_str);
-                            files[*file_count] = DirEntry {
-                                name: n,
-                                name_len: name_actual,
-                                is_iso: true,
-                                start_cluster: start_cl,
-                                file_size: size,
-                            };
-                            *file_count += 1;
+                            // Check if it's an ISO file
+                            let is_iso = name_actual >= 4
+                                && (name_str[name_actual-4..].eq_ignore_ascii_case(b".iso")
+                                ||  name_str[name_actual-4..].eq_ignore_ascii_case(b".ISO"));
+
+                            if is_iso && *file_count < max_files {
+                                let mut n = [0u8; 256];
+                                n[..name_actual].copy_from_slice(name_str);
+                                files[*file_count] = DirEntry {
+                                    name: n,
+                                    name_len: name_actual,
+                                    is_iso: true,
+                                    start_cluster: start_cl,
+                                    file_size: size,
+                                };
+                                *file_count += 1;
+                            }
+                            i += 3; // skip file + stream + name entries
+                            continue;
                         }
-                        i += 2; // skip file + name entry
-                        continue;
                     }
                 }
                 i += 1;

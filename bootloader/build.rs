@@ -494,7 +494,7 @@ fn extract_flat_from_elf(elf: &[u8]) -> Vec<u8> {
     for (vaddr, foff, fsz) in &lo_segments {
         let dest_off = (vaddr - min_vaddr) as usize;
         if *foff < elf.len() {
-            let src_len = fsz.min(elf.len() - foff);
+            let src_len = (*fsz).min(elf.len() - *foff);
             let copy_len = src_len.min(flat.len() - dest_off);
             flat[dest_off..dest_off + copy_len].copy_from_slice(&elf[*foff..*foff + copy_len]);
         }

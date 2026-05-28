@@ -2,3 +2,4 @@
 /Cargo.lock
 bootloader/target
 bootloader/kernel/target
+bootloader/efi/target
