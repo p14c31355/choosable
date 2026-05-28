@@ -502,12 +502,17 @@ fn boot_iso(file: &DirEntry, _part_lba: u32, info: &ExfatInfo) -> ! {
         let off = i * 32;
         if catalog[off] == 0x88 { // Bootable entry
             let media_type = catalog[off + 1];
-            boot_load_seg = u16::from_le_bytes([catalog[off + 8], catalog[off + 9]]);
+            boot_load_seg = u16::from_le_bytes([catalog[off + 2], catalog[off + 3]]);
             if boot_load_seg == 0 { boot_load_seg = 0x07C0; }
-            boot_sector_count = u16::from_le_bytes([catalog[off + 12], catalog[off + 13]]);
-            // Sector count: if 0, use the full emulated size
-            if boot_sector_count == 0 { boot_sector_count = 4; } // default 4 emulated sectors (2048 bytes)
-            boot_image_iso_lba = u32::from_le_bytes([catalog[off + 28], catalog[off + 29], catalog[off + 30], catalog[off + 31]]);
+            boot_sector_count = u16::from_le_bytes([catalog[off + 6], catalog[off + 7]]);
+            // Sector count: if 0, use the default 4 emulated sectors (2048 bytes)
+            if boot_sector_count == 0 { boot_sector_count = 4; }
+            boot_image_iso_lba = u32::from_le_bytes([
+                catalog[off + 8],
+                catalog[off + 9],
+                catalog[off + 10],
+                catalog[off + 11],
+            ]);
 
             vga_print(4, 5, b"Found boot entry, type: ", 0x07);
             vga_print_byte(media_type, 4, 27, 0x0A);
