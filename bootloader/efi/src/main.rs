@@ -187,12 +187,35 @@ enum MemoryType {
 
 // ─── UEFI Protocol GUIDs ────────────────────────────────────────────────
 
+/// EFI_LOADED_IMAGE_PROTOCOL_GUID
+/// {5B1B31A1-9562-11D2-8E3F-00A0C969723B}
+const LOADED_IMAGE_PROTOCOL_GUID: Guid = Guid {
+    data1: 0x5B1B31A1,
+    data2: 0x9562,
+    data3: 0x11D2,
+    data4: [0x8E, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B],
+};
+
+/// EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID
+/// {0964E5B2-6459-11D2-8E39-00A0C969723B}
 const SIMPLE_FILE_SYSTEM_GUID: Guid = Guid {
     data1: 0x0964e5b2,
     data2: 0x6459,
     data3: 0x11d2,
     data4: [0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
 };
+
+// ─── EFI_LOADED_IMAGE_PROTOCOL ──────────────────────────────────────────
+
+/// Minimal definition — we only need DeviceHandle (offset 0x18 → 5th pointer-sized field).
+#[repr(C)]
+struct LoadedImageProtocol {
+    _revision: u32,
+    _parent_handle: *mut core::ffi::c_void,
+    _system_table: *mut core::ffi::c_void,
+    // device_handle: fourth pointer-sized field
+    device_handle: *mut core::ffi::c_void,
+}
 
 // ─── SimpleTextOutput helpers ───────────────────────────────────────────
 
@@ -218,10 +241,33 @@ fn show_boot_menu(
 ) {
     let bs = unsafe { &mut *st.boot_services };
 
-    // Get the SimpleFileSystem protocol on our image handle
+    // Step 1: Get LoadedImageProtocol on our image handle to find the
+    //         device handle that our EFI binary was loaded from.
+    let mut loaded_image: *mut LoadedImageProtocol = core::ptr::null_mut();
+    let status = unsafe {
+        (bs.handle_protocol)(
+            image_handle,
+            &LOADED_IMAGE_PROTOCOL_GUID,
+            &mut loaded_image as *mut _ as *mut *mut core::ffi::c_void,
+        )
+    };
+    if status != 0 || loaded_image.is_null() {
+        con.output_string(b"Failed to get LoadedImageProtocol.\r\n\0");
+        return;
+    }
+
+    let device_handle = unsafe { (*loaded_image).device_handle };
+    if device_handle.is_null() {
+        con.output_string(b"LoadedImage has no device handle.\r\n\0");
+        return;
+    }
+
+    // Step 2: Get SimpleFileSystem protocol on the device handle.
+    //         The image_handle itself does NOT have SFS installed —
+    //         only the device handle (the partition block device) does.
     let mut fs: *mut core::ffi::c_void = core::ptr::null_mut();
     let status = unsafe {
-        (bs.handle_protocol)(image_handle, &SIMPLE_FILE_SYSTEM_GUID, &mut fs)
+        (bs.handle_protocol)(device_handle, &SIMPLE_FILE_SYSTEM_GUID, &mut fs)
     };
     if status != 0 || fs.is_null() {
         con.output_string(b"Failed to open file system.\r\n\0");
