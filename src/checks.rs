@@ -208,24 +208,23 @@ pub fn wait_for_partitions(disk_path: &str) -> Result<()> {
         }
     }
 
-    // Create device nodes if they still don't exist (mknod fallback)
-    if !Path::new(&part1).exists() {
-        if let Some(major_minor) = read_dev_major_minor(&part1) {
-            println!("Creating device node {} with mknod...", part1);
-            let _ = std::process::Command::new("mknod")
-                .args(&["-m", "0660", &part1, "b", &major_minor.0.to_string(), &major_minor.1.to_string()])
-                .status();
-        }
-    }
+    // Use partx to add partitions through udev (NOT mknod, which bypasses udev
+    // and causes "No object for D-bus interface" in udisks2).
+    // mknod creates device nodes directly without emitting udev events,
+    // so the desktop environment never learns about the new partitions.
+    println!("Adding partitions for {} via partx...", disk_path);
+    let _ = std::process::Command::new("partx")
+        .args(&["-a", disk_path])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 
-    if !Path::new(&part2).exists() {
-        if let Some(major_minor) = read_dev_major_minor(&part2) {
-            println!("Creating device node {} with mknod...", part2);
-            let _ = std::process::Command::new("mknod")
-                .args(&["-m", "0660", &part2, "b", &major_minor.0.to_string(), &major_minor.1.to_string()])
-                .status();
-        }
-    }
+    // Wait for udev to create the device nodes
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let _ = std::process::Command::new("udevadm").arg("settle")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 
     if Path::new(&part1).exists() && Path::new(&part2).exists() {
         Ok(())
@@ -251,17 +250,28 @@ fn read_dev_major_minor(part_path: &str) -> Option<(u32, u32)> {
     None
 }
 
-/// Delete existing partition device nodes (equivalent to `rm -f $PART1 $PART2`)
+/// Delete existing partition device nodes using partx.
+///
+/// `rm -f /dev/sdX1` bypasses udev and causes "No object for D-bus interface"
+/// errors in udisks2.  `partx -d` properly tells the kernel to remove partition
+/// nodes, which triggers udev "remove" events that udisks2 can react to.
 pub fn remove_partition_nodes(disk_path: &str) {
     let part1 = get_partition_name(disk_path, 1);
     let part2 = get_partition_name(disk_path, 2);
 
-    if Path::new(&part1).exists() {
-        println!("Removing existing partition node {}", part1);
-        let _ = std::fs::remove_file(&part1);
-    }
-    if Path::new(&part2).exists() {
-        println!("Removing existing partition node {}", part2);
-        let _ = std::fs::remove_file(&part2);
+    if Path::new(&part1).exists() || Path::new(&part2).exists() {
+        println!("Removing existing partition nodes for {} via partx...", disk_path);
+        let _ = std::process::Command::new("partx")
+            .args(&["-d", disk_path])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+
+        // Let udev process the removal events
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let _ = std::process::Command::new("udevadm").arg("settle")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
     }
 }

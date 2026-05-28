@@ -321,8 +321,10 @@ fn read_choosable_version(disk_path: &str, part2_start_byte: u64) -> Result<Opti
     file.seek(SeekFrom::Start(part2_start_byte))?;
     let slice = PartitionSlice::new(file, part2_start_byte, CHOOSABLE_EFI_PART_SIZE);
 
-    let fs = fatfs::FileSystem::new(slice, fatfs::FsOptions::new())
-        .map_err(|e| ChoosableError::Generic(format!("Failed to parse FAT: {}", e)))?;
+    let fs = match fatfs::FileSystem::new(slice, fatfs::FsOptions::new()) {
+        Ok(fs) => fs,
+        Err(_) => return Ok(None),
+    };
 
     let root_dir = fs.root_dir();
     let grub_dir = match root_dir.open_dir("grub") {
@@ -339,8 +341,8 @@ fn read_choosable_version(disk_path: &str, part2_start_byte: u64) -> Result<Opti
     cfg_file.read_to_string(&mut content).ok();
 
     for line in content.lines() {
-        if let Some(pos) = line.find("VENTOY_VERSION=") {
-            let after = &line[pos + "VENTOY_VERSION=".len()..];
+        if let Some(pos) = line.find("CHOOSABLE_VERSION=") {
+            let after = &line[pos + "CHOOSABLE_VERSION=".len()..];
             let version = after.trim_matches(|c: char| c == '"' || c == '\'' || c.is_whitespace());
             if !version.is_empty() {
                 return Ok(Some(version.to_string()));
