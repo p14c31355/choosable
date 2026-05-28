@@ -201,7 +201,7 @@ fn build_mbr_boot_sector() -> Vec<u8> {
     c.patch_rel8_here(j6);
     c.patch_rel8_here(j5); c.mov_dl_mem16(dn); c.jmp_far(0x0000,0x7E00);
     let pl=c.label(); let ci=crp-2;
-    c.bytes[ci as usize+1]=(pl-crp) as u8; c.bytes[ci as usize+2]=((pl-crp)>>8) as u8;
+    c.bytes[ci as usize]=(pl-crp) as u8; c.bytes[ci as usize+1]=((pl-crp)>>8) as u8;
     c.pusha(); c.mov_ah(0x0E); c.xor_bx_bx(); c.lodsb(); c.test_al_al();
     let pz=c.jz_ph(); c.int(0x10); c.jmp_short(-9i8); c.popa(); c.ret(); c.patch_rel8_here(pz);
     while c.bytes.len()<440 { c.emit(0x00); }
