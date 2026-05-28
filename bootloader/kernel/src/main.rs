@@ -450,8 +450,8 @@ fn boot_iso(file: &DirEntry, _part_lba: u32, info: &ExfatInfo) -> ! {
     // Boot Record Validation Entry starts at offset 0 → identifier byte 0 = 0x01
     // Wait, we read 512 bytes, but the 2048-byte Boot Record has multiple fields.
     // The first sector (512 bytes) of the Boot Record contains the Validation Entry at offset 0.
-    if boot_rec[0] != 0x01 {
-        vga_print(4, 2, b"Invalid Boot Record identifier (expected 0x01).", 0x0C);
+    if &boot_rec[1..6] != b"CD001" {
+        vga_print(4, 2, b"Invalid Boot Record identifier (expected CD001).", 0x0C);
         kbd_wait_key();
         show_menu(&[], 0, 0, info);
     }
