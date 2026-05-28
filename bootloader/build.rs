@@ -239,11 +239,30 @@ fn build_stage2_binary(kernel: &[u8]) -> Vec<u8> {
 
     // ── 16-bit real mode entry (phys 0x7E00) ───────────────────────
     c.cli();
+    c.xor_ax_ax(); c.mov_ss_ax(); // SS ← 0
+    c.mov_sp(0x7E00);             // stack at top of stage2 area
+
     c.mov_mem8_dl(0x7DFE); // save disk number
-    // Enable A20 via BIOS INT 15h AH=2401h.
-    // Keyboard controller A20 gate is unreliable on NEC OEM firmware
-    // (the controller is not emulated and may hang the system).
+
+    // ── Enable A20 gate ────────────────────────────────────────────
+    // Try three methods in sequence: keyboard controller, BIOS call,
+    // then I/O port 0x92 (fast A20).  NEC 2015 firmware is known to
+    // fail the BIOS call but will accept the keyboard controller or
+    // the fast A20 port.
+    //
+    // 1) Keyboard controller (8042)
+    c.mov_al(0xD1); c.emit(0xE6).emit(0x64); // OUT 0x64, AL (write cmd)
+    c.mov_al(0xDF); c.emit(0xE6).emit(0x60); // OUT 0x60, AL (enable A20)
+    //　wait a moment (loop ~65536 times)
+    c.mov_cx(0xFFFF);
+    let wait1 = c.label();
+    c.emit(0xE2).emit(0xFD); // LOOP $-3
+
+    // 2) BIOS call (INT 15h AH=2401h)
     c.mov_ah(0x24); c.mov_al(0x01); c.int(0x15);
+
+    // 3) Fast A20 gate via System Control Port A (I/O 0x92)
+    c.mov_al(0x02); c.emit(0xE6).emit(0x92); // OUT 0x92, 2
 
     // ── GDT pseudo-descriptor (must be at STAGE2_GDT_PTR_OFF) ──────
     while c.offset() < STAGE2_GDT_PTR_OFF { c.emit(0x90); }
