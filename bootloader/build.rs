@@ -438,8 +438,8 @@ fn build_kernel_binary(out_dir: &PathBuf) -> Vec<u8> {
 
     match status {
         Ok(s) if s.success() => {}
-        Ok(s) => { println!("cargo:warning=Kernel build exit {:?}", s.code()); return vec![0; 512]; }
-        Err(e) => { println!("cargo:warning=Kernel build error: {}", e); return vec![0; 512]; }
+        Ok(s) => panic!("Kernel build failed with exit code {:?}", s.code()),
+        Err(e) => panic!("Kernel build failed to start: {}", e),
     }
 
     let elf_path = ktarget.join("x86_64-unknown-none/release/choosable-kernel");
