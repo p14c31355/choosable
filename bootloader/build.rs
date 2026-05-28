@@ -180,7 +180,12 @@ fn build_mbr_boot_sector() -> Vec<u8> {
     // 0x07C1 = reserved      (1 byte  → must be 0x00; already zero from REP MOVSW)
     // 0x07C4 = buffer offset (2 bytes → 0x7E00)
     // 0x07C6 = buffer segment(2 bytes → 0x0000)
-    c.mov_mem8_imm8(0x07C0, 0x10);
+    // Write packet size (0x10) and reserved (0x00) as a 16-bit word.
+    // Writing only the byte at 0x07C0 leaves 0x07C1 polluted with
+    // partition-table data copied by REP MOVSW.  Many legacy BIOSes
+    // (especially NEC OEM) reject the DAP when the reserved byte is
+    // non-zero.
+    c.mov_mem16_imm16(0x07C0, 0x0010);
     c.mov_mem16_imm16(0x07C4, 0x7E00);
     // The buffer segment at 0x07C6-0x07C7 is NOT zero after REP MOVSW!
     // REP MOVSW copies the MBR code from 0x7C00→0x0600, so byte 0x07C6
@@ -235,9 +240,10 @@ fn build_stage2_binary(kernel: &[u8]) -> Vec<u8> {
     // ── 16-bit real mode entry (phys 0x7E00) ───────────────────────
     c.cli();
     c.mov_mem8_dl(0x7DFE); // save disk number
-    // Enable A20 (keyboard controller method — safe, no INT 15h needed)
-    c.mov_al(0xD1); c.emit(0xE6).emit(0x64);
-    c.mov_al(0xDF); c.emit(0xE6).emit(0x60);
+    // Enable A20 via BIOS INT 15h AH=2401h.
+    // Keyboard controller A20 gate is unreliable on NEC OEM firmware
+    // (the controller is not emulated and may hang the system).
+    c.mov_ah(0x24); c.mov_al(0x01); c.int(0x15);
 
     // ── GDT pseudo-descriptor (must be at STAGE2_GDT_PTR_OFF) ──────
     while c.offset() < STAGE2_GDT_PTR_OFF { c.emit(0x90); }
@@ -409,6 +415,7 @@ fn build_kernel_binary(out_dir: &PathBuf) -> Vec<u8> {
     println!("cargo:warning=Building kernel for x86_64-unknown-none...");
     let status = std::process::Command::new("cargo")
         .args(&["build", "--target", "x86_64-unknown-none", "--release"])
+        .env("RUSTFLAGS", "-C link-arg=-Ttext=0x9E00 -C relocation-model=static -C code-model=small")
         .arg("--target-dir").arg(&ktarget)
         .current_dir(&kdir)
         .status();
@@ -449,8 +456,16 @@ fn extract_flat_from_elf(elf: &[u8]) -> Vec<u8> {
     }
 
     if lo_segments.is_empty() { return vec![0;512]; }
-    lo_segments.sort_by_key(|s| s.0);
 
+    // Skip GNU EFI stub headers (vaddr=0x0, small size).
+    // Stage2 loads the kernel at physical 0x9E00, so the first real
+    // code segment will be linked at 0x9E00.  Keeping the EFI header
+    // as min_vaddr would offset the flat binary by 0x200, causing
+    // Stage2's far-jump to land on the header instead of _start.
+    lo_segments.retain(|(va, _, sz)| *va >= 0x1000 || *sz >= 0x1000);
+    if lo_segments.is_empty() { return vec![0;512]; }
+
+    lo_segments.sort_by_key(|s| s.0);
     let min_vaddr = lo_segments[0].0;
 
     // Find max end address
