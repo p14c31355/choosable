@@ -825,55 +825,42 @@ fn write_gpt_f(disk: &mut std::fs::File, _disk_path: &str, disk_size_bytes: u64,
     gpt_info.write_to_disk(disk)?;
     disk.flush()?;
 
-    // 3. Overwrite the protective-MBR boot code area (bytes 0–440) with
-    //    our real boot sector.  gpt_info.write_to_disk() wrote a zero-filled
-    //    protective MBR (boot_code = [0u8; 446]), so we MUST write boot_img
-    //    AFTER that.  We also patch the MBR in-memory so it reads stage2
-    //    from LBA 34 (the GPT gap) instead of LBA 1.
+    // 3. Overwrite only the boot code area (bytes 0–440) in the
+    //    protective MBR that gpt_info.write_to_disk() just wrote.
+    //    The partition table (bytes 446–509) already contains the
+    //    correct GPT protective entry (0xEE) — we MUST NOT overwrite it.
+    //
+    //    Read the current MBR from disk, overlay our boot code (LBA
+    //    patched to 34 for GPT gap), then write back only the first
+    //    440 bytes.  The remainder of the sector is left as-is.
     let boot_img = bootloader::BOOT_IMG;
     let boot_code_len = std::cmp::min(boot_img.len(), 440);
 
-    // Build a complete 512-byte MBR sector in memory so we can patch LBA
-    // fields and write it in a single I/O.
+    // Read the protective MBR that write_to_disk() just wrote.
+    // It has the correct 0xEE partition entry at bytes 446–509.
     let mut mbr_bytes = [0u8; 512];
+    disk.seek(SeekFrom::Start(0))?;
+    disk.read_exact(&mut mbr_bytes)?;
+
+    // Overlay boot code (bytes 0–440)
     mbr_bytes[..boot_code_len].copy_from_slice(&boot_img[..boot_code_len]);
 
     // Disk GUID at offset 384 and 440 (NT serial-like)
     mbr_bytes[384..400].copy_from_slice(&disk_guid);
     mbr_bytes[440..444].copy_from_slice(&disk_guid[12..16]);
 
-    // MBR boot signature at 510–511
+    // MBR boot signature at 510–511 (should already be set, but ensure)
     mbr_bytes[510] = MBR_SIGNATURE_55;
     mbr_bytes[511] = MBR_SIGNATURE_AA;
 
-    // Patch the LBA fields inside the boot code so that the MBR loads
-    // stage2 from the GPT gap (LBA 34) instead of the MBR gap (LBA 1).
-    //
-    // The MBR code stores the starting LBA in a DAP at address 0x07C8
-    // (variable `dll` in build_mbr_boot_sector).  The 32-bit LBA value
-    // is encoded as an immediate operand of a MOV DWORD PTR [dll], imm32
-    // instruction.  We locate it by searching for the DAP buffer address
-    // 0xC8 0x07 in little-endian inside the boot code bytes.
-    //
-    // Instruction encoding (from build_mbr_boot_sector):
-    //   66 C7 06 C8 07  01 00 00 00  → MOV DWORD [0x07C8], 1
-    //                                    ^^^^^^^^ ^^^^^^^^^^^
-    //                                     opcode    imm32 = LBA
-    // We search for C7 06 C8 07 and patch the 4 bytes after it.
+    // Patch LBA from 1 → 34 so MBR loads stage2 from GPT gap (LBA 34)
     let lba_patch: u32 = 34u32.to_le();
     let needle: [u8; 4] = [0xC7, 0x06, 0xC8, 0x07];
-    let mut patched = false;
     for i in 0..(boot_code_len.saturating_sub(8)) {
         if mbr_bytes[i..i+4] == needle {
             mbr_bytes[i+4..i+8].copy_from_slice(&lba_patch.to_le_bytes());
-            patched = true;
             break;
         }
-    }
-    if !patched {
-        // Fallback: if the pattern isn't found, stage2 loading will read
-        // from LBA 1 (MBR gap), which works for MBR layout but not for
-        // GPT.  The disk won't boot in GPT mode in this case.
     }
 
     // Write the complete 512-byte MBR sector
@@ -940,15 +927,22 @@ fn write_boot_images(disk: &mut std::fs::File, is_gpt: bool, _part2_start_sector
         disk.seek(SeekFrom::Start(34 * 512))?;
         disk.write_all(&core[..core_len])?;
 
-        // Patch MBR LBA from 1 → 34 using the same needle search as write_gpt_f
+        // Read the existing protective MBR and overlay only the boot
+        // code area (bytes 0–440).  The partition table (bytes 446–509)
+        // already has the correct GPT protective entry (0xEE).
         let boot_code_len = std::cmp::min(boot_img.len(), 440);
         let mut mbr_bytes = [0u8; 512];
+        disk.seek(SeekFrom::Start(0))?;
+        disk.read_exact(&mut mbr_bytes)?;
+
+        // Overlay boot code
         mbr_bytes[..boot_code_len].copy_from_slice(&boot_img[..boot_code_len]);
 
         // MBR signatures
         mbr_bytes[510] = MBR_SIGNATURE_55;
         mbr_bytes[511] = MBR_SIGNATURE_AA;
 
+        // Patch LBA from 1 → 34
         let lba: u32 = 34u32.to_le();
         let needle: [u8; 4] = [0xC7, 0x06, 0xC8, 0x07];
         for i in 0..(boot_code_len.saturating_sub(8)) {
@@ -1141,14 +1135,21 @@ pub fn update_choosable(disk_path: &str, secure_boot: Option<bool>, yes: bool) -
     let boot_code_len = std::cmp::min(boot_img.len(), 440);
 
     if is_gpt {
-        // Build a complete MBR sector with LBA patched to 34
+        // Read the existing protective MBR and overlay only the boot
+        // code area (bytes 0–440).  The partition table (bytes 446–509)
+        // already has the correct GPT protective entry (0xEE).
         let mut mbr_bytes = [0u8; 512];
+        disk.seek(SeekFrom::Start(0))?;
+        disk.read_exact(&mut mbr_bytes)?;
+
+        // Overlay boot code
         mbr_bytes[..boot_code_len].copy_from_slice(&boot_img[..boot_code_len]);
         mbr_bytes[384..400].copy_from_slice(&diskuuid);
         mbr_bytes[440..444].copy_from_slice(&diskuuid[12..16]);
         mbr_bytes[510] = MBR_SIGNATURE_55;
         mbr_bytes[511] = MBR_SIGNATURE_AA;
 
+        // Patch LBA from 1 → 34
         let lba: u32 = 34u32.to_le();
         let needle: [u8; 4] = [0xC7, 0x06, 0xC8, 0x07];
         for i in 0..(boot_code_len.saturating_sub(8)) {
