@@ -37,17 +37,26 @@ extern "efiapi" fn efi_main(
         die(st, b"ERROR: Cannot read MBR.\r\n\0");
     }
 
-    // Find partition 1 (first partition with sectors > 0 and type != 0xEE)
+    // Find partition 1 — try MBR first, then GPT fallback
     let mut part1_lba: u64 = 0;
+    let mut is_gpt = false;
     for i in 0..4 {
         let off = 446 + i * 16;
         let fs = mbr[off + 4];
         let lba = u32::from_le_bytes([mbr[off+8], mbr[off+9], mbr[off+10], mbr[off+11]]);
         let sec = u32::from_le_bytes([mbr[off+12], mbr[off+13], mbr[off+14], mbr[off+15]]);
+        if fs == 0xEE && sec > 0 { is_gpt = true; }
         if sec == 0 || fs == 0xEE { continue; }
         part1_lba = lba as u64;
         break;
     }
+
+    if part1_lba == 0 && is_gpt {
+        // GPT protective MBR — search GPT partition table for Basic Data Partition
+        print_raw(st, b"GPT detected, searching for data partition...\r\n\0");
+        part1_lba = find_gpt_data_partition(st, bio_ref, bio_ptr, mid);
+    }
+
     if part1_lba == 0 { die(st, b"ERROR: No partition 1 found.\r\n\0"); }
 
     // Read partition 1 VBR
@@ -347,6 +356,43 @@ fn boot_iso(
 //  Disk handle discovery
 // ═══════════════════════════════════════════════════════════════════
 
+/// Search GPT partition table for a Microsoft Basic Data Partition
+/// (type GUID: EBD0A0A2-B9E5-4433-87C0-68B6B72699C7).
+fn find_gpt_data_partition(st: &mut SystemTable, bio_ref: &BlockIoProtocol, bio_ptr: *mut BlockIoProtocol, mid: u32) -> u64 {
+    let mut hdr: [u8; 92] = [0; 92];
+    if unsafe { (bio_ref.read_blocks)(bio_ptr, mid, 1, 512, hdr.as_mut_ptr() as _) } != EFI_SUCCESS { return 0; }
+    if &hdr[0..8] != b"EFI PART" { return 0; }
+    let entries_lba = u64::from_le_bytes(hdr[72..80].try_into().unwrap());
+    let n = u32::from_le_bytes(hdr[80..84].try_into().unwrap());
+    let sz = u32::from_le_bytes(hdr[84..88].try_into().unwrap());
+    if sz == 0 || n == 0 { return 0; }
+
+    // Basic Data GUID (EBD0A0A2-B9E5-4433-87C0-68B6B72699C7) — matches constants.rs GPT_TYPE_BASIC_DATA
+    let basic_data_guid: [u8; 16] = [
+        0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44,
+        0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7,
+    ];
+
+    let mut sec: [u8; 512] = [0; 512];
+    for i in 0..n.min(128) {
+        let eoff = i as usize * sz as usize;
+        let lba = entries_lba + (eoff / 512) as u64;
+        let boff = eoff % 512;
+        if boff + 16 > 512 { continue; }
+        if i as usize % (512usize / sz as usize) == 0 || i == 0 {
+            if unsafe { (bio_ref.read_blocks)(bio_ptr, mid, lba, 512, sec.as_mut_ptr() as _) } != EFI_SUCCESS { break; }
+        }
+        if sec[boff..boff+16] == basic_data_guid {
+            let start_lba = u64::from_le_bytes(sec[boff+32..boff+40].try_into().unwrap());
+            print_raw(st, b"Found GPT Basic Data at LBA ");
+            print_hex(st, b"0x", start_lba);
+            print_raw(st, b"\r\n\0");
+            return start_lba;
+        }
+    }
+    0
+}
+
 fn find_disk_handle(bs: &mut BootServices, image_handle: *mut core::ffi::c_void) -> Option<*mut core::ffi::c_void> {
     // Try LoadedImageProtocol first
     let mut lip: *mut LoadedImageProtocol = core::ptr::null_mut();
@@ -373,7 +419,7 @@ fn banner(st: &mut SystemTable) {
     if !st.con_out.is_null() {
         let con = unsafe { &mut *(st.con_out as *mut SimpleTextOutput) };
         prints(con, b"\r\n========================================\r\n\0");
-        prints(con, b"    Choosable UEFI Bootloader v1.0      \r\n\0");
+        prints(con, b"        Choosable UEFI Bootloader       \r\n\0");
         prints(con, b"========================================\r\n\0");
     }
 }
