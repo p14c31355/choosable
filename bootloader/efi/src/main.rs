@@ -3,8 +3,6 @@
 
 use core::panic::PanicInfo;
 
-/// EFI_UNSUPPORTED = 0x8000_0000_0000_0003 (bit 63 set → error)
-/// EFI_NOT_FOUND   = 0x8000_0000_0000_000E
 const EFI_SUCCESS: usize = 0;
 
 /// UEFI entry point — NEVER returns.
@@ -16,14 +14,15 @@ extern "efiapi" fn efi_main(
     let st = unsafe { &mut *system_table };
     let bs = unsafe { &mut *st.boot_services };
 
+    // Print banner
     if !st.con_out.is_null() {
         let con = unsafe { &mut *(st.con_out as *mut SimpleTextOutput) };
         con.output_string(b"\r\n========================================\r\n\0");
-        con.output_string(b"    Choosable UEFI Bootloader v0.5      \r\n\0");
+        con.output_string(b"    Choosable UEFI Bootloader v0.6      \r\n\0");
         con.output_string(b"========================================\r\n\0");
     }
 
-    // Step 1: Get LoadedImageProtocol on image_handle.
+    // Step 1: Get LoadedImageProtocol
     let mut loaded_image: *mut LoadedImageProtocol = core::ptr::null_mut();
     let status = unsafe {
         (bs.handle_protocol)(
@@ -33,44 +32,69 @@ extern "efiapi" fn efi_main(
         )
     };
     if status != EFI_SUCCESS || loaded_image.is_null() {
-        print_hex(st, b"ERROR: LoadedImageProtocol failed: 0x", status as u64);
-        print_raw(st, b"\r\n");
+        print_raw(st, b"ERROR: No LoadedImageProtocol\r\n\0");
         halt_or_reboot(st);
     }
 
-    // Step 2: Get the device handle from LoadedImage.
     let device_handle = unsafe { (*loaded_image).device_handle };
     if device_handle.is_null() {
-        print_raw(st, b"ERROR: No device handle in LoadedImage.\r\n\0");
+        print_raw(st, b"ERROR: No device handle\r\n\0");
         halt_or_reboot(st);
     }
 
-    // Step 3: Get SimpleFileSystem on device_handle.
-    let mut fs: *mut core::ffi::c_void = core::ptr::null_mut();
+    // Step 2: Try SimpleFileSystem first (fast path on most firmware)
+    let mut sfs_iface: *mut core::ffi::c_void = core::ptr::null_mut();
     let status = unsafe {
-        (bs.handle_protocol)(device_handle, &SIMPLE_FILE_SYSTEM_GUID, &mut fs)
+        (bs.handle_protocol)(device_handle, &SIMPLE_FILE_SYSTEM_GUID, &mut sfs_iface)
     };
-    if status != EFI_SUCCESS || fs.is_null() {
-        print_hex(st, b"ERROR: SFS on device failed: 0x", status as u64);
-        print_raw(st, b"\r\n");
+    if status == EFI_SUCCESS && !sfs_iface.is_null() {
+        print_raw(st, b"Filesystem opened (SFS).\r\n\0");
+        halt_or_reboot(st);
+    }
 
-        // Fallback: try handle_protocol on image_handle directly
-        // (some firmware binds SFS to the image handle)
-        fs = core::ptr::null_mut();
-        let status = unsafe {
-            (bs.handle_protocol)(image_handle, &SIMPLE_FILE_SYSTEM_GUID, &mut fs)
-        };
-        if status == EFI_SUCCESS && !fs.is_null() {
-            print_raw(st, b"  (found SFS on image handle as fallback)\r\n\0");
-        } else {
-            print_hex(st, b"  Fallback also failed: 0x", status as u64);
-            print_raw(st, b"\r\n");
-            halt_or_reboot(st);
+    // Step 3: Fallback — Block I/O Protocol + minimal FAT16 reader
+    print_raw(st, b"SFS not supported, trying Block I/O...\r\n\0");
+
+    let mut bio: *mut BlockIoProtocol = core::ptr::null_mut();
+    let status = unsafe {
+        (bs.handle_protocol)(
+            device_handle,
+            &BLOCK_IO_PROTOCOL_GUID,
+            &mut bio as *mut _ as *mut *mut core::ffi::c_void,
+        )
+    };
+    if status != EFI_SUCCESS || bio.is_null() {
+        print_raw(st, b"ERROR: No Block I/O protocol.\r\n\0");
+        halt_or_reboot(st);
+    }
+
+    let bio = unsafe { &*bio };
+    if !bio.media.is_null() {
+        let media = unsafe { &*bio.media };
+        if !media.logical_partition {
+            // Whole disk — we need partition 2 (offset 32 MiB from end)
+            // But we don't know disk size here.  For now, just read sector 0.
+            print_raw(st, b"Whole-disk Block I/O detected.\r\n\0");
         }
     }
 
-    print_raw(st, b"Filesystem opened successfully!\r\n\0");
-    print_raw(st, b"Boot menu coming in a future update.\r\n\0");
+    // Read a few sectors from the start of the partition
+    // (Block I/O reads from partition start if logical_partition=true)
+    let mut buf: [u8; 512] = [0; 512];
+    let status = unsafe { (bio.read_blocks)(bio as *const BlockIoProtocol as *mut BlockIoProtocol, 0, 0, 1, buf.as_mut_ptr() as *mut core::ffi::c_void) };
+    if status != EFI_SUCCESS {
+        print_raw(st, b"ERROR: Block I/O read failed.\r\n\0");
+        halt_or_reboot(st);
+    }
+
+    // Check for FAT16 signature (bytes 0x36-0x3D = "FAT16   ")
+    if &buf[0x36..0x3E] == b"FAT16   " {
+        print_raw(st, b"FAT16 partition found via Block I/O!\r\n\0");
+        print_raw(st, b"Boot menu coming in a future update.\r\n\0");
+    } else {
+        print_hex(st, b"  First bytes: ", u64::from_le_bytes(buf[0..8].try_into().unwrap()));
+        print_raw(st, b"\r\n\0");
+    }
 
     halt_or_reboot(st);
 }
@@ -110,8 +134,9 @@ fn halt_or_reboot(st: &mut SystemTable) -> ! {
         for _ in 0..300 {
             unsafe { (bs.stall)(100_000) };
             let mut key = Key { scan_code: 0, unicode_char: 0 };
-            let status = unsafe { (con_in.read_key_stroke)(con_in as *mut SimpleTextInput, &mut key) };
-            if status == EFI_SUCCESS { system_reset(st); }
+            if unsafe { (con_in.read_key_stroke)(con_in as *mut SimpleTextInput, &mut key) } == EFI_SUCCESS {
+                system_reset(st);
+            }
         }
     }
     system_reset(st);
@@ -123,34 +148,34 @@ fn panic(_info: &PanicInfo) -> ! {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  UEFI Type Definitions (offsets verified against UEFI 2.10 spec)
+//  UEFI Types
 // ═══════════════════════════════════════════════════════════════════
 
 #[repr(C)]
 struct SystemTable {
-    hdr:                  TableHeader,            // 0x00
-    firmware_vendor:      *const u16,             // 0x18
-    firmware_revision:    u32,                    // 0x20
-    _pad24:               u32,                    // 0x24 (align to 8)
-    _console_in_handle:   *mut core::ffi::c_void, // 0x28
-    con_in:               *mut core::ffi::c_void, // 0x30
-    _console_out_handle:  *mut core::ffi::c_void, // 0x38
-    con_out:              *mut core::ffi::c_void, // 0x40
-    _stderr_handle:       *mut core::ffi::c_void, // 0x48
-    stderr:               *mut core::ffi::c_void, // 0x50
-    runtime_services:     *mut RuntimeServices,   // 0x58
-    boot_services:        *mut BootServices,      // 0x60
-    _num_table_entries:   usize,                  // 0x68
-    _config_table:        *mut core::ffi::c_void, // 0x70
+    hdr:                  TableHeader,
+    firmware_vendor:      *const u16,
+    firmware_revision:    u32,
+    _pad24:               u32,
+    _console_in_handle:   *mut core::ffi::c_void,
+    con_in:               *mut core::ffi::c_void,
+    _console_out_handle:  *mut core::ffi::c_void,
+    con_out:              *mut core::ffi::c_void,
+    _stderr_handle:       *mut core::ffi::c_void,
+    stderr:               *mut core::ffi::c_void,
+    runtime_services:     *mut RuntimeServices,
+    boot_services:        *mut BootServices,
+    _num_table_entries:   usize,
+    _config_table:        *mut core::ffi::c_void,
 }
 
 #[repr(C)]
 struct TableHeader {
-    signature:   u64,  // 0x00
-    revision:    u32,  // 0x08
-    header_size: u32,  // 0x0C
-    crc32:       u32,  // 0x10
-    _reserved:   u32,  // 0x14
+    signature:   u64,
+    revision:    u32,
+    header_size: u32,
+    crc32:       u32,
+    _reserved:   u32,
 }
 
 #[repr(C)]
@@ -190,35 +215,30 @@ struct Key {
     unicode_char: u16,
 }
 
-/// BootServices — every field explicitly listed with offsets.
 #[repr(C)]
 struct BootServices {
-    // 0x00
     hdr: TableHeader,
-    // 0x18
-    _18: *mut core::ffi::c_void, // RaiseTPL
-    _20: *mut core::ffi::c_void, // RestoreTPL
-    _28: *mut core::ffi::c_void, // AllocatePages
-    _30: *mut core::ffi::c_void, // FreePages
-    _38: *mut core::ffi::c_void, // GetMemoryMap
-    _40: *mut core::ffi::c_void, // AllocatePool
-    _48: *mut core::ffi::c_void, // FreePool
-    _50: *mut core::ffi::c_void, // CreateEvent
-    _58: *mut core::ffi::c_void, // SetTimer
-    _60: *mut core::ffi::c_void, // WaitForEvent
-    _68: *mut core::ffi::c_void, // SignalEvent
-    _70: *mut core::ffi::c_void, // CloseEvent
-    _78: *mut core::ffi::c_void, // CheckEvent
-    _80: *mut core::ffi::c_void, // InstallProtocolInterface
-    _88: *mut core::ffi::c_void, // ReinstallProtocolInterface
-    _90: *mut core::ffi::c_void, // UninstallProtocolInterface
-    // 0x98
+    _18: *mut core::ffi::c_void,
+    _20: *mut core::ffi::c_void,
+    _28: *mut core::ffi::c_void,
+    _30: *mut core::ffi::c_void,
+    _38: *mut core::ffi::c_void,
+    _40: *mut core::ffi::c_void,
+    _48: *mut core::ffi::c_void,
+    _50: *mut core::ffi::c_void,
+    _58: *mut core::ffi::c_void,
+    _60: *mut core::ffi::c_void,
+    _68: *mut core::ffi::c_void,
+    _70: *mut core::ffi::c_void,
+    _78: *mut core::ffi::c_void,
+    _80: *mut core::ffi::c_void,
+    _88: *mut core::ffi::c_void,
+    _90: *mut core::ffi::c_void,
     handle_protocol: unsafe extern "efiapi" fn(
         *mut core::ffi::c_void,
         *const Guid,
         *mut *mut core::ffi::c_void,
     ) -> usize,
-    // 0xA0
     _a0: *mut core::ffi::c_void,
     _a8: *mut core::ffi::c_void,
     _b0: *mut core::ffi::c_void,
@@ -230,9 +250,7 @@ struct BootServices {
     _e0: *mut core::ffi::c_void,
     _e8: *mut core::ffi::c_void,
     _f0: *mut core::ffi::c_void,
-    // 0xF8
     stall: unsafe extern "efiapi" fn(usize) -> usize,
-    // 0x100
     _100: *mut core::ffi::c_void,
     _108: *mut core::ffi::c_void,
     _110: *mut core::ffi::c_void,
@@ -267,6 +285,35 @@ struct RuntimeServices {
 }
 
 #[repr(C)]
+struct BlockIoProtocol {
+    _revision:    u64,
+    media:        *mut BlockIoMedia,
+    _reset:       *mut core::ffi::c_void,
+    read_blocks:  unsafe extern "efiapi" fn(
+        *mut BlockIoProtocol,
+        u32,       // MediaId
+        u64,       // LBA
+        usize,     // BufferSize
+        *mut core::ffi::c_void, // Buffer
+    ) -> usize,
+    _write_blocks: *mut core::ffi::c_void,
+    _flush_blocks: *mut core::ffi::c_void,
+}
+
+#[repr(C)]
+struct BlockIoMedia {
+    _media_id:          u32,
+    _removable_media:   bool,
+    _media_present:     bool,
+    logical_partition:  bool,
+    _read_only:         bool,
+    _write_caching:     bool,
+    _block_size:        u32,
+    _io_align:          u32,
+    _last_block:        u64,
+}
+
+#[repr(C)]
 struct Guid {
     data1: u32,
     data2: u16,
@@ -278,24 +325,6 @@ struct Guid {
 #[repr(u32)]
 enum ResetType { ResetCold = 0 }
 
-// ─── GUIDs ──────────────────────────────────────────────────────────────
-
-const LOADED_IMAGE_PROTOCOL_GUID: Guid = Guid {
-    data1: 0x5B1B31A1,
-    data2: 0x9562,
-    data3: 0x11D2,
-    data4: [0x8E, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B],
-};
-
-const SIMPLE_FILE_SYSTEM_GUID: Guid = Guid {
-    data1: 0x0964e5b2,
-    data2: 0x6459,
-    data3: 0x11d2,
-    data4: [0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
-};
-
-// ─── EFI_LOADED_IMAGE_PROTOCOL ──────────────────────────────────────────
-
 #[repr(C)]
 struct LoadedImageProtocol {
     _revision:      u32,
@@ -304,15 +333,28 @@ struct LoadedImageProtocol {
     device_handle:  *mut core::ffi::c_void,
 }
 
+// ─── GUIDs ──────────────────────────────────────────────────────────────
+
+const LOADED_IMAGE_PROTOCOL_GUID: Guid = Guid {
+    data1: 0x5B1B31A1, data2: 0x9562, data3: 0x11D2,
+    data4: [0x8E, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B],
+};
+const SIMPLE_FILE_SYSTEM_GUID: Guid = Guid {
+    data1: 0x0964e5b2, data2: 0x6459, data3: 0x11d2,
+    data4: [0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
+};
+const BLOCK_IO_PROTOCOL_GUID: Guid = Guid {
+    data1: 0x964e5b21, data2: 0x6459, data3: 0x11d2,
+    data4: [0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
+};
+
 // ─── SimpleTextOutput helpers ───────────────────────────────────────────
 
 impl SimpleTextOutput {
     fn output_string(&mut self, s: &[u8]) {
         let mut buf = [0u16; 256];
         let len = s.len().min(255);
-        for (i, &b) in s[..len].iter().enumerate() {
-            buf[i] = b as u16;
-        }
+        for (i, &b) in s[..len].iter().enumerate() { buf[i] = b as u16; }
         buf[len] = 0;
         unsafe { (self.output_string)(self as *mut Self, buf.as_ptr()) };
     }
