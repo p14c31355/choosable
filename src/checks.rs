@@ -208,10 +208,9 @@ pub fn wait_for_partitions(disk_path: &str) -> Result<()> {
         }
     }
 
-    // Use partx to add partitions through udev (NOT mknod, which bypasses udev
-    // and causes "No object for D-bus interface" in udisks2).
-    // mknod creates device nodes directly without emitting udev events,
-    // so the desktop environment never learns about the new partitions.
+    // Use partx to add partitions.  `partx -a` works with the kernel directly,
+    // so it is safe even while udev exec-queue is stopped.
+    // Do NOT call `udevadm settle` here — the caller may have stopped udev.
     println!("Adding partitions for {} via partx...", disk_path);
     let _ = std::process::Command::new("partx")
         .args(&["-a", disk_path])
@@ -219,12 +218,9 @@ pub fn wait_for_partitions(disk_path: &str) -> Result<()> {
         .stderr(std::process::Stdio::null())
         .status();
 
-    // Wait for udev to create the device nodes
-    std::thread::sleep(std::time::Duration::from_secs(2));
-    let _ = std::process::Command::new("udevadm").arg("settle")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    // Poll for device nodes — partx adds them synchronously, so they should
+    // appear almost immediately.
+    std::thread::sleep(std::time::Duration::from_millis(500));
 
     if Path::new(&part1).exists() && Path::new(&part2).exists() {
         Ok(())
@@ -254,7 +250,11 @@ fn read_dev_major_minor(part_path: &str) -> Option<(u32, u32)> {
 ///
 /// `rm -f /dev/sdX1` bypasses udev and causes "No object for D-bus interface"
 /// errors in udisks2.  `partx -d` properly tells the kernel to remove partition
-/// nodes, which triggers udev "remove" events that udisks2 can react to.
+/// nodes.
+///
+/// NOTE: This function must NOT call `udevadm settle` — it is called while
+/// udev exec-queue is stopped (`--stop-exec-queue`).  `partx -d` works
+/// directly with the kernel and does not require udev.
 pub fn remove_partition_nodes(disk_path: &str) {
     let part1 = get_partition_name(disk_path, 1);
     let part2 = get_partition_name(disk_path, 2);
@@ -267,11 +267,7 @@ pub fn remove_partition_nodes(disk_path: &str) {
             .stderr(std::process::Stdio::null())
             .status();
 
-        // Let udev process the removal events
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        let _ = std::process::Command::new("udevadm").arg("settle")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        // Brief sleep to let the kernel finish removing nodes
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
 }

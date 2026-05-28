@@ -628,56 +628,59 @@ pub fn install_choosable(
     let zero_buf = vec![0u8; 64 * 512];
     disk.seek(SeekFrom::Start(0))?; disk.write_all(&zero_buf)?; disk.flush()?;
 
-    println!("Creating partition table...");
-    if use_gpt {
-        install_gpt_f(&mut disk, disk_path, size_bytes, reserve_space_mb, label, fs_type, secure_boot)?;
+    println!("Writing partition table and boot images...");
+    let part2_start_sector = if use_gpt {
+        write_gpt_f(&mut disk, disk_path, size_bytes, reserve_space_mb, secure_boot)?
     } else {
-        install_mbr_f(&mut disk, disk_path, size_bytes, reserve_space_mb, label, fs_type, secure_boot)?;
-    }
+        write_mbr_f(&mut disk, disk_path, size_bytes, reserve_space_mb, secure_boot)?
+    };
 
-    // Drop the disk handle before notifying kernel — an open write handle on
-    // the block device can prevent udev from processing partition changes.
     drop(disk);
-
-    // Force sync to disk
     let _ = std::process::Command::new("sync")
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
 
-    // Resume udev event processing now that every byte is on disk
+    // Resume udev event processing now that all raw disk writes are complete
     let _ = std::process::Command::new("udevadm")
         .args(&["control", "--start-exec-queue"])
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
 
-    // Let the kernel re-read the partition table
+    // Let the kernel re-read the partition table and create device nodes
     let _ = std::process::Command::new("partprobe").arg(disk_path)
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    std::thread::sleep(std::time::Duration::from_secs(1));
     let _ = std::process::Command::new("udevadm").arg("settle")
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
 
-    // Add partition device nodes via kernel (udev-aware)
+    // Remove old nodes and add new ones via kernel (udev-aware)
+    checks::remove_partition_nodes(disk_path);
     let _ = std::process::Command::new("partx").args(&["-a", disk_path])
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+    std::thread::sleep(std::time::Duration::from_millis(500));
 
-    // Trigger a "change" event on the parent disk only — udisks2 will
-    // discover every partition at once and create D-Bus objects for them.
-    let _ = std::process::Command::new("udevadm")
-        .args(&["trigger", "--action=change", "--name-match", disk_path])
-        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+    // Format partitions (udev-aware; will fire change events, but that's fine
+    // now that udev is running)
+    let part1 = get_partition_name(disk_path, 1);
+    format_partition(&part1, label, fs_type)?;
+    format_efi_partition(disk_path, 2)?;
 
-    std::thread::sleep(std::time::Duration::from_secs(5));
-    let _ = std::process::Command::new("udevadm").arg("settle")
-        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+    // Write EFI bootloader into partition 2
+    write_efi_bootloader(disk_path, part2_start_sector)?;
 
-    let _ = std::process::Command::new("sync")
-        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+    if !secure_boot {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        process_secure_boot_esp(disk_path, part2_start_sector, false)?;
+    }
+
+    notify_kernel(disk_path);
 
     println!();
     println!("\x1b[32mChoosable installed successfully to {}.\x1b[0m", disk_path);
     Ok(())
 }
 
-fn install_mbr_f(disk: &mut std::fs::File, disk_path: &str, disk_size_bytes: u64, reserve_space_mb: u64, label: &str, fs_type: FilesystemType, secure_boot: bool) -> Result<()> {
+/// Write MBR partition table, boot code, GUID, and Stage 2 — raw disk only.
+/// Returns part2 start offset in bytes.
+fn write_mbr_f(disk: &mut std::fs::File, _disk_path: &str, disk_size_bytes: u64, reserve_space_mb: u64, _secure_boot: bool) -> Result<u64> {
     let total_sectors = disk_size_bytes / SECTOR_SIZE;
     let efi_part_sectors = CHOOSABLE_EFI_PART_SIZE / SECTOR_SIZE;
     let part1_start = CHOOSABLE_PART1_START_SECTOR;
@@ -740,28 +743,12 @@ fn install_mbr_f(disk: &mut std::fs::File, disk_path: &str, disk_size_bytes: u64
     disk.write_all(&core[..core_len])?;
     disk.flush()?;
 
-    // ── Phase 2: Create partition devices ─────────────────────────────
-    checks::remove_partition_nodes(disk_path);
-    checks::wait_for_partitions(disk_path)?;
-
-    // Zero-clear EFI partition area (32 sectors) then format
-    zero_efi_partition(disk_path, part2_start)?;
-    format_efi_partition(disk_path, 2)?;
-
-    let part1 = get_partition_name(disk_path, 1);
-    format_partition(&part1, label, fs_type)?;
-
-    // ── Phase 3: Write EFI bootloader into partition 2 ────────────────
-    write_efi_bootloader(disk_path, part2_start * SECTOR_SIZE)?;
-
-    if !secure_boot {
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        process_secure_boot_esp(disk_path, part2_start * SECTOR_SIZE, false)?;
-    }
-    Ok(())
+    Ok(part2_start * SECTOR_SIZE)
 }
 
-fn install_gpt_f(disk: &mut std::fs::File, disk_path: &str, disk_size_bytes: u64, reserve_space_mb: u64, label: &str, fs_type: FilesystemType, secure_boot: bool) -> Result<()> {
+/// Write GPT partition table, boot code, GUID, and Stage 2 — raw disk only.
+/// Returns part2 start offset in bytes.
+fn write_gpt_f(disk: &mut std::fs::File, _disk_path: &str, disk_size_bytes: u64, reserve_space_mb: u64, _secure_boot: bool) -> Result<u64> {
     let efi_part_sectors = CHOOSABLE_EFI_PART_SIZE / SECTOR_SIZE;
     let total_sectors = disk_size_bytes / SECTOR_SIZE;
     let part2_end = total_sectors - 34;
@@ -811,25 +798,7 @@ fn install_gpt_f(disk: &mut std::fs::File, disk_path: &str, disk_size_bytes: u64
     disk.write_all(&boot_img[..boot_code_len])?;
     disk.flush()?;
 
-    // ── Phase 2: Create partition devices ─────────────────────────────
-    checks::remove_partition_nodes(disk_path);
-    checks::wait_for_partitions(disk_path)?;
-
-    // Zero-clear EFI partition area (32 sectors) then format
-    zero_efi_partition(disk_path, part2_start)?;
-    format_efi_partition(disk_path, 2)?;
-
-    let part1 = get_partition_name(disk_path, 1);
-    format_partition(&part1, label, fs_type)?;
-
-    // ── Phase 3: Write EFI bootloader into partition 2 ────────────────
-    write_efi_bootloader(disk_path, part2_start * SECTOR_SIZE)?;
-
-    if !secure_boot {
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        process_secure_boot_esp(disk_path, part2_start * SECTOR_SIZE, false)?;
-    }
-    Ok(())
+    Ok(part2_start * SECTOR_SIZE)
 }
 
 // ─── Helper utilities ────────────────────────────────────────────────────
