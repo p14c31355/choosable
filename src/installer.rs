@@ -173,9 +173,20 @@ pub fn non_destructive_install(disk_path: &str, label: &str, fs_type: Filesystem
     // and install the bootloader.  If udev fires in the middle it will
     // see a half-initialised state and produce "No object for D-bus
     // interface" errors.
+    struct UdevGuard;
+    impl Drop for UdevGuard {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("udevadm")
+                .args(&["control", "--start-exec-queue"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
     let _ = std::process::Command::new("udevadm")
         .args(&["control", "--stop-exec-queue"])
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+    let _udev_guard = UdevGuard;
 
     println!("Writing partition table with new CZBLEFI partition...");
     update_partition_table(disk_path, &mbr, is_gpt, size_bytes, part2_start_sector)?;
