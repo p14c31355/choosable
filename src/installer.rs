@@ -528,19 +528,27 @@ fn notify_kernel_before_udev(disk_path: &str) {
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
 }
 
-/// Udev-side notification (trigger + settle).
+/// Udev-side notification (sync + settle — no trigger).
 /// Called AFTER udev is resumed so that udisks2 can pick up the final state.
-fn notify_kernel_after_udev(disk_path: &str) {
-    // Trigger a "change" event on the parent disk so that udisks2
-    // re-reads the partition table and creates D-Bus objects for every
-    // partition at once.  Per-partition triggers are NOT used because
-    // they race with desktop auto-mount.
-    let _ = std::process::Command::new("udevadm")
-        .args(&["trigger", "--action=change", "--name-match", disk_path])
+///
+/// IMPORTANT: We do NOT call `udevadm trigger --action=change` on the parent
+/// disk.  Doing so forces udev to re-read the partition table and emit
+/// synthetic remove/add events for every partition.  udisks2 then drops and
+/// recreates its D-Bus objects, causing "No object for D-bus interface"
+/// errors from any in-flight desktop component (file manager, auto-mount).
+///
+/// Instead we rely on the natural event flow:
+///   1. Partition table changes were queued while udev was stopped.
+///   2. When udev resumes (--start-exec-queue), it processes those events.
+///   3. Filesystem changes (mkfs, FAT writes) generate their own uevents.
+///   4. `udevadm settle` waits for all queued events to be processed.
+///
+/// A simple sync + settle is all that's needed.
+fn notify_kernel_after_udev(_disk_path: &str) {
+    let _ = std::process::Command::new("sync")
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
 
-    // Wait for udev + udisks2 to finish processing
-    std::thread::sleep(std::time::Duration::from_secs(3));
+    // Wait for udev + udisks2 to finish processing any queued events
     let _ = std::process::Command::new("udevadm").arg("settle")
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
 }
