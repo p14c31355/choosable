@@ -1036,6 +1036,13 @@ pub fn update_choosable(disk_path: &str, secure_boot: Option<bool>, yes: bool) -
         if answer.trim().to_lowercase() != "y" { println!("Aborted."); return Ok(()); }
     }
 
+    // Stop udev while we write boot code, stage2, EFI bootloader and fix
+    // GPT attributes.  If udev fires in the middle it will see a
+    // half-updated state and produce "No object for D-bus interface" errors.
+    let _ = std::process::Command::new("udevadm")
+        .args(&["control", "--stop-exec-queue"])
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+
     let part2_start = part2_start.unwrap();
     let mut disk = open_disk_readwrite(disk_path)?;
 
@@ -1070,19 +1077,16 @@ pub fn update_choosable(disk_path: &str, secure_boot: Option<bool>, yes: bool) -
 
     disk.seek(SeekFrom::Start(2040 * 512))?; disk.write_all(&rsv_data)?;
     disk.flush()?;
-
-    // Drop the disk handle so that udev can process partition changes
-    // without an open write handle on the block device.
     drop(disk);
 
-    // Sync pending writes to disk
     let _ = std::process::Command::new("sync")
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
 
     write_efi_bootloader(disk_path, part2_start)?;
 
     if !use_secure_boot {
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        // Safe while udev is stopped — operates on the already-formatted
+        // FAT filesystem.
         process_secure_boot_esp(disk_path, part2_start, false)?;
     }
 
@@ -1090,7 +1094,19 @@ pub fn update_choosable(disk_path: &str, secure_boot: Option<bool>, yes: bool) -
         fix_gpt_attributes(disk_path)?;
     }
 
-    notify_kernel(disk_path);
+    // All disk writes are complete.  Re-read kernel partition table,
+    // then resume udev so that udisks2 sees the final consistent state.
+    let _ = std::process::Command::new("sync")
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+    notify_kernel_before_udev(disk_path);
+
+    // Resume udev event processing now.
+    let _ = std::process::Command::new("udevadm")
+        .args(&["control", "--start-exec-queue"])
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+
+    // Trigger change events and let udisks2 pick up the final state.
+    notify_kernel_after_udev(disk_path);
 
     println!();
     println!("\x1b[32mChoosable updated successfully on {}.\x1b[0m", disk_path);

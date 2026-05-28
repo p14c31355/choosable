@@ -189,154 +189,181 @@ fn build_mbr_boot_sector() -> Vec<u8> {
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn build_stage2_binary(kernel: &[u8]) -> Vec<u8> {
+    // Layout (physical addresses, stage2 loaded at 0x7E00):
+    //  offset 0x000 – 0x0?? : 16-bit real-mode entry
+    //  offset 0x120         : GDT pseudo-descriptor (limit + base)
+    //  offset 0x126         : GDT entries (5 × 8 = 40 bytes → ends at 0x14E)
+    //  0x14E+               : 32-bit protected mode code (calculated dynamically)
+    //  offset 0x200         : PML4 (page-aligned, zeroed by code)
+    //  offset 0x400         : PDPT
+    //  offset 0x600         : PD
+    //  offset 0x2000        : kernel flat binary
+    // ────────────────────────────────────────────────────────────────
+    // The GDT pseudo-descriptor and entries are placed at fixed offsets
+    // so the 16-bit real-mode code can refer to them by absolute address.
+    // The 32-bit code MUST come immediately AFTER the GDT entries because
+    // we emit GDT first (fixed offsets), then 32-bit code, then page tables,
+    // then kernel.  The 16-bit entry calculates the 32-bit entry point as
+    //   prot_entry = 0x7E00 + (current offset right after GDT entries).
+    //
+    // In 32-bit protected mode there is NO 0x66 prefix — the default
+    // operand size in a 32-bit code segment is 32 bits.  Adding 0x66
+    // would switch the instruction to 16-bit operands, which is wrong.
+    // ────────────────────────────────────────────────────────────────
+
     let mut c = CodeBuf::new();
 
-    // ── 16-bit real mode entry (0x7E00) ────────────────────────────
+    // ── 16-bit real mode entry (phys 0x7E00) ───────────────────────
     c.cli();
     c.mov_mem8_dl(0x7DFE); // save disk number
-
-    // Enable A20
+    // Enable A20 (keyboard controller method — safe, no INT 15h needed)
     c.mov_al(0xD1); c.emit(0xE6).emit(0x64);
     c.mov_al(0xDF); c.emit(0xE6).emit(0x60);
 
-    // Load 32-bit GDT, enter protected mode
-    let prot_entry = 0x7E00u32 + STAGE2_PROT_OFFSET as u32;
-    c.lgdt_mem16(0x7E00 + STAGE2_GDT_PTR_OFF);
-    c.mov_eax_cr0(); c.or_eax_imm32(1); c.mov_cr0_eax();
-    c.jmp_far32(0x08, prot_entry);
-
-    // ── GDT descriptor (at offset STAGE2_GDT_PTR_OFF) ──────────────
+    // ── GDT pseudo-descriptor (must be at STAGE2_GDT_PTR_OFF) ──────
     while c.offset() < STAGE2_GDT_PTR_OFF { c.emit(0x90); }
-    c.emit16(5 * 8 - 1); // limit
+    c.emit16(5 * 8 - 1);                         // limit
     c.emit32(0x7E00 + STAGE2_GDT_ENTS_OFF as u32); // base
 
-    // ── GDT entries (at STAGE2_GDT_ENTS_OFF) ───────────────────────
+    // ── GDT entries (at STAGE2_GDT_ENTS_OFF) ────────────────────────
     while c.offset() < STAGE2_GDT_ENTS_OFF { c.emit(0x00); }
-    // [0] null
+    // [0] null descriptor
     c.emit32(0); c.emit32(0);
-    // [1] 32-bit code (sel 0x08): base=0, limit=4GB, D=1
-    c.emit16(0xFFFF); c.emit16(0); c.emit(0); c.emit(0x9A); c.emit(0xCF); c.emit(0);
-    // [2] 32-bit data (sel 0x10): base=0, limit=4GB
-    c.emit16(0xFFFF); c.emit16(0); c.emit(0); c.emit(0x92); c.emit(0xCF); c.emit(0);
-    // [3] 64-bit code (sel 0x18): L=1, D=0
-    c.emit16(0); c.emit16(0); c.emit(0); c.emit(0x9A); c.emit(0x20); c.emit(0);
-    // [4] 64-bit data (sel 0x20)
-    c.emit16(0); c.emit16(0); c.emit(0); c.emit(0x92); c.emit(0); c.emit(0);
+    // [1] 32-bit code (selector 0x08): base=0, limit=4 GiB, D=1
+    c.emit16(0xFFFF); c.emit16(0x0000); c.emit(0x00); c.emit(0x9A); c.emit(0xCF); c.emit(0x00);
+    // [2] 32-bit data (selector 0x10): base=0, limit=4 GiB, writable
+    c.emit16(0xFFFF); c.emit16(0x0000); c.emit(0x00); c.emit(0x92); c.emit(0xCF); c.emit(0x00);
+    // [3] 64-bit code (selector 0x18): L=1, D=0
+    c.emit16(0x0000); c.emit16(0x0000); c.emit(0x00); c.emit(0x9A); c.emit(0x20); c.emit(0x00);
+    // [4] 64-bit data (selector 0x20)
+    c.emit16(0x0000); c.emit16(0x0000); c.emit(0x00); c.emit(0x92); c.emit(0x00); c.emit(0x00);
 
-    // ── 32-bit protected mode entry ────────────────────────────────
-    while c.offset() < STAGE2_PROT_OFFSET { c.emit(0x90); }
+    // ── 32-bit protected mode entry (immediately after GDT entries) ─
+    // Record the physical address so the 16-bit code can far-jump here.
+    let prot32_phys = 0x7E00u32 + c.offset() as u32;
 
-    // Setup 32-bit data segments
-    c.emit(0x66).emit(0xB8).emit16(0x10); // MOV EAX, 0x10
-    c.emit(0x8E).emit(0xD8); c.emit(0x8E).emit(0xC0); // MOV DS/ES, AX
-    c.emit(0x8E).emit(0xE0); c.emit(0x8E).emit(0xE8); // MOV FS/GS, AX
-    c.emit(0x8E).emit(0xD0); // MOV SS, AX
-    c.emit(0x66).emit(0xBC).emit32(0x0008_0000u32); // MOV ESP, 0x80000
+    // Back in the 16-bit code: load GDT, set PE, far-jump to prot32
+    // (We insert this BEFORE the 16-bit code that is already emitted,
+    //  so we use a branch-past pattern.  Instead, we just write the
+    //  LGDT / MOV CR0 / JMP FAR *here* because the 16-bit code hasn't
+    //  been fully emitted yet — the GDT is written, but the far jump
+    //  target wasn't known until now.  We'll patch the jmp_far32 into
+    //  its correct position in the 16-bit preamble.)
 
-    // Build page tables: identity-map first 1GB with 2MB huge pages
-    // PML4, PDPT, PD are at fixed offsets in this binary
-    // They must be page-aligned in physical memory.
-    // Since stage2 loaded at 0x7E00, offsets 0x200/0x400/0x600 → phys 0x8000/0x8200/0x8400
+    // Rewind: the 16-bit preamble (CLI … enable A20) is already in
+    // `c.bytes`.  Now we append LGDT + PE enable + far-jump right after
+    // the existing 16-bit code, using `prot32_phys` which is now known.
+    let preamble_len = c.offset();
+
+    // Build the 32-bit trampoline at the current position.
+    // ── setup segments ──────────────────────────────────────────────
+    // MOV EAX, 0x10  (B8 10 00 00 00)  -- no 0x66, default 32-bit
+    c.emit(0xB8).emit32(0x10);
+    // MOV DS, AX   (8E D8)
+    c.emit(0x8E).emit(0xD8);
+    // MOV ES, AX   (8E C0)
+    c.emit(0x8E).emit(0xC0);
+    // MOV FS, AX   (8E E0)
+    c.emit(0x8E).emit(0xE0);
+    // MOV GS, AX   (8E E8)
+    c.emit(0x8E).emit(0xE8);
+    // MOV SS, AX   (8E D0)
+    c.emit(0x8E).emit(0xD0);
+    // MOV ESP, 0x80000  (BC 00 00 08 00)
+    c.emit(0xBC).emit32(0x0008_0000u32);
+
+    // ── build page tables ───────────────────────────────────────────
+    // PML4 at phys 0x8000 (binary offset 0x200)
     let pml4_phys: u32 = 0x8000;
     let pdpt_phys: u32 = 0x8200;
-    let pd_phys: u32 = 0x8400;
-    let stage2_base: u32 = 0x7E00;
+    let pd_phys: u32   = 0x8400;
 
-    // Zero PML4: 4096 bytes. Use ECX=1024, EDI=pml4, EAX=0, STOSD
-    c.emit(0x66).emit(0xBF).emit32(pml4_phys); // MOV EDI, pml4_phys
-    c.emit(0x66).emit(0xB9).emit32(1024);       // MOV ECX, 1024
-    c.emit(0x66).emit(0x31).emit(0xC0);         // XOR EAX, EAX
-    let zloop = c.label() as usize;
-    c.emit(0x66).emit(0xAB);                    // STOSD
-    c.emit(0x66).emit(0x49);                    // DEC ECX
-    let zjnz = c.offset(); c.emit(0x75).emit(0x00);
-    c.bytes[zjnz as usize+1] = (zloop as i32 - zjnz as i32 - 2) as i8 as u8;
+    // Zero PML4 (EDI = pml4_phys, ECX = 1024, EAX = 0, REP STOSD)
+    c.emit(0xBF).emit32(pml4_phys);       // MOV EDI, pml4_phys
+    c.emit(0xB9).emit32(1024);             // MOV ECX, 1024
+    c.emit(0x31).emit(0xC0);               // XOR EAX, EAX
+    let z1 = c.offset() as usize;
+    c.emit(0xAB);                          // STOSD
+    c.emit(0x49);                          // DEC ECX
+    let z1j = c.offset(); c.emit(0x75).emit(0x00);
+    c.bytes[z1j as usize+1] = (z1 as u32).wrapping_sub(z1j as u32).wrapping_sub(2) as u8;
 
     // Zero PDPT
-    c.emit(0x66).emit(0xBF).emit32(pdpt_phys);
-    c.emit(0x66).emit(0xB9).emit32(1024);
-    c.emit(0x66).emit(0x31).emit(0xC0);
-    let z2l = c.label() as usize;
-    c.emit(0x66).emit(0xAB); c.emit(0x66).emit(0x49);
+    c.emit(0xBF).emit32(pdpt_phys);
+    c.emit(0xB9).emit32(1024);
+    c.emit(0x31).emit(0xC0);
+    let z2 = c.offset() as usize;
+    c.emit(0xAB); c.emit(0x49);
     let z2j = c.offset(); c.emit(0x75).emit(0x00);
-    c.bytes[z2j as usize+1] = (z2l as i32 - z2j as i32 - 2) as i8 as u8;
+    c.bytes[z2j as usize+1] = (z2 as u32).wrapping_sub(z2j as u32).wrapping_sub(2) as u8;
 
-    // Set PML4[0] = pdpt_phys | 0x03 (present, writable)
-    c.emit(0x66).emit(0xC7).emit(0x05).emit32(pml4_phys).emit32(pdpt_phys | 0x03);
+    // PML4[0] = pdpt_phys | 0x03
+    c.emit(0xC7).emit(0x05).emit32(pml4_phys).emit32(pdpt_phys | 0x03);
 
-    // Set PDPT[0] = pd_phys | 0x03
-    c.emit(0x66).emit(0xC7).emit(0x05).emit32(pdpt_phys).emit32(pd_phys | 0x03);
+    // PDPT[0] = pd_phys | 0x03
+    c.emit(0xC7).emit(0x05).emit32(pdpt_phys).emit32(pd_phys | 0x03);
 
-    // Fill PD with 512 2MB entries: PD[i] = (i * 2MB) | 0x83 (present, writable, huge)
-    c.emit(0x66).emit(0xBF).emit32(pd_phys);      // MOV EDI, pd_phys
-    c.emit(0x66).emit(0xB9).emit32(512);           // MOV ECX, 512
-    c.emit(0x66).emit(0x31).emit(0xF6);            // XOR ESI, ESI (counter = 0)
-    let fllll = c.label() as usize;
-    // EAX = ESI * 0x200000 | 0x83
-    c.emit(0x66).emit(0x89).emit(0xF0);            // MOV EAX, ESI
-    // Shift left 21 (multiply by 2MB): SHL EAX, 21
-    c.emit(0x66).emit(0xC1).emit(0xE0).emit(21);   // SHL EAX, 21
-    c.emit(0x66).emit(0x83).emit(0xC8).emit(0x83); // OR EAX, 0x83
-    // STOSD to [EDI] (writes EAX), EDI+=4
-    c.emit(0x66).emit(0xAB);                        // STOSD
-    // Upper 32 bits = 0, STOSD again
-    c.emit(0x66).emit(0x31).emit(0xC0);            // XOR EAX, EAX
-    c.emit(0x66).emit(0xAB);                        // STOSD
-    c.emit(0x66).emit(0x46);                        // INC ESI
-    c.emit(0x66).emit(0x49);                        // DEC ECX
-    let fjnz = c.offset(); c.emit(0x75).emit(0x00);
-    c.bytes[fjnz as usize+1] = (fllll as i32 - fjnz as i32 - 2) as i8 as u8;
+    // Fill PD with 512 × 2 MiB entries: PD[i] = (i*2MB) | 0x83
+    c.emit(0xBF).emit32(pd_phys);           // MOV EDI, pd_phys
+    c.emit(0xB9).emit32(512);               // MOV ECX, 512
+    c.emit(0x31).emit(0xF6);                // XOR ESI, ESI
+    let fl = c.offset() as usize;
+    c.emit(0x89).emit(0xF0);                // MOV EAX, ESI
+    c.emit(0xC1).emit(0xE0).emit(21);       // SHL EAX, 21
+    c.emit(0x83).emit(0xC8).emit(0x83);     // OR EAX, 0x83
+    c.emit(0xAB);                            // STOSD (lo 32)
+    c.emit(0x31).emit(0xC0);                // XOR EAX, EAX
+    c.emit(0xAB);                            // STOSD (hi 32)
+    c.emit(0x46);                            // INC ESI
+    c.emit(0x49);                            // DEC ECX
+    let fj = c.offset(); c.emit(0x75).emit(0x00);
+    c.bytes[fj as usize+1] = (fl as u32).wrapping_sub(fj as u32).wrapping_sub(2) as u8;
 
-    // Enable PAE (CR4 bit 5)
-    c.emit(0x66).emit(0x0F).emit(0x20).emit(0xE0); // MOV EAX, CR4
-    c.emit(0x66).emit(0x83).emit(0xC8).emit(0x20);  // OR EAX, 0x20 (PAE bit)
-    c.emit(0x66).emit(0x0F).emit(0x22).emit(0xE0);  // MOV CR4, EAX
+    // Enable PAE (CR4.PAE = bit 5)
+    c.emit(0x0F).emit(0x20).emit(0xE0);     // MOV EAX, CR4
+    c.emit(0x83).emit(0xC8).emit(0x20);      // OR EAX, 0x20
+    c.emit(0x0F).emit(0x22).emit(0xE0);     // MOV CR4, EAX
 
-    // Load CR3 with PML4 address
-    c.emit(0x66).emit(0xB8).emit32(pml4_phys);      // MOV EAX, pml4
-    c.emit(0x0F).emit(0x22).emit(0xD8);              // MOV CR3, EAX
+    // Load CR3
+    c.emit(0xB8).emit32(pml4_phys);          // MOV EAX, pml4
+    c.emit(0x0F).emit(0x22).emit(0xD8);     // MOV CR3, EAX
 
-    // Enable EFER.LME (Long Mode Enable) via MSR 0xC0000080
-    c.emit(0x66).emit(0xB9).emit32(0xC000_0080u32); // MOV ECX, 0xC0000080
-    c.emit(0x0F).emit(0x32);                         // RDMSR (EDX:EAX = MSR[ECX])
-    c.emit(0x66).emit(0x83).emit(0xC8).emit(0x00);   // OR EAX, 0x100 (bit 8 = LME) ... wait, 0x100 doesn't fit in imm8
-    // OR EAX, 0x100 (32-bit)
-    c.emit(0x66).emit(0x0D).emit32(0x100);           // OR EAX, 0x100
-    c.emit(0x0F).emit(0x30);                         // WRMSR
+    // Enable EFER.LME via MSR 0xC0000080
+    c.emit(0xB9).emit32(0xC000_0080u32);     // MOV ECX, 0xC0000080
+    c.emit(0x0F).emit(0x32);                 // RDMSR
+    c.emit(0x0D).emit32(0x100);              // OR EAX, 0x100
+    c.emit(0x0F).emit(0x30);                 // WRMSR
 
-    // Enable paging (CR0.PG) while PE is already set
-    // CR0 |= 0x80000000 (PG bit)
+    // Enable paging (CR0.PG | CR0.PE) — PE already set
+    // CR0 |= 0x80000000
+    c.emit(0x0F).emit(0x20).emit(0xC0);     // MOV EAX, CR0
+    c.emit(0x0D).emit32(0x8000_0000u32);     // OR EAX, 0x80000000
+    c.emit(0x0F).emit(0x22).emit(0xC0);     // MOV CR0, EAX
+
+    // Far jump to 64-bit kernel entry (selector 0x18)
+    // We're in 32-bit compat mode.  Opcode EA + 32-bit offset + 16-bit sel
+    // is legal — offset truncated to 32 bits, which is fine since kernel < 4 GiB.
+    let kernel_phys = (0x7E00u64 + STAGE2_KERNEL_OFFSET as u64) as u32;
+    c.emit(0xEA).emit32(kernel_phys).emit16(0x18);
+
+    // ── Patch the 16-bit preamble to far-jump to the 32-bit code ────
+    // The 16-bit code occupies `c.bytes[0..preamble_len]`.
+    // We need to insert LGDT / MOV CR0 / JMP FAR32 right after the A20 enable.
+    // Save the 32-bit trampoline portion, put it aside, then rebuild
+    // the 16-bit preamble with the jump inserted.
+    let trampoline = c.bytes.split_off(preamble_len as usize);
+    // Now c.bytes contains only the 16-bit preamble + GDT.
+    // Append LGDT + PE + far-jump:
+    c.lgdt_mem16(0x7E00 + STAGE2_GDT_PTR_OFF);
     c.mov_eax_cr0();
-    c.emit(0x66).emit(0x0D).emit32(0x8000_0000u32); // OR EAX, 0x80000000
-    c.mov_cr0_eax();
+    c.or_eax_imm32(1);
+    c.mov_cr0_eax();                         // CR0.PE = 1 → protected mode
+    c.jmp_far32(0x08, prot32_phys);         // far jump to 32-bit selector + trampoline
 
-    // We are now in 32-bit compatibility mode (long mode active but in 32-bit code segment)
-    // Far jump to 64-bit code segment (selector 0x18) to enter full 64-bit long mode
-    let kernel_phys = 0x7E00u64 + STAGE2_KERNEL_OFFSET as u64;
-    // REX.W prefix (0x48) + EA (far JMP) → 0x48 0xEA
-    // Far JMP needs seg:offset in a specific format
-    // Actually, we need: JMP FAR 0x18:kernel_phys
-    // In 64-bit mode, far JMP is: REX.W + opcode + offset64 + segment16
-    // But we're still in 32-bit compat mode, so we use 66 EA (32-bit far jump)
-    // which in long mode interprets as a 64-bit offset.
-    // Wait, in 32-bit compat mode:
-    // - 66 EA xxx → far jmp with 16-bit offset? No, that's weird.
-    // Actually, the JMP FAR instruction in 32-bit mode:
-    //   Opcode EA followed by 32-bit offset and 16-bit selector.
-    // In long mode (which we just entered), a far JMP uses the REX.W prefix:
-    //   REX.W (48) + 66 (operand size override)? Actually it's just REX.W + EA.
-    // Let's use: FF /5 (JMP m16:64) - JMP far, absolute indirect
-    // Actually, simpler: use a data pointer at a known location and do JMP FAR [mem].
+    // Re-append the trampoline after the patched preamble.
+    c.bytes.extend_from_slice(&trampoline);
 
-    // Simplest approach: after CR0.PG, we're in 32-bit compat mode with paging.
-    // A 32-bit far jump (opcode EA) to selector 0x18 with the 64-bit offset
-    // should work because long mode is active and the target is in a 64-bit code segment.
-    // But the offset is truncated to 32 bits by the opcode.
-    // Since our kernel is at 0x9E00 (< 4GB), this is fine.
-    let kernel_phys_32 = kernel_phys as u32;
-    c.emit(0xEA).emit32(kernel_phys_32).emit16(0x18); // JMP FAR 0x18:kernel_phys
-
-    // ── Pad to STAGE2_KERNEL_OFFSET, then append kernel ────────────
+    // Pad to STAGE2_KERNEL_OFFSET, then append kernel flat binary.
     while (c.offset() as usize) < STAGE2_KERNEL_OFFSET { c.emit(0x00); }
     c.extend(kernel);
 
