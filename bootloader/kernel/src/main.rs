@@ -280,7 +280,10 @@ fn parse_exfat_vbr(part_start_lba: u32) -> Option<ExfatInfo> {
         return None;
     }
 
-    let sector_shift = buf[108]; // SectorsPerClusterShift (offset 108 in VBR)
+    let sector_shift = buf[109]; // SectorsPerClusterShift (offset 109 in VBR)
+    if sector_shift >= 25 {
+        return None;
+    }
     let cluster_count = u32::from_le_bytes([buf[92], buf[93], buf[94], buf[95]]);
     let fat_offset = u32::from_le_bytes([buf[80], buf[81], buf[82], buf[83]]);
     let fat_length = u32::from_le_bytes([buf[84], buf[85], buf[86], buf[87]]);
