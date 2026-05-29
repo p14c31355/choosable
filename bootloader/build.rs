@@ -42,9 +42,9 @@ pub const EFI_BIN: &[u8] = &{efi_bin:?};
     fs::write(&dest, &code).unwrap();
 
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=efi/src/main.rs");
+    println!("cargo:rerun-if-changed=efi/src/");
     println!("cargo:rerun-if-changed=efi/Cargo.toml");
-    println!("cargo:rerun-if-changed=kernel/src/main.rs");
+    println!("cargo:rerun-if-changed=kernel/src/");
     println!("cargo:rerun-if-changed=kernel/Cargo.toml");
 }
 
@@ -651,9 +651,11 @@ fn build_kernel_binary(out_dir: &PathBuf) -> Vec<u8> {
     println!("cargo:warning=Building kernel for x86_64-unknown-none...");
     let status = std::process::Command::new("cargo")
         .args(&["build", "--target", "x86_64-unknown-none", "--release"])
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .env(
             "RUSTFLAGS",
-            "-C link-arg=-Ttext=0x100000 -C relocation-model=static -C code-model=small",
+            "-C link-arg=--image-base=0x100000 -C link-arg=-no-pie -C link-arg=-Ttext=0x100000 -C relocation-model=static",
         )
         .arg("--target-dir")
         .arg(&ktarget)
