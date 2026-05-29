@@ -1,359 +1,312 @@
 // ═══════════════════════════════════════════════════════════════════════════
-//  ISO El Torito Boot Record parser + UEFI → real mode chainloader
+//  ISO9660 directory parser + UEFI chainloader
 // ═══════════════════════════════════════════════════════════════════════════
 //
-//  All mode-switch code is pre-encoded as const byte arrays and copied
-//  to low physical memory before ExitBootServices.  The single #[naked]
-//  function does only CLI + LGDT + retfq.
+//  On pure UEFI systems (no CSM), the BIOS El Torito boot image cannot work
+//  (no INT 13h, no legacy CD emulation).  The correct path is:
+//    1. Parse ISO9660 Primary Volume Descriptor → get root directory
+//    2. Walk /EFI/BOOT/ → find BOOTX64.EFI
+//    3. Read it into a contiguous buffer
+//    4. Call LoadImage() + StartImage()
 
-use core::arch::naked_asm;
 use core::ffi::c_void;
 
 use crate::disk::read_sector;
 use crate::fs::{IsoEntry, FsCtx};
 use crate::output::{die, format_u64_buf, halt_or_reboot, print_raw};
 use crate::protocol::{
-    AllocateType, BlockIoProtocol, BootServices, MemoryDescriptor, MemoryType, SystemTable,
-    EFI_SUCCESS,
+    AllocateType, BlockIoProtocol, BootServices, MemoryType, SystemTable,
+    DevicePathProtocol, EFI_SUCCESS,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  GDT (3 entries)
+//  ISO9660 on-disk structures
 // ═══════════════════════════════════════════════════════════════════════════
 
-const GDT_NULL: u64   = 0x0000000000000000;
-const GDT_CODE32: u64 = 0x00CF9A000000FFFF; // D=1, L=0, G=1 → 4 GiB, 32-bit
-const GDT_CODE16: u64 = 0x00009A000000FFFF; // D=0, L=0, G=0 → 64 KiB, 16-bit
-
-#[repr(C, align(8))]
-struct GdtTable([u64; 3]);
-
-#[used]
-#[link_section = ".rodata"]
-static GDT: GdtTable = GdtTable([GDT_NULL, GDT_CODE32, GDT_CODE16]);
-
+/// ISO9660 directory record (variable-length, minimum 34 bytes)
 #[repr(C, packed)]
-struct Gdtr { limit: u16, base: u64 }
+struct DirRecordHdr {
+    len: u8,
+    ext_attr_len: u8,
+    extent: [u8; 8],
+    size: [u8; 8],
+    _date: [u8; 7],
+    flags: u8,
+    _unit_size: u8,
+    _gap_size: u8,
+    _vol_seq: [u8; 4],
+    name_len: u8,
+}
 
-#[used]
-#[link_section = ".data"]
-static mut GDTR: Gdtr = Gdtr { limit: 0, base: 0 };
+fn extent_le(extent: &[u8; 8]) -> u32 {
+    u32::from_le_bytes([extent[0], extent[1], extent[2], extent[3]])
+}
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  Mode-switch bytecode (32-bit, copied to 0x0500)
-// ═══════════════════════════════════════════════════════════════════════════
-//
-//    mov   eax, cr0
-//    and   eax, 0x7FFFFFFF       ; clear PG
-//    mov   cr0, eax
-//    mov   eax, cr3
-//    mov   cr3, eax              ; flush TLB
-//    mov   eax, cr4
-//    and   eax, ~0x20            ; clear PAE
-//    mov   cr4, eax
-//    mov   ecx, 0xC0000080
-//    rdmsr
-//    and   eax, ~0x100           ; clear LME
-//    wrmsr
-//    jmpf  0x0010:0x00000600
+fn size_le(size: &[u8; 8]) -> u32 {
+    u32::from_le_bytes([size[0], size[1], size[2], size[3]])
+}
 
-const MODE_SWITCH: [u8; 49] = [
-    0x0F, 0x20, 0xC0,                   // mov eax, cr0
-    0x25, 0xFF, 0xFF, 0xFF, 0x7F,       // and eax, 0x7FFFFFFF
-    0x0F, 0x22, 0xC0,                   // mov cr0, eax
-    0x0F, 0x20, 0xD8,                   // mov eax, cr3
-    0x0F, 0x22, 0xD8,                   // mov cr3, eax
-    0x0F, 0x20, 0xE0,                   // mov eax, cr4
-    0x25, 0xDF, 0xFF, 0xFF, 0xFF,       // and eax, ~0x20
-    0x0F, 0x22, 0xE0,                   // mov cr4, eax
-    0xB9, 0x80, 0x00, 0x00, 0xC0,       // mov ecx, 0xC0000080
-    0x0F, 0x32,                         // rdmsr
-    0x25, 0xFF, 0xFE, 0xFF, 0xFF,       // and eax, ~0x100
-    0x0F, 0x30,                         // wrmsr
-    0xEA,
-    0x00, 0x06, 0x00, 0x00,
-    0x10, 0x00,
-];
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  TRAMP_A (16-bit protected-mode, copied to 0x0600)
-// ═══════════════════════════════════════════════════════════════════════════
-//
-//    mov   eax, cr0
-//    and   eax, ~1                 ; clear PE
-//    mov   cr0, eax
-//    jmpf  0x0000:0x0614
-
-const TRAMP_A: [u8; 17] = [
-    0x66, 0x0F, 0x20, 0xC0,
-    0x66, 0x83, 0xE0, 0xFE,
-    0x66, 0x0F, 0x22, 0xC0,
-    0xEA,
-    0x14, 0x06,
-    0x00, 0x00,
-];
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  TRAMP_B (real-mode, copied to 0x0614)
-// ═══════════════════════════════════════════════════════════════════════════
-//
-//    mov   ax, 0
-//    mov   ds, ax
-//    mov   es, ax
-//    mov   fs, ax
-//    mov   gs, ax
-//    mov   ss, ax
-//    mov   sp, 0x7000
-//    sti
-//    mov   dl, 0x80
-//    jmpf  0x0000:0x7C00
-
-const TRAMP_B: [u8; 24] = [
-    0xB8, 0x00, 0x00,
-    0x8E, 0xD8,
-    0x8E, 0xC0,
-    0x8E, 0xE0,
-    0x8E, 0xE8,
-    0x8E, 0xD0,
-    0xBC, 0x00, 0x70,
-    0xFB,
-    0xB2, 0x80,
-    0xEA, 0x00, 0x7C, 0x00, 0x00,
-];
-
-/// Copy all trampoline bytecodes to low memory.
-/// Must be called **before** ExitBootServices.
-fn copy_trampolines() {
-    unsafe {
-        // Initialise GDTR
-        GDTR = Gdtr {
-            limit: (core::mem::size_of::<GdtTable>() - 1) as u16,
-            base: &GDT as *const GdtTable as u64,
-        };
-        // Copy code
-        core::slice::from_raw_parts_mut(0x0500 as *mut u8, MODE_SWITCH.len())
-            .copy_from_slice(&MODE_SWITCH);
-        core::slice::from_raw_parts_mut(0x0600 as *mut u8, TRAMP_A.len())
-            .copy_from_slice(&TRAMP_A);
-        core::slice::from_raw_parts_mut(0x0614 as *mut u8, TRAMP_B.len())
-            .copy_from_slice(&TRAMP_B);
+/// Read one 2048-byte ISO logical sector (4 × 512-byte disk sectors)
+fn read_iso_sector(
+    bio_ref: &BlockIoProtocol,
+    bio_ptr: *mut BlockIoProtocol,
+    mid: u32,
+    iso_lba: u64,
+    sector: u32,
+    buf: &mut [u8; 2048],
+) -> bool {
+    let disk_lba = iso_lba + sector as u64 * 4;
+    for i in 0..4usize {
+        let mut sec = [0u8; 512];
+        if !read_sector(bio_ref, bio_ptr, mid, disk_lba + i as u64, &mut sec) {
+            return false;
+        }
+        buf[i * 512..(i + 1) * 512].copy_from_slice(&sec);
     }
+    true
+}
+
+/// Read any size extent (LBA + byte length) into a heap buffer.
+/// Caller must call `bs.free_pool` to release the allocation.
+fn read_extent(
+    bs: &mut BootServices,
+    bio_ref: &BlockIoProtocol,
+    bio_ptr: *mut BlockIoProtocol,
+    mid: u32,
+    iso_lba: u64,
+    lba: u32,
+    byte_len: u32,
+) -> Option<(*mut u8, u32)> {
+    let sector_count = ((byte_len as u64 + 2047) / 2048) as u32;
+    let buf_len = sector_count as usize * 2048;
+
+    let mut ptr: *mut u8 = core::ptr::null_mut();
+    // AllocatePool is at offset 0x040, but we use raw pointer cast:
+    // EFI AllocatePool returns EFI_SUCCESS on success.
+    let status = unsafe {
+        let allocate_pool: unsafe extern "efiapi" fn(u32, usize, *mut *mut c_void) -> usize =
+            core::mem::transmute(bs.allocate_pool);
+        allocate_pool(1 /* EfiLoaderData */, buf_len, &mut ptr as *mut _ as _)
+    };
+    if status != EFI_SUCCESS || ptr.is_null() {
+        return None;
+    }
+
+    let mut offset: usize = 0;
+    for s in 0..sector_count {
+        let mut iso_sec = [0u8; 2048];
+        if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, lba + s, &mut iso_sec) {
+            unsafe { (bs.free_pool)(ptr as _); }
+            return None;
+        }
+        let to_copy = if offset + 2048 > buf_len { buf_len - offset } else { 2048 };
+        unsafe {
+            core::ptr::copy_nonoverlapping(iso_sec.as_ptr(), ptr.add(offset), to_copy);
+        }
+        offset += to_copy;
+    }
+    Some((ptr, byte_len.min(buf_len as u32)))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Mode-switch entry (naked function)
+//  ISO9660 directory walker
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[unsafe(naked)]
-unsafe extern "C" fn jump_to_real_mode() -> ! {
-    naked_asm!(
-        "cli",
-        "lgdt [rip + {gdtr}]",
-        "mov rax, 0x0500",
-        "push 0x08",
-        "push rax",
-        "retfq",
-        gdtr = sym GDTR,
-    )
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  El Torito parser
-// ═══════════════════════════════════════════════════════════════════════════
-
-fn parse_el_torito(
+/// Get root directory record from the Primary Volume Descriptor (sector 16).
+fn get_root_dir(
     st: &mut SystemTable,
     bio_ref: &BlockIoProtocol,
     bio_ptr: *mut BlockIoProtocol,
     mid: u32,
     iso_lba: u64,
-) -> Option<(u32, u16)> {
-    let boot_rec_lba = iso_lba + 17 * 4;
-    let mut boot_rec = [0u8; 512];
-    if !read_sector(bio_ref, bio_ptr, mid, boot_rec_lba, &mut boot_rec) {
-        print_raw(st, b"Failed to read Boot Record.\r\n\0");
+) -> Option<(u32, u32)> {
+    let mut pvd = [0u8; 2048];
+    if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, 16, &mut pvd) {
+        print_raw(st, b"Failed to read ISO PVD.\r\n\0");
         return None;
     }
-    if &boot_rec[1..6] != b"CD001" {
-        print_raw(st, b"Invalid Boot Record.\r\n\0");
+    if pvd[0] != 1 || &pvd[1..6] != b"CD001" {
+        print_raw(st, b"Invalid ISO PVD signature.\r\n\0");
         return None;
     }
+    // Root directory record at offset 156 in PVD
+    let hdr: &DirRecordHdr = unsafe { &*(pvd[156..].as_ptr() as *const DirRecordHdr) };
+    Some((extent_le(&hdr.extent), size_le(&hdr.size)))
+}
 
-    let catalog_iso_lba =
-        u32::from_le_bytes([boot_rec[0x47], boot_rec[0x48], boot_rec[0x49], boot_rec[0x4A]]);
-    let catalog_lba = iso_lba + catalog_iso_lba as u64 * 4;
-
-    let mut catalog = [0u8; 512];
-    if !read_sector(bio_ref, bio_ptr, mid, catalog_lba, &mut catalog) {
-        print_raw(st, b"Failed to read Boot Catalog.\r\n\0");
-        return None;
-    }
-
-    let mut best: Option<(u32, u16)> = None;
-    for i in 0..16 {
-        let off = i * 32;
-        match catalog[off] {
-            0x88 => {
-                let count = u16::from_le_bytes([catalog[off + 6], catalog[off + 7]]);
-                let lba = u32::from_le_bytes([
-                    catalog[off + 8],
-                    catalog[off + 9],
-                    catalog[off + 10],
-                    catalog[off + 11],
-                ]);
-                return Some((lba, if count == 0 { 4 } else { count }));
+/// Search an ISO9660 directory extent for a child by name (case-insensitive).
+/// Returns (child_extent_lba, child_size_in_bytes) or None.
+fn find_in_dir(
+    bio_ref: &BlockIoProtocol,
+    bio_ptr: *mut BlockIoProtocol,
+    mid: u32,
+    iso_lba: u64,
+    dir_lba: u32,
+    dir_size: u32,
+    name: &[u8],
+    scratch: &mut [u8; 2048],
+) -> Option<(u32, u32)> {
+    let total_sectors = ((dir_size as u64 + 2047) / 2048) as u32;
+    for s in 0..total_sectors {
+        if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, dir_lba + s, scratch) {
+            return None;
+        }
+        let mut offset: usize = 0;
+        while offset + core::mem::size_of::<DirRecordHdr>() <= 2048 && offset < dir_size as usize {
+            let hdr: &DirRecordHdr =
+                unsafe { &*(scratch[offset..].as_ptr() as *const DirRecordHdr) };
+            if hdr.len == 0 {
+                break;
             }
-            0x90 if best.is_none() => {
-                let count = u16::from_le_bytes([catalog[off + 6], catalog[off + 7]]);
-                let lba = u32::from_le_bytes([
-                    catalog[off + 8],
-                    catalog[off + 9],
-                    catalog[off + 10],
-                    catalog[off + 11],
-                ]);
-                best = Some((lba, if count == 0 { 4 } else { count }));
+            let name_len = hdr.name_len as usize;
+            let name_offset = offset + core::mem::size_of::<DirRecordHdr>();
+            // ISO9660 names may have ";1" version suffix — strip it
+            let effective_len = if name_len >= 2 && scratch[name_offset + name_len - 2] == b';' {
+                name_len - 2
+            } else {
+                name_len
+            };
+            if effective_len == name.len() {
+                let mut matched = true;
+                for i in 0..name.len() {
+                    let a = scratch[name_offset + i].to_ascii_uppercase();
+                    let b = name[i].to_ascii_uppercase();
+                    if a != b {
+                        matched = false;
+                        break;
+                    }
+                }
+                if matched {
+                    return Some((extent_le(&hdr.extent), size_le(&hdr.size)));
+                }
             }
-            _ => {}
+            offset += hdr.len as usize;
         }
     }
-    if best.is_none() {
-        print_raw(st, b"No bootable entry in catalog.\r\n\0");
+    None
+}
+
+/// Resolve path "/EFI/BOOT/BOOTX64.EFI" within the ISO directory tree.
+fn find_efi_boot(
+    st: &mut SystemTable,
+    bio_ref: &BlockIoProtocol,
+    bio_ptr: *mut BlockIoProtocol,
+    mid: u32,
+    iso_lba: u64,
+) -> Option<(u32, u32)> {
+    let (root_lba, root_size) = get_root_dir(st, bio_ref, bio_ptr, mid, iso_lba)?;
+    let mut scratch = [0u8; 2048];
+
+    // 1. Find /EFI
+    let (efi_lba, efi_size) = find_in_dir(
+        bio_ref, bio_ptr, mid, iso_lba,
+        root_lba, root_size, b"EFI", &mut scratch,
+    )?;
+
+    // 2. Find /EFI/BOOT
+    let (boot_lba, boot_size) = find_in_dir(
+        bio_ref, bio_ptr, mid, iso_lba,
+        efi_lba, efi_size, b"BOOT", &mut scratch,
+    )?;
+
+    // 3. Find /EFI/BOOT/BOOTX64.EFI
+    find_in_dir(
+        bio_ref, bio_ptr, mid, iso_lba,
+        boot_lba, boot_size, b"BOOTX64.EFI", &mut scratch,
+    )
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  UEFI chainload
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Load and start an EFI executable from within an ISO.
+///
+/// This is the **correct** UEFI chainload path.  No real-mode transition,
+/// no BIOS INT 13h dependency.
+fn uefi_chainload_iso(
+    st: &mut SystemTable,
+    image_handle: *mut c_void,
+    files: &[IsoEntry; 64],
+    idx: usize,
+    bio_ref: &BlockIoProtocol,
+    bio_ptr: *mut BlockIoProtocol,
+    mid: u32,
+) {
+    let iso_lba = files[idx].file_start_lba;
+
+    let (efi_lba, efi_size) = match find_efi_boot(st, bio_ref, bio_ptr, mid, iso_lba) {
+        Some(v) => v,
+        None => {
+            print_raw(st, b"ERROR: /EFI/BOOT/BOOTX64.EFI not found in ISO.\r\n\0");
+            return;
+        }
+    };
+
+    let bs = unsafe { &mut *st.boot_services };
+
+    // Read the EFI executable into a pool-allocated buffer
+    let (buf_ptr, buf_len) = match read_extent(bs, bio_ref, bio_ptr, mid, iso_lba, efi_lba, efi_size) {
+        Some(v) => v,
+        None => {
+            print_raw(st, b"ERROR: Failed to read EFI executable from ISO.\r\n\0");
+            return;
+        }
+    };
+
+    print_raw(st, b"Loading EFI image...\r\n\0");
+
+    // LoadImage
+    let mut child_handle: *mut c_void = core::ptr::null_mut();
+    let status = unsafe {
+        (bs.load_image)(
+            false,               // BootPolicy
+            image_handle,        // ParentImageHandle
+            core::ptr::null_mut(), // DevicePath (NULL = memory-only)
+            buf_ptr,             // SourceBuffer
+            buf_len as u64,      // SourceSize
+            &mut child_handle,
+        )
+    };
+
+    if status != EFI_SUCCESS {
+        unsafe { (bs.free_pool)(buf_ptr as _); }
+        print_raw(st, b"ERROR: LoadImage failed.\r\n\0");
+        return;
     }
-    best
+
+    print_raw(st, b"Starting EFI image...\r\n\0");
+
+    // StartImage
+    let mut exit_data_size: u64 = 0;
+    let mut exit_data: *mut u16 = core::ptr::null_mut();
+    let status2 = unsafe {
+        (bs.start_image)(child_handle, &mut exit_data_size, &mut exit_data)
+    };
+
+    // If we get here, the child image returned
+    print_raw(st, b"WARNING: Image returned with status 0x");
+    crate::output::print_hex(st, b"", status2 as u64);
+    print_raw(st, b"\r\n\0");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Chainloader entry point
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Load ISO boot image, exit UEFI boot services, transition to real mode,
-/// and jump to the boot image.  Never returns.
+/// Boot an ISO by chainloading its UEFI bootloader (/EFI/BOOT/BOOTX64.EFI).
+/// Never returns on success; returns on failure so the menu can continue.
 pub fn boot_iso(
     st: &mut SystemTable,
+    image_handle: *mut c_void,
     files: &[IsoEntry; 64],
     idx: usize,
     bio_ref: &BlockIoProtocol,
     bio_ptr: *mut BlockIoProtocol,
     mid: u32,
-) -> ! {
-    print_raw(st, b"\r\nBooting ISO...\r\n\0");
-
-    let iso_lba = files[idx].file_start_lba;
-
-    let (boot_image_iso_lba, sector_count) =
-        match parse_el_torito(st, bio_ref, bio_ptr, mid, iso_lba) {
-            Some(v) => v,
-            None => die(st, b"ERROR: Cannot parse El Torito.\r\n\0"),
-        };
-
-    let total_bytes = sector_count as usize * 512;
-
-    let bs = unsafe { &mut *st.boot_services };
-
-    // Allocate pages at 1 MiB as a temporary read buffer
-    let num_pages = (total_bytes + 4095) / 4096;
-    let mut tmp_addr: u64 = 0x100000;
-    let status = unsafe {
-        (bs.allocate_pages)(
-            AllocateType::AllocateAddress,
-            MemoryType::EfiLoaderData,
-            num_pages,
-            &mut tmp_addr,
-        )
-    };
-    if status != EFI_SUCCESS {
-        die(st, b"ERROR: Cannot allocate temp buffer.\r\n\0");
-    }
-
-    // Read boot image sectors into temp buffer
-    let boot_image_lba = iso_lba + boot_image_iso_lba as u64 * 4;
-    let dest = tmp_addr as *mut u8;
-    for s in 0..sector_count {
-        let mut sector_buf = [0u8; 512];
-        if !read_sector(bio_ref, bio_ptr, mid, boot_image_lba + s as u64, &mut sector_buf) {
-            die(st, b"ERROR: Failed to read boot image.\r\n\0");
-        }
-        unsafe {
-            for (j, &b) in sector_buf.iter().enumerate() {
-                *dest.add(s as usize * 512 + j) = b;
-            }
-        }
-    }
-
-    print_raw(st, b"Boot image loaded.\r\n\0");
-
-    // ── Get memory map ──────────────────────────────────────────
-    let mut map_size: usize = 0;
-    let mut map_key: u64 = 0;
-    let mut desc_size: u64 = 0;
-    let mut desc_version: u32 = 0;
-
-    let mut dummy_desc: MemoryDescriptor = MemoryDescriptor {
-        ty: 0,
-        pad: 0,
-        phys_start: 0,
-        virt_start: 0,
-        num_pages: 0,
-        attr: 0,
-    };
-    unsafe {
-        (bs.get_memory_map)(
-            &mut map_size,
-            &mut dummy_desc,
-            &mut map_key,
-            &mut desc_size,
-            &mut desc_version,
-        );
-    }
-
-    map_size += desc_size as usize * 4;
-    if map_size > 65536 {
-        die(st, b"ERROR: Memory map too large.\r\n\0");
-    }
-    static mut MEM_MAP_BUF: [u8; 65536] = [0u8; 65536];
-    let map_ptr = unsafe { MEM_MAP_BUF.as_mut_ptr() };
-
-    unsafe {
-        (bs.get_memory_map)(
-            &mut map_size,
-            map_ptr as *mut MemoryDescriptor,
-            &mut map_key,
-            &mut desc_size,
-            &mut desc_version,
-        );
-    }
-
-    // Copy boot image from temp to 0x7C00
-    let boot_addr = 0x7C00usize as *mut u8;
-    unsafe {
-        for i in 0..total_bytes {
-            *boot_addr.add(i) = *dest.add(i);
-        }
-    }
-
-    // Copy trampolines to low memory (must be done before ExitBootServices
-    // so the memory is accessible in long mode identity-mapped region).
-    copy_trampolines();
-
-    // Exit boot services
-    let image_handle = core::ptr::null_mut::<c_void>();
-    let exit_status = unsafe { (bs.exit_boot_services)(image_handle, map_key) };
-    if exit_status != EFI_SUCCESS {
-        // Try again with updated map key
-        unsafe {
-            (bs.get_memory_map)(
-                &mut map_size,
-                map_ptr as *mut MemoryDescriptor,
-                &mut map_key,
-                &mut desc_size,
-                &mut desc_version,
-            );
-        }
-        let _ = unsafe { (bs.exit_boot_services)(image_handle, map_key) };
-    }
-
-    // ── Transition to real mode and jump ──────────────────────
-    unsafe { jump_to_real_mode() }
+) {
+    print_raw(st, b"\r\nBooting ISO (UEFI chainload)...\r\n\0");
+    uefi_chainload_iso(st, image_handle, files, idx, bio_ref, bio_ptr, mid);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -364,6 +317,7 @@ use crate::fs::scan_directory;
 
 pub fn show_menu(
     st: &mut SystemTable,
+    image_handle: *mut c_void,
     files: &[IsoEntry; 64],
     count: usize,
     ctx: &FsCtx,
@@ -414,16 +368,16 @@ pub fn show_menu(
         if (b'1'..=b'9').contains(&ch) {
             let idx = (ch - b'1') as usize;
             if idx < count {
-                boot_iso(st, files, idx, bio_ref, bio_ptr, mid);
+                boot_iso(st, image_handle, files, idx, bio_ref, bio_ptr, mid);
             }
         } else if ch == b'0' && count >= 10 {
-            boot_iso(st, files, 9, bio_ref, bio_ptr, mid);
+            boot_iso(st, image_handle, files, 9, bio_ref, bio_ptr, mid);
         } else if ch == b'r' || ch == b'R' {
             print_raw(st, b"\r\nRe-scanning...\r\n\0");
             let mut new_files: [IsoEntry; 64] = unsafe { core::mem::zeroed() };
             let mut new_count: usize = 0;
             scan_directory(bio_ref, bio_ptr, mid, ctx, &mut new_files, &mut new_count);
-            show_menu(st, &new_files, new_count, ctx, bio_ref, bio_ptr, mid);
+            show_menu(st, image_handle, &new_files, new_count, ctx, bio_ref, bio_ptr, mid);
         }
     }
     halt_or_reboot(st)

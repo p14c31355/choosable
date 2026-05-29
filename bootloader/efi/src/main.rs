@@ -229,7 +229,7 @@ extern "efiapi" fn efi_main(
     scan_directory(bio_ref, bio_ptr, mid, &ctx, &mut iso_files, &mut iso_count);
 
     // Show menu — never returns
-    iso::show_menu(st, &iso_files, iso_count, &ctx, bio_ref, bio_ptr, mid);
+    iso::show_menu(st, image_handle, &iso_files, iso_count, &ctx, bio_ref, bio_ptr, mid);
     // Unreachable, but the compiler needs explicit diverging:
     loop { unsafe { core::arch::asm!("hlt") } }
 }

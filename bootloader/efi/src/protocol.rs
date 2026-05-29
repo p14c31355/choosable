@@ -81,8 +81,19 @@ pub struct BootServices {
     // ── 0x0B8–0x0E8 ──
     pub locate_device_path: *mut c_void,        // 0x0B8
     pub install_configuration_table: *mut c_void, // 0x0C0
-    pub load_image: *mut c_void,                 // 0x0C8
-    pub start_image: *mut c_void,                // 0x0D0
+    pub load_image: unsafe extern "efiapi" fn(
+        bool,                       // BootPolicy
+        *mut c_void,                // ParentImageHandle
+        *mut crate::protocol::DevicePathProtocol, // DevicePath
+        *const u8,                  // SourceBuffer
+        u64,                        // SourceSize
+        *mut *mut c_void,           // ImageHandle
+    ) -> usize,
+    pub start_image: unsafe extern "efiapi" fn(
+        *mut c_void,                // ImageHandle
+        *mut u64,                   // ExitDataSize
+        *mut *mut u16,              // ExitData
+    ) -> usize,
     pub exit: *mut c_void,                       // 0x0D8
     pub unload_image: *mut c_void,               // 0x0E0
     pub exit_boot_services: unsafe extern "efiapi" fn(*mut c_void, u64) -> usize, // 0x0E8
@@ -224,6 +235,14 @@ pub enum AllocateType {
 #[repr(u32)]
 pub enum MemoryType {
     EfiLoaderData = 1,
+}
+
+/// Opaque device path type — only needed as a pointer in LoadImage.
+#[repr(C)]
+pub struct DevicePathProtocol {
+    pub ty: u8,
+    pub sub_type: u8,
+    pub length: [u8; 2],
 }
 
 pub const BLOCK_IO_PROTOCOL_GUID: Guid = Guid {
