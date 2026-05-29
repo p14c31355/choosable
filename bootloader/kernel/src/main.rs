@@ -413,7 +413,7 @@ fn scan_exfat_dir(ctx: &FsCtx, files: &mut [DirEntry], file_count: &mut usize) {
                         if entries[noff] != EXFAT_ENTRY_NAME {
                             break;
                         }
-                        let to_copy = (name_len - name_pos).min(15);
+                        let to_copy = name_len.saturating_sub(name_pos).min(15);
                         if to_copy == 0 {
                             break;
                         }
