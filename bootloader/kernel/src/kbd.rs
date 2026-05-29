@@ -13,8 +13,8 @@ pub fn kbd_poll() -> Option<u8> {
 
 pub fn kbd_wait_key() -> u8 {
     loop {
-        while inb(0x64) & 2 != 0 {}
         if let Some(sc) = kbd_poll() {
+
             return sc;
         }
     }
