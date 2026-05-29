@@ -80,32 +80,29 @@ fn read_extent(
     let sector_count = ((byte_len as u64 + 2047) / 2048) as u32;
     let buf_len = sector_count as usize * 2048;
 
-    let mut ptr: *mut u8 = core::ptr::null_mut();
-    // AllocatePool is at offset 0x040, but we use raw pointer cast:
-    // EFI AllocatePool returns EFI_SUCCESS on success.
+    let mut ptr: *mut c_void = core::ptr::null_mut();
     let status = unsafe {
-        let allocate_pool: unsafe extern "efiapi" fn(u32, usize, *mut *mut c_void) -> usize =
-            core::mem::transmute(bs.allocate_pool);
-        allocate_pool(1 /* EfiLoaderData */, buf_len, &mut ptr as *mut _ as _)
+        (bs.allocate_pool)(MemoryType::EfiLoaderData, buf_len, &mut ptr)
     };
     if status != EFI_SUCCESS || ptr.is_null() {
         return None;
     }
+    let ptr_u8: *mut u8 = ptr as *mut u8;
 
     let mut offset: usize = 0;
     for s in 0..sector_count {
         let mut iso_sec = [0u8; 2048];
         if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, lba + s, &mut iso_sec) {
-            unsafe { (bs.free_pool)(ptr as _); }
+            unsafe { (bs.free_pool)(ptr); }
             return None;
         }
         let to_copy = if offset + 2048 > buf_len { buf_len - offset } else { 2048 };
         unsafe {
-            core::ptr::copy_nonoverlapping(iso_sec.as_ptr(), ptr.add(offset), to_copy);
+            core::ptr::copy_nonoverlapping(iso_sec.as_ptr(), ptr_u8.add(offset), to_copy);
         }
         offset += to_copy;
     }
-    Some((ptr, byte_len.min(buf_len as u32)))
+    Some((ptr_u8, byte_len.min(buf_len as u32)))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

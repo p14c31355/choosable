@@ -54,7 +54,7 @@ pub struct BootServices {
         *mut u32,
     ) -> usize,
     // ── 0x040 ──
-    pub allocate_pool: *mut c_void,     // 0x040
+    pub allocate_pool: unsafe extern "efiapi" fn(MemoryType, usize, *mut *mut c_void) -> usize,
     // ── 0x048 ──
     pub free_pool: unsafe extern "efiapi" fn(*mut c_void) -> usize,
     // ── 0x050–0x078 ──
@@ -74,14 +74,14 @@ pub struct BootServices {
         *mut *mut c_void,
     ) -> usize,
     // ── 0x0A0 ──
-    pub reserved: *mut c_void,          // 0x0A0 (must be NULL)
+    pub reserved: *mut c_void,          // 0x0A0 (must point to NULL)
     // ── 0x0A8–0x0B0 ──
     pub register_protocol_notify: *mut c_void,  // 0x0A8
     pub locate_handle: *mut c_void,              // 0x0B0
     // ── 0x0B8–0x0E8 ──
     pub locate_device_path: *mut c_void,        // 0x0B8
     pub install_configuration_table: *mut c_void, // 0x0C0
-    pub load_image: unsafe extern "efiapi" fn(
+    pub load_image: unsafe extern "efiapi" fn(  // 0x0C8
         bool,                       // BootPolicy
         *mut c_void,                // ParentImageHandle
         *mut crate::protocol::DevicePathProtocol, // DevicePath
