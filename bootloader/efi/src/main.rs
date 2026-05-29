@@ -315,6 +315,10 @@ fn scan_exfat_dir(
                 }
                 if etype == 0x85 {
                     let sec_count = entries[pos * 32 + 1] as usize;
+                    if sec_count < 1 {
+                        pos += 1;
+                        continue;
+                    }
                     let total_ents = 1 + sec_count;
                     if pos + total_ents > n_entries {
                         let rem = total - pos * 32;
@@ -682,7 +686,7 @@ fn parse_ntfs_attrs(
         } else {
             break;
         };
-        if alen < 8 || off + alen > attrs.len() {
+        if alen < 24 || off + alen > attrs.len() {
             break;
         }
         let is_nonresident = attrs[off + 8] != 0;
@@ -839,7 +843,7 @@ fn parse_ntfs_data_attr(ctx: &FsCtx, attrs: &[u8], _rem: usize) -> Option<(u64, 
             break;
         }
         let alen = u32::from_le_bytes([attrs[off + 4], attrs[off + 5], attrs[off + 6], attrs[off + 7]]) as usize;
-        if alen < 8 || off + alen > attrs.len() {
+        if alen < 24 || off + alen > attrs.len() {
             break;
         }
         if atype == 0x80 {

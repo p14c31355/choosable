@@ -74,14 +74,28 @@ pub fn make_backup_gpt_header(primary: &GptInfo) -> GptHeader {
 
 // ─── udev helpers ───────────────────────────────────────────────────────
 
+struct UdevGuard;
+
+impl Drop for UdevGuard {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("udevadm")
+            .args(&["control", "--start-exec-queue"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
 /// Stop udev event processing so that udisks2 doesn't see intermediate
-/// states during disk reconfiguration.
-fn udev_stop() {
+/// states during disk reconfiguration. Returns a guard that resumes
+/// udev when dropped.
+fn udev_stop() -> UdevGuard {
     let _ = std::process::Command::new("udevadm")
         .args(&["control", "--stop-exec-queue"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
+    UdevGuard
 }
 
 /// Resume udev after a LAYOUT-CHANGING operation (install / non-destructive).
