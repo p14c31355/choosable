@@ -102,10 +102,10 @@ pub fn create_virtual_cdrom(
     let dp = dp_ptr as *mut u8;
     unsafe {
         dp.copy_from_nonoverlapping(CDROM_NODE.as_ptr(), CDROM_NODE.len());
-        // Patch PartitionStart (offset 8) = ISO start LBA * 512
-        *(dp.add(8) as *mut u64) = (iso_lba * 512).to_le();
-        // Patch PartitionSize (offset 16) = iso_size_bytes
-        *(dp.add(16) as *mut u64) = iso_size_bytes.to_le();
+        // Patch PartitionStart (offset 8) = 0 (start of virtual CD-ROM)
+        *(dp.add(8) as *mut u64) = 0u64.to_le();
+        // Patch PartitionSize (offset 16) = size in 2048-byte blocks
+        *(dp.add(16) as *mut u64) = (iso_size_bytes / 2048).to_le();
         // Append end node
         dp.add(CDROM_NODE.len())
             .copy_from_nonoverlapping(END_NODE.as_ptr(), END_NODE.len());
