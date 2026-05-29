@@ -1014,11 +1014,13 @@ pub extern "C" fn _start() -> ! {
             let cluster_bytes = spc as u64 * 512;
             let mft_lcn = i64::from_le_bytes(vbr[0x30..0x38].try_into().unwrap());
             let mft_start_lba = part1_lba as u64 + (mft_lcn as u64) * spc as u64;
-            let cpmr_raw = i32::from_le_bytes(vbr[0x40..0x44].try_into().unwrap());
+            let cpmr_raw = vbr[0x40] as i8;
             let mft_record_size: u64 = if cpmr_raw > 0 {
                 cpmr_raw as u64 * cluster_bytes
+            } else if cpmr_raw >= -12 {
+                1u64 << (-cpmr_raw)
             } else {
-                (1u64 << (-cpmr_raw)) as u64
+                0
             };
             if mft_record_size == 0 || mft_record_size > 4096 {
                 vga_print(3, 2, b"Invalid MFT record size.", 0x0C);

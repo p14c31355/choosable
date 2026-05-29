@@ -145,7 +145,7 @@ extern "efiapi" fn efi_main(
     match fs {
         FsType::Exfat => {
             let spc_shift = vbr[109] as u32;
-            if spc_shift >= 25 {
+            if spc_shift > 16 {
                 die(st, b"ERROR: Invalid SectorsPerClusterShift.\r\n\0");
             }
             let cluster_bytes = (1u32 << spc_shift) * 512;
@@ -193,11 +193,13 @@ extern "efiapi" fn efi_main(
             let mft_lcn = i64::from_le_bytes(vbr[0x30..0x38].try_into().unwrap());
             let mft_start_lba = part1_lba + (mft_lcn as u64) * spc as u64;
             // MFT record size: clus_per_mft_record at offset 0x40 (64)
-            let cpmr_raw = i32::from_le_bytes(vbr[0x40..0x44].try_into().unwrap());
+            let cpmr_raw = vbr[0x40] as i8;
             let mft_record_size: u64 = if cpmr_raw > 0 {
                 cpmr_raw as u64 * cluster_bytes
+            } else if cpmr_raw >= -12 {
+                1u64 << (-cpmr_raw)
             } else {
-                (1u64 << (-cpmr_raw)) as u64
+                0
             };
             if mft_record_size == 0 || mft_record_size > 4096 {
                 die(st, b"ERROR: Invalid MFT record size.\r\n\0");
@@ -739,7 +741,7 @@ fn parse_ntfs_index_entries(
         let fn_len = entries[0x10] as usize;
         let fn_off = 0x52usize; // $FILE_NAME attribute starts at offset 0x52 from index entry start
 
-        if fn_off + fn_len < entries.len()
+        if fn_off + 0x42 <= entries.len()
             && (flags & 0x02) == 0 // not a subdirectory (we only care about files)
         {
             // Parse $FILE_NAME: offset 0 = MFT ref (8 bytes), 0x40 = flags, 0x42 = name_len, 0x44 = name
@@ -852,12 +854,14 @@ fn parse_ntfs_data_attr(ctx: &FsCtx, attrs: &[u8], _rem: usize) -> Option<(u64, 
                             }
                             let len_bytes = (hdr & 0x0F) as usize;
                             let off_bytes = ((hdr >> 4) & 0x0F) as usize;
-                            let clen = parse_varlen_le(&run_bytes[i + 1..], len_bytes);
-                            let coff = parse_varlen_le_signed(&run_bytes[i + 1 + len_bytes..], off_bytes);
-                            lcn = (lcn as i64 + coff) as u64;
-                            if clen > 0 {
-                                let iso_lba = ctx.part1_lba + lcn * ctx.sectors_per_cluster as u64;
-                                return Some((iso_lba, file_size));
+                            if i + 1 + len_bytes + off_bytes <= run_bytes.len() {
+                                let clen = parse_varlen_le(&run_bytes[i + 1..], len_bytes);
+                                let coff = parse_varlen_le_signed(&run_bytes[i + 1 + len_bytes..], off_bytes);
+                                lcn = (lcn as i64 + coff) as u64;
+                                if clen > 0 {
+                                    let iso_lba = ctx.part1_lba + lcn * ctx.sectors_per_cluster as u64;
+                                    return Some((iso_lba, file_size));
+                                }
                             }
                         }
                     }
@@ -1042,7 +1046,7 @@ fn boot_iso(
 
     let bs = unsafe { &mut *st.boot_services };
     let num_pages = (boot_sector_count as usize * 512 + 4095) / 4096;
-    let mut pages: u64 = 0x100000;
+    let mut pages: u64 = 0x80000;
     let status = unsafe {
         (bs.allocate_pages)(
             AllocateType::AllocateAddress,
