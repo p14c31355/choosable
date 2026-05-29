@@ -95,6 +95,10 @@ const ATA_STATUS: u16 = ATA_PRIMARY_BASE + 7;
 const ATA_CMD: u16 = ATA_PRIMARY_BASE + 7;
 
 fn ata_read_sector(lba: u64, buf: &mut [u8; 512]) -> bool {
+    let status = inb(ATA_STATUS);
+    if status == 0xFF {
+        return false;
+    }
     while inb(ATA_STATUS) & 0x80 != 0 {}
     while inb(ATA_STATUS) & 0x08 != 0 {}
 
