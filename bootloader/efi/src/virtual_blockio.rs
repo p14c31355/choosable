@@ -139,7 +139,7 @@ pub fn create_virtual_cdrom(
     vbio.media = BlockIoMedia {
         mid: 0,                // media ID
         bim_rm: 0,             // removable: no
-        bim_mp: 0,             // media present: yes (changed from 0 for better compat)
+        bim_mp: 1,             // media present: yes
         bim_lp: 0,             // logical partition
         bim_ro: 1,             // read-only
         bim_wc: 0,             // write caching: none
