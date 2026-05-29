@@ -28,35 +28,31 @@ unsafe extern "efiapi" fn vblock_read(
 ) -> usize {
     let vbio = &*(this as *const VirtualBlockIo);
 
-    // CD-ROM sector = 2048 bytes.
-    // Real disk sector = 512 bytes.
-    // Absolute disk LBA = iso_lba + (cd_lba * 4).
-    let cd_byte_offset = lba * 2048;
-    let disk_lba = vbio.iso_lba + lba * 4;
-    let byte_count = buffer_size.min(2048);
+    if buffer_size % 2048 != 0 {
+        return 0x8000_0000_0000_0004; // EFI_BAD_BUFFER_SIZE
+    }
 
-    let dst = core::slice::from_raw_parts_mut(buffer as *mut u8, byte_count);
+    let num_blocks = buffer_size / 2048;
+    let dst = core::slice::from_raw_parts_mut(buffer as *mut u8, buffer_size);
 
-    let mut offset: usize = 0;
-    for i in 0..4usize {
-        if offset >= byte_count {
-            break;
+    for b in 0..num_blocks {
+        let block_lba = lba + b as u64;
+        let disk_lba = vbio.iso_lba + block_lba * 4;
+        let block_offset = b * 2048;
+
+        for i in 0..4 {
+            let mut sec = [0u8; 512];
+            if !read_sector(
+                &*vbio.real_bio_ptr,
+                vbio.real_bio_ptr,
+                vbio.real_media_id,
+                disk_lba + i as u64,
+                &mut sec,
+            ) {
+                return 0x8000_0000_0000_0002; // EFI_DEVICE_ERROR
+            }
+            dst[block_offset + i * 512..block_offset + (i + 1) * 512].copy_from_slice(&sec);
         }
-        let mut sec = [0u8; 512];
-        if !read_sector(
-            &*vbio.real_bio_ptr,
-            vbio.real_bio_ptr,
-            vbio.real_media_id,
-            disk_lba + i as u64,
-            &mut sec,
-        ) {
-            return 0x8000_0000_0000_0002; // EFI_DEVICE_ERROR
-        }
-        let to_copy = byte_count - offset;
-        let to_copy = if to_copy > 512 { 512 } else { to_copy };
-        dst[offset..offset + to_copy].copy_from_slice(&sec[..to_copy]);
-        offset += to_copy;
-        let _ = cd_byte_offset; // suppress unused warning
     }
 
     EFI_SUCCESS
