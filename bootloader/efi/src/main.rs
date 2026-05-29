@@ -924,11 +924,12 @@ struct LoadedImageProtocol {
     device_handle: *mut core::ffi::c_void,
 }
 #[derive(Clone, Copy)]
+#[derive(Clone, Copy)]
 #[repr(u32)]
 enum ResetType {
     ResetCold = 0,
+    ResetWarm = 1,
 }
-#[derive(Clone, Copy)]
 #[repr(u32)]
 enum LocateSearchType {
     ByProtocol = 2,
