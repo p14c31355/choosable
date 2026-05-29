@@ -555,9 +555,10 @@ fn show_menu(files: &[DirEntry], count: usize, part_lba: u32, info: &ExfatInfo) 
             break;
         }
         let num = (i + 1) as u8;
-        vga_print_byte(num, row, 1, 0x0A);
-        vga_print(row, 3, b". ", 0x07);
-        vga_print(row, 5, &files[i].name[..files[i].name_len], 0x0F);
+        let mut num_buf = [0u8; 20];
+        let num_str = format_u64((i + 1) as u64, &mut num_buf);
+        vga_print(row, 1, num_str, 0x0A);
+        vga_print(row, 1 + num_str.len(), b". ", 0x07);
 
         // Show file size
         let size_mb = files[i].file_size / (1024 * 1024);
