@@ -432,7 +432,7 @@ fn build_stage2_binary(kernel: &[u8]) -> Vec<u8> {
                              //　wait a moment (loop ~65536 times)
     c.mov_cx(0xFFFF);
     let wait1 = c.label();
-    c.emit(0xE2).emit(0xFD); // LOOP $-3
+    c.emit(0xE2).emit(0xFE); // LOOP wait1 (offset -2)
 
     // 2) BIOS call (INT 15h AH=2401h)
     c.mov_ah(0x24);
