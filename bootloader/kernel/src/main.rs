@@ -701,7 +701,7 @@ fn scan_ntfs_dir(ctx: &FsCtx, files: &mut [DirEntry], file_count: &mut usize) {
                             }
                             let flags = entries[12];
                             let fn_off = 0x52usize;
-                            if fn_off + 1 < entries.len() && (flags & 0x02) == 0 {
+                            if fn_off + 0x42 <= entries.len() && (flags & 0x02) == 0 {
                                 let name_len = entries[fn_off + 0x41] as usize;
                                 if name_len > 0 && name_len <= 255 && fn_off + 0x42 + name_len * 2 <= entries.len() {
                                     let mut name_buf = [0u8; 256];
