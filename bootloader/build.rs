@@ -533,8 +533,8 @@ fn build_stage2_binary(kernel: &[u8]) -> Vec<u8> {
     // ── build page tables ───────────────────────────────────────────
     // PML4 at phys 0x8000 (binary offset 0x200)
     let pml4_phys: u32 = 0x90000;
-    let pdpt_phys: u32 = 0x90200;
-    let pd_phys: u32 = 0x90400;
+    let pdpt_phys: u32 = 0x91000;
+    let pd_phys: u32 = 0x92000;
 
     // Zero PML4 (EDI = pml4_phys, ECX = 1024, EAX = 0, REP STOSD)
     c.emit(0xBF).emit32(pml4_phys); // MOV EDI, pml4_phys
