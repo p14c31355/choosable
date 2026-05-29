@@ -2,6 +2,7 @@
 #![no_main]
 
 mod ata;
+mod chainload;
 mod fs;
 mod io;
 mod iso;
@@ -168,6 +169,9 @@ pub extern "C" fn _start() -> ! {
     let mut iso_files: [DirEntry; 64] = unsafe { core::mem::zeroed() };
     let mut iso_count: usize = 0;
     scan_filesystem(&ctx, &mut iso_files, &mut iso_count);
+
+    // Initialise GDT descriptor for chainload mode switch
+    chainload::init_gdtr();
 
     // Show menu → boot_iso() → chainload_iso() (never returns)
     menu::show_menu(&iso_files, iso_count, &ctx);

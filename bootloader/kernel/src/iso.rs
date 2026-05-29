@@ -1,8 +1,9 @@
 // ═══════════════════════════════════════════════════════════════════════════
-//  ISO El Torito Boot Record parser + chainloader
+//  ISO El Torito Boot Record parser + chainloader entry point
 // ═══════════════════════════════════════════════════════════════════════════
 
 use crate::ata::{ata_read_sector, ata_read_sectors};
+use crate::chainload;
 use crate::fs::{DirEntry, FsCtx};
 use crate::vga::vga_print;
 
@@ -95,7 +96,6 @@ fn load_boot_image(iso_lba: u64, image_iso_lba: u32, sector_count: u16) -> bool 
     let image_absolute_lba = iso_lba + image_iso_lba as u64 * 4;
     let total_bytes = sector_count as usize * 512;
 
-    // Direct read into 0x7C00 — we're in ring 0 so this is fine
     let dst = unsafe { core::slice::from_raw_parts_mut(BIOS_BOOT_ADDR as *mut u8, total_bytes) };
     if !ata_read_sectors(image_absolute_lba, dst, sector_count as u32) {
         vga_print(10, 2, b"Failed to read boot image sectors.", 0x0C);
@@ -104,176 +104,21 @@ fn load_boot_image(iso_lba: u64, image_iso_lba: u32, sector_count: u16) -> bool 
     true
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  Protected Mode → Real Mode transition + far jump to 0x7C00
-// ═══════════════════════════════════════════════════════════════════════════
-//
-//  The problem with `outb(0x64, 0xFE)` (CPU reset) is that the BIOS
-//  re-initialises everything and reads the MBR again → Choosable starts
-//  over.  To actually chainload, we must:
-//
-//   1. Disable interrupts (CLI)
-//   2. Load a GDT with 16-bit real-mode-compatible descriptors
-//   3. Jump to 16-bit code segment
-//   4. Disable paging / long mode (CR0)
-//   5. Load real-mode segment registers
-//   6. Set up a real-mode stack (SS:SP)
-//   7. Set DL = boot drive (we use 0x80)
-//   8. Write boot cookie at 0x7B00
-//   9. far JMP 0000:7C00
-//
-//  This code is written as inline assembly inside a naked function.
-// ═══════════════════════════════════════════════════════════════════════════
-
-core::arch::global_asm!(
-    ".section .text.realmode_gdt,\"ax\",@progbits",
-    ".align 8",
-    "realmode_gdt:",
-
-    // Entry 0 (selector 0x00): null descriptor
-    ".quad 0",
-
-    // Entry 1 (selector 0x08): 32-bit compat code segment
-    // Base=0, Limit=0xFFFFF, D=1 (32-bit), L=0 (not 64-bit)
-    ".word 0xFFFF",   // limit low (bits 0-15)
-    ".word 0x0000",   // base low (bits 0-15)
-    ".byte 0x00",     // base mid (bits 16-23)
-    ".byte 0x9A",     // access: P=1, DPL=0, S=1, Type=1010 (code/exec/read)
-    ".byte 0xCF",     // flags: G=1 (4K granularity), D=1 (32-bit), limit high=0xF
-    ".byte 0x00",     // base high (bits 24-31)
-
-    // Entry 2 (selector 0x10): 16-bit code segment (real-mode compatible)
-    // Base=0, Limit=0xFFFF, D=0 (16-bit)
-    ".word 0xFFFF",   // limit low
-    ".word 0x0000",   // base low
-    ".byte 0x00",     // base mid
-    ".byte 0x9A",     // access: P=1, DPL=0, S=1, Type=1010 (code/exec/read)
-    ".byte 0x00",     // flags: G=0 (byte granularity), D=0 (16-bit), limit high=0
-    ".byte 0x00",     // base high
-
-    // Entry 3 (selector 0x18): 16-bit data segment (real-mode compatible)
-    // Base=0, Limit=0xFFFF
-    ".word 0xFFFF",
-    ".word 0x0000",
-    ".byte 0x00",
-    ".byte 0x92",     // access: P=1, DPL=0, S=1, Type=0010 (data/read/write)
-    ".byte 0x00",
-    ".byte 0x00",
-
-    "realmode_gdt_end:",
-    "realmode_gdtr:",
-    ".word realmode_gdt_end - realmode_gdt - 1",
-    ".quad realmode_gdt",
-);
-
-extern "C" {
-    fn realmode_gdtr();
-    fn do_chainload();
-}
-
-core::arch::global_asm!(
-    // ═══════════════════════════════════════════════════════════════════
-    //  Realmode stub — copied to low memory (0x0600) before transition.
-    //  Must be position-independent raw machine code.
-    // ═══════════════════════════════════════════════════════════════════
-    ".global realmode_stub",
-    "realmode_stub:",
-    ".code16",
-
-    // Set up real-mode segments
-    "mov ax, 0x0000",
-    "mov ds, ax",
-    "mov es, ax",
-    "mov fs, ax",
-    "mov gs, ax",
-    "mov ss, ax",
-    "mov sp, 0x7000",
-
-    // Re-enable interrupts
-    "sti",
-
-    // Set DL = boot drive (0x80 = first hard disk)
-    "mov dl, 0x80",
-
-    // Far jump to ISO boot image at 0x7C00
-    ".byte 0xEA",
-    ".word 0x7C00",
-    ".word 0x0000",
-
-    "realmode_stub_end:",
-
-    // ═══════════════════════════════════════════════════════════════════
-    //  do_chainload — transition from 64-bit long mode → real mode
-    // ═══════════════════════════════════════════════════════════════════
-    ".global do_chainload",
-    ".code64",
-    "do_chainload:",
-
-    // ── 1. Disable interrupts ─────────────────────────
-    "cli",
-
-    // ── 2. Load our GDT ───────────────────────────────
-    "lgdt [rip + realmode_gdtr]",
-
-    // ── 3. Switch to 32-bit compat mode (selector 0x08) ─
-    "lea rax, [rip + 2f]",
-    "push 0x08",
-    "push rax",
-    "retfq",
-    "2:",
-    ".code32",
-
-    // ── 4. Disable paging, PAE, and long mode ────────
-    "mov eax, cr0",
-    "and eax, 0x7FFFFFFF",
-    "mov cr0, eax",
-
-    "mov eax, cr4",
-    "and eax, 0xFFFFFFDF",
-    "mov cr4, eax",
-
-    "mov ecx, 0xC0000080",
-    "rdmsr",
-    "and eax, 0xFFFFFEFF",
-    "wrmsr",
-
-    // ── 5. Copy realmode stub to 0x0600 (low memory) ─
-    //     Use .att_syntax temporarily for unambiguous immediate
-    //     address loading, then switch back to intel syntax.
-    ".att_syntax prefix",
-    "movl $realmode_stub, %esi",
-    "movl $0x0600, %edi",
-    "movl $(realmode_stub_end - realmode_stub), %ecx",
-    "rep movsb",
-    ".intel_syntax noprefix",
-
-    // ── 6. Disable protected mode → real mode ────────
-    //     Still in 32-bit code segment → D=1, so after PE is cleared
-    //     we can still execute 32-bit instructions (unreal mode).
-    "mov eax, cr0",
-    "and eax, 0xFFFFFFFE",
-    "mov cr0, eax",
-
-    // ── 7. Far jump to realmode stub at 0x0600 ───────
-    //     In 32-bit code mode, far-jump default encoding is
-    //     EA [32-bit offset] [16-bit selector], so no 0x66 prefix needed.
-    ".byte 0xEA",
-    ".long 0x0600",
-    ".word 0x0000",
-);
-
-/// Write boot cookie and invoke the global-asm chainloader.
+/// Copy the real-mode trampoline to low memory, write the boot cookie,
+/// and invoke the mode-switch #[naked] function.
 /// Never returns.
-#[no_mangle]
-pub fn chainload_iso() -> ! {
-    let cookie_ptr = BOOT_COOKIE_ADDR as *mut u32;
+fn chainload_iso() -> ! {
+    // 1. Write boot cookie at 0x7B00 so the MBR recognises a warm reboot.
     unsafe {
-        *cookie_ptr = BOOT_COOKIE_MAGIC;
-        do_chainload();
+        *(BOOT_COOKIE_ADDR as *mut u32) = BOOT_COOKIE_MAGIC;
     }
-    loop {
-        unsafe { core::arch::asm!("hlt") }
-    }
+
+    // 2. Copy the real-mode trampoline bytecode to 0x0600.
+    chainload::copy_trampoline();
+
+    // 3. Transition: 64-bit long mode → 32-bit compat → unreal → real mode
+    //    → far-jump to 0x0000:0x0600 (trampoline) → far-jump to 0x0000:0x7C00.
+    unsafe { chainload::do_mode_switch() }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -300,9 +145,6 @@ pub fn boot_iso(file: &DirEntry, _ctx: &FsCtx) -> ! {
         &mut boot_sector_count,
         &mut error_row,
     ) {
-        // parse_el_torito already printed error messages.
-        // Halt — caller (menu) would need to handle fallback but
-        // boot_iso never returns.
         vga_print(error_row + 2, 2, b"ISO boot failed. Press any key to halt...", 0x07);
         while crate::kbd::kbd_wait_key() == 0 {}
         loop {
@@ -322,7 +164,5 @@ pub fn boot_iso(file: &DirEntry, _ctx: &FsCtx) -> ! {
 
     vga_print(10, 5, b"Chainloading...", 0x0F);
 
-    // chainload_iso() handles real-mode transition and far-jump.
-    // It never returns.
     chainload_iso()
 }
