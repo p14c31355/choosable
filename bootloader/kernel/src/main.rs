@@ -662,7 +662,7 @@ fn scan_ntfs_dir(ctx: &FsCtx, files: &mut [DirEntry], file_count: &mut usize) {
     // Fixup
     let fixup_off = u16::from_le_bytes([rec_buf[4], rec_buf[5]]) as usize;
     let fixup_count = u16::from_le_bytes([rec_buf[6], rec_buf[7]]) as usize;
-    if fixup_off > 0 && fixup_off < rec_size && fixup_count > 1 {
+    if fixup_off > 0 && fixup_off + 2 <= rec_size && fixup_count > 1 {
         let fixup_val = u16::from_le_bytes([rec_buf[fixup_off], rec_buf[fixup_off + 1]]);
         for i in 1..fixup_count {
             let pos = i * 512 - 2;
