@@ -617,7 +617,7 @@ fn find_gpt_data_partition(
         let eoff = i as usize * sz as usize;
         let lba = entries_lba + (eoff / 512) as u64;
         let boff = eoff % 512;
-        if boff + 16 > 512 {
+        if boff + 40 > 512 {
             continue;
         }
         if !loaded || lba != current_lba {
