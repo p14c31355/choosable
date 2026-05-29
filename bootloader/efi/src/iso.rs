@@ -217,6 +217,85 @@ fn find_efi_boot(
 //  UEFI chainload
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Build a minimal DevicePath for the ISO's EFI executable:
+///   HD(partition1) / File("\\EFI\\BOOT\\BOOTX64.EFI")
+/// Returns a pool-allocated pointer, or null on failure.
+fn build_iso_device_path(
+    bs: &mut BootServices,
+    part1_lba: u64,
+) -> *mut c_void {
+    // ── Hard Drive media device path node (42 bytes) ──────
+    const HD_NODE: [u8; 42] = {
+        let mut n = [0u8; 42];
+        n[0] = 0x04; // Type: MEDIA_DEVICE_PATH
+        n[1] = 0x01; // SubType: HARD_DRIVE
+        // Length (2 bytes LE) = 42 → 0x002A
+        n[2] = 0x2A;
+        n[3] = 0x00;
+        // PartitionNumber = 1 (bytes 4-7)
+        n[4] = 1;
+        // n[5..7] = 0
+        // PartitionStart (bytes 8-15, placeholder)
+        // PartitionSize (bytes 16-23, 0 = unknown)
+        // PartitionSignature (bytes 24-39, zero)
+        // PartitionFormat = 0x02 (GPT) at byte 40
+        n[40] = 0x02;
+        // SignatureType = 0x00 (None) at byte 41
+        n
+    };
+
+    // ── File path node (48 bytes = 4 header + 44 UCS-2) ───
+    let file_name: [u16; 22] = [
+        b'\\' as u16, b'E' as u16, b'F' as u16, b'I' as u16,
+        b'\\' as u16, b'B' as u16, b'O' as u16, b'O' as u16, b'T' as u16,
+        b'\\' as u16,
+        b'B' as u16, b'O' as u16, b'O' as u16, b'T' as u16, b'X' as u16,
+        b'6' as u16, b'4' as u16, b'.' as u16, b'E' as u16, b'F' as u16, b'I' as u16,
+        0x0000u16, // null terminator
+    ];
+
+    // ── End device path node (4 bytes) ────────────────────
+    const END_NODE: [u8; 4] = [0x7F, 0xFF, 0x04, 0x00];
+
+    let total = HD_NODE.len() + 4 + file_name.len() * 2 + END_NODE.len();
+    // = 42 + 4 + 44 + 4 = 94
+
+    let mut ptr: *mut c_void = core::ptr::null_mut();
+    let status = unsafe {
+        (bs.allocate_pool)(MemoryType::EfiLoaderData, total, &mut ptr)
+    };
+    if status != EFI_SUCCESS || ptr.is_null() {
+        return core::ptr::null_mut();
+    }
+    let dp = ptr as *mut u8;
+
+    unsafe {
+        // HD node
+        let mut off = 0usize;
+        dp.copy_from_nonoverlapping(HD_NODE.as_ptr(), HD_NODE.len());
+        off += HD_NODE.len();
+        // Patch PartitionStart (bytes 8-15) with actual partition LBA in bytes
+        *(dp.add(8) as *mut u64) = (part1_lba * 512).to_le();
+
+        // File path node header
+        dp.add(off).write_volatile(0x04u8); // Type: MEDIA_DEVICE_PATH
+        off += 1;
+        dp.add(off).write_volatile(0x04u8); // SubType: FILE_PATH
+        off += 1;
+        let file_bytes = (file_name.len() * 2) as u16; // 44 bytes including null
+        *(dp.add(off) as *mut u16) = (4 + file_bytes).to_le(); // total node length
+        off += 2;
+        // File path body
+        core::ptr::copy_nonoverlapping(file_name.as_ptr() as *const u8, dp.add(off), file_name.len() * 2);
+        off += file_name.len() * 2;
+
+        // End node
+        dp.add(off).copy_from_nonoverlapping(END_NODE.as_ptr(), END_NODE.len());
+    }
+
+    ptr
+}
+
 /// Load and start an EFI executable from within an ISO.
 ///
 /// This is the **correct** UEFI chainload path.  No real-mode transition,
@@ -225,6 +304,7 @@ fn uefi_chainload_iso(
     st: &mut SystemTable,
     image_handle: *mut c_void,
     disk_handle: *mut c_void,
+    part1_lba: u64,
     files: &[IsoEntry; 64],
     idx: usize,
     bio_ref: &BlockIoProtocol,
@@ -259,21 +339,23 @@ fn uefi_chainload_iso(
 
     print_raw(st, b"Loading EFI image...\r\n\0");
 
+    // Build a proper DevicePath so the child image can find its files
+    let device_path = build_iso_device_path(bs, part1_lba);
+
     // LoadImage
     let mut child_handle: *mut c_void = core::ptr::null_mut();
     let status = unsafe {
         (bs.load_image)(
             false,               // BootPolicy
             image_handle,        // ParentImageHandle
-            core::ptr::null_mut(), // DevicePath (NULL = memory-only)
+            device_path as *mut DevicePathProtocol, // DevicePath
             buf_ptr,             // SourceBuffer
             buf_len as u64,      // SourceSize
             &mut child_handle,
         )
     };
 
-    // Patch LoadedImageProtocol.DeviceHandle to point to the disk handle
-    // so the child image can discover block devices.
+    // Patch LoadedImageProtocol.DeviceHandle + FilePath
     if status == EFI_SUCCESS {
         let mut lip: *mut LoadedImageProtocol = core::ptr::null_mut();
         let lip_status = unsafe {
@@ -286,6 +368,11 @@ fn uefi_chainload_iso(
         if lip_status == EFI_SUCCESS && !lip.is_null() {
             unsafe {
                 (*lip).device_handle = disk_handle;
+                // FilePath was already set by LoadImage via the DevicePath parameter,
+                // but LoadImage may overwrite it — ensure it stays.
+                if (*lip).file_path.is_null() {
+                    (*lip).file_path = device_path;
+                }
             }
         }
     } else {
@@ -319,6 +406,7 @@ pub fn boot_iso(
     st: &mut SystemTable,
     image_handle: *mut c_void,
     disk_handle: *mut c_void,
+    part1_lba: u64,
     files: &[IsoEntry; 64],
     idx: usize,
     bio_ref: &BlockIoProtocol,
@@ -326,7 +414,7 @@ pub fn boot_iso(
     mid: u32,
 ) {
     print_raw(st, b"\r\nBooting ISO (UEFI chainload)...\r\n\0");
-    uefi_chainload_iso(st, image_handle, disk_handle, files, idx, bio_ref, bio_ptr, mid);
+    uefi_chainload_iso(st, image_handle, disk_handle, part1_lba, files, idx, bio_ref, bio_ptr, mid);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -389,10 +477,10 @@ pub fn show_menu(
         if (b'1'..=b'9').contains(&ch) {
             let idx = (ch - b'1') as usize;
             if idx < count {
-                boot_iso(st, image_handle, disk_handle, files, idx, bio_ref, bio_ptr, mid);
+                boot_iso(st, image_handle, disk_handle, ctx.part1_lba, files, idx, bio_ref, bio_ptr, mid);
             }
         } else if ch == b'0' && count >= 10 {
-            boot_iso(st, image_handle, disk_handle, files, 9, bio_ref, bio_ptr, mid);
+            boot_iso(st, image_handle, disk_handle, ctx.part1_lba, files, 9, bio_ref, bio_ptr, mid);
         } else if ch == b'r' || ch == b'R' {
             print_raw(st, b"\r\nRe-scanning...\r\n\0");
             let mut new_files: [IsoEntry; 64] = unsafe { core::mem::zeroed() };
