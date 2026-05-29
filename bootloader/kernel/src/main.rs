@@ -222,10 +222,11 @@ fn read_partitions() -> ([Partition; 4], usize) {
                     for i in 0..max {
                         let eoff = i * sz as usize;
                         if sec[eoff..eoff + 16] == basic_data {
-                            let lba = u32::from_le_bytes(sec[eoff + 32..eoff + 36].try_into().unwrap());
-                            let sectors = u32::from_le_bytes(sec[eoff + 40..eoff + 44].try_into().unwrap());
+                            let start_lba = u64::from_le_bytes(sec[eoff + 32..eoff + 40].try_into().unwrap());
+                            let end_lba = u64::from_le_bytes(sec[eoff + 40..eoff + 48].try_into().unwrap());
+                            let sectors = (end_lba + 1).saturating_sub(start_lba);
                             if sectors > 0 {
-                                parts[count] = Partition { start_lba: lba, sector_count: sectors, fs_type: 0x07 };
+                                parts[count] = Partition { start_lba: start_lba as u32, sector_count: sectors as u32, fs_type: 0x07 };
                                 count += 1;
                             }
                             break;
