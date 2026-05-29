@@ -97,6 +97,9 @@ extern "efiapi" fn efi_main(
 
     // vbr[0x6D] = SectorsPerClusterShift (NOT vbr[0x6C]=BytesPerSectorShift)
     let spc_shift = vbr[109] as u32;
+    if spc_shift >= 25 {
+        die(st, b"ERROR: Invalid SectorsPerClusterShift.\r\n\0");
+    }
     let cluster_bytes = (1u32 << spc_shift) * 512;
     let fat_off = u32::from_le_bytes([vbr[80], vbr[81], vbr[82], vbr[83]]) as u64;
     let fat_len = u32::from_le_bytes([vbr[84], vbr[85], vbr[86], vbr[87]]) as u64;
