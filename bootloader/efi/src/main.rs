@@ -479,34 +479,39 @@ fn scan_fat32_dir(
                     let seq = first & 0x1F;
                     let is_last = first & 0x40;
                     let checksum = buf[off + 13];
-                    if is_last != 0 {
-                        // New LFN chain
-                        lfn_seq = seq;
-                        lfn_checksum = checksum;
-                        lfn_len = 0;
-                    }
-                    if seq != lfn_seq || checksum != lfn_checksum {
-                        continue; // skip out-of-order LFN
-                    }
-                    if lfn_seq == 0 {
+                    if seq == 0 || seq > 20 {
                         continue;
                     }
-                    lfn_seq -= 1;
                     let chars = [
                         buf[off + 1], buf[off + 3], buf[off + 5], buf[off + 7], buf[off + 9],
                         buf[off + 14], buf[off + 16], buf[off + 18], buf[off + 20],
                         buf[off + 22], buf[off + 24], buf[off + 28], buf[off + 30],
                     ];
+                    if is_last != 0 {
+                        lfn_seq = seq;
+                        lfn_checksum = checksum;
+                        let mut num_chars = 0;
+                        for &c in &chars {
+                            if c == 0x00 || c == 0xFF {
+                                break;
+                            }
+                            num_chars += 1;
+                        }
+                        lfn_len = ((seq as usize - 1) * 13 + num_chars).min(255);
+                    }
+                    if seq != lfn_seq || checksum != lfn_checksum {
+                        continue;
+                    }
+                    lfn_seq -= 1;
+                    let write_start = (seq as usize - 1) * 13;
+                    let mut char_idx = 0;
                     for &c in &chars {
                         if c == 0x00 || c == 0xFF {
                             break;
                         }
-                        if lfn_len < 255 && c < 0x80 {
-                            lfn_buf[lfn_len] = c;
-                            lfn_len += 1;
-                        } else if lfn_len < 255 {
-                            lfn_buf[lfn_len] = b'?';
-                            lfn_len += 1;
+                        if write_start + char_idx < 255 {
+                            lfn_buf[write_start + char_idx] = if c < 0x80 { c } else { b'?' };
+                            char_idx += 1;
                         }
                     }
                     continue;
@@ -1081,11 +1086,6 @@ fn boot_iso(
                 *dest.add(s as usize * 512 + j) = b;
             }
         }
-    }
-
-    let safe_dest = 0x80000 as *mut u8;
-    unsafe {
-        core::ptr::copy_nonoverlapping(dest, safe_dest, boot_sector_count as usize * 512);
     }
 
     let cookie_ptr = 0x7B00usize as *mut u32;

@@ -673,10 +673,9 @@ pub fn process_secure_boot_esp(
         .open(&part2)
         .map_err(|e| ChoosableError::Generic(format!("Cannot open {}: {}", part2, e)))?;
 
-    let fs = match fatfs::FileSystem::new(file, fatfs::FsOptions::new()) {
-        Ok(fs) => fs,
-        Err(_) => return Ok(()),
-    };
+    let fs = fatfs::FileSystem::new(file, fatfs::FsOptions::new()).map_err(|e| {
+        ChoosableError::Generic(format!("Failed to open EFI FAT filesystem: {}", e))
+    })?;
     let root = fs.root_dir();
 
     let has_sb = if let Ok(efi) = root.open_dir("EFI") {
@@ -1045,7 +1044,8 @@ fn format_partition(partition: &str, label: &str, fs_type: FilesystemType) -> Re
                 let args: Vec<&str> = if *cmd == "mkexfatfs" {
                     vec!["-n", label, "-s", cluster_sectors, partition]
                 } else {
-                    vec!["-n", label, partition]
+                    // exfatprogs (modern mkfs.exfat) uses -l for label
+                    vec!["-l", label, partition]
                 };
                 match std::process::Command::new(cmd).args(&args).status() {
                     Ok(s) if s.success() => return Ok(()),
