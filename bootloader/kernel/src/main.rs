@@ -684,6 +684,9 @@ fn scan_ntfs_dir(ctx: &FsCtx, files: &mut [DirEntry], file_count: &mut usize) {
         if atype == 0xFFFFFFFF || atype == 0 {
             break;
         }
+        if off + 8 > attrs.len() {
+            break;
+        }
         let alen = u32::from_le_bytes([attrs[off + 4], attrs[off + 5], attrs[off + 6], attrs[off + 7]]) as usize;
         if alen < 8 || off + alen > attrs.len() {
             break;
