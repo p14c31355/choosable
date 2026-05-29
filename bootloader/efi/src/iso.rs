@@ -1,15 +1,12 @@
 // ═══════════════════════════════════════════════════════════════════════════
-//  ISO El Torito Boot Record parser + UEFI chainloader
+//  ISO El Torito Boot Record parser + UEFI → real mode chainloader
 // ═══════════════════════════════════════════════════════════════════════════
 //
-//  Instead of ResetSystem (which re-enters firmware and re-reads the MBR,
-//  returning to Choosable), we:
-//    1. Load the boot image to conventional memory (0x7C00)
-//    2. Get the UEFI memory map
-//    3. ExitBootServices
-//    4. Transition from long mode → real mode
-//    5. Far-jump to 0x7C00
+//  All mode-switch code is pre-encoded as const byte arrays and copied
+//  to low physical memory before ExitBootServices.  The single #[naked]
+//  function does only CLI + LGDT + retfq.
 
+use core::arch::naked_asm;
 use core::ffi::c_void;
 
 use crate::disk::read_sector;
@@ -21,119 +18,143 @@ use crate::protocol::{
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  GDT for 64→32→16→real mode transition (same as kernel/iso.rs)
+//  GDT (3 entries)
 // ═══════════════════════════════════════════════════════════════════════════
 
-core::arch::global_asm!(
-    ".align 8",
-    "realmode_gdt:",
+const GDT_NULL: u64   = 0x0000000000000000;
+const GDT_CODE32: u64 = 0x00CF9A000000FFFF; // D=1, L=0, G=1 → 4 GiB, 32-bit
+const GDT_CODE16: u64 = 0x00009A000000FFFF; // D=0, L=0, G=0 → 64 KiB, 16-bit
 
-    // Entry 0 (selector 0x00): null
-    ".quad 0",
+#[repr(C, align(8))]
+struct GdtTable([u64; 3]);
 
-    // Entry 1 (selector 0x08): 32-bit compat code (base=0, limit=4G)
-    ".word 0xFFFF",
-    ".word 0x0000",
-    ".byte 0x00",
-    ".byte 0x9A",
-    ".byte 0xCF",
-    ".byte 0x00",
+#[used]
+#[link_section = ".rodata"]
+static GDT: GdtTable = GdtTable([GDT_NULL, GDT_CODE32, GDT_CODE16]);
 
-    // Entry 2 (selector 0x10): 16-bit code (base=0, limit=64K)
-    ".word 0xFFFF",
-    ".word 0x0000",
-    ".byte 0x00",
-    ".byte 0x9A",
-    ".byte 0x00",
-    ".byte 0x00",
+#[repr(C, packed)]
+struct Gdtr { limit: u16, base: u64 }
 
-    // Entry 3 (selector 0x18): 16-bit data (base=0, limit=64K)
-    ".word 0xFFFF",
-    ".word 0x0000",
-    ".byte 0x00",
-    ".byte 0x92",
-    ".byte 0x00",
-    ".byte 0x00",
+#[used]
+#[link_section = ".data"]
+static mut GDTR: Gdtr = Gdtr { limit: 0, base: 0 };
 
-    "realmode_gdt_end:",
-    "realmode_gdtr:",
-    ".word realmode_gdt_end - realmode_gdt - 1",
-    ".quad realmode_gdt",
-);
+// ═══════════════════════════════════════════════════════════════════════════
+//  Mode-switch bytecode (32-bit, copied to 0x0500)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+//    mov   eax, cr0
+//    and   eax, 0x7FFFFFFF       ; clear PG
+//    mov   cr0, eax
+//    mov   eax, cr3
+//    mov   cr3, eax              ; flush TLB
+//    mov   eax, cr4
+//    and   eax, ~0x20            ; clear PAE
+//    mov   cr4, eax
+//    mov   ecx, 0xC0000080
+//    rdmsr
+//    and   eax, ~0x100           ; clear LME
+//    wrmsr
+//    jmpf  0x0010:0x00000600
 
-extern "C" {
-    fn realmode_gdtr();
-    fn realmode_gdt();
-}
+const MODE_SWITCH: [u8; 49] = [
+    0x0F, 0x20, 0xC0,                   // mov eax, cr0
+    0x25, 0xFF, 0xFF, 0xFF, 0x7F,       // and eax, 0x7FFFFFFF
+    0x0F, 0x22, 0xC0,                   // mov cr0, eax
+    0x0F, 0x20, 0xD8,                   // mov eax, cr3
+    0x0F, 0x22, 0xD8,                   // mov cr3, eax
+    0x0F, 0x20, 0xE0,                   // mov eax, cr4
+    0x25, 0xDF, 0xFF, 0xFF, 0xFF,       // and eax, ~0x20
+    0x0F, 0x22, 0xE0,                   // mov cr4, eax
+    0xB9, 0x80, 0x00, 0x00, 0xC0,       // mov ecx, 0xC0000080
+    0x0F, 0x32,                         // rdmsr
+    0x25, 0xFF, 0xFE, 0xFF, 0xFF,       // and eax, ~0x100
+    0x0F, 0x30,                         // wrmsr
+    0xEA,
+    0x00, 0x06, 0x00, 0x00,
+    0x10, 0x00,
+];
 
-/// Transition from 64-bit long mode to real mode and jump to 0x7C00.
-/// This is called after ExitBootServices.
-///
-/// SAFETY: Never returns. Destroys the execution environment.
-extern "C" {
-    fn efi_jump_to_rm();
-}
+// ═══════════════════════════════════════════════════════════════════════════
+//  TRAMP_A (16-bit protected-mode, copied to 0x0600)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+//    mov   eax, cr0
+//    and   eax, ~1                 ; clear PE
+//    mov   cr0, eax
+//    jmpf  0x0000:0x0614
 
-core::arch::global_asm!(
-    ".global efi_jump_to_rm",
-    "efi_jump_to_rm:",
+const TRAMP_A: [u8; 17] = [
+    0x66, 0x0F, 0x20, 0xC0,
+    0x66, 0x83, 0xE0, 0xFE,
+    0x66, 0x0F, 0x22, 0xC0,
+    0xEA,
+    0x14, 0x06,
+    0x00, 0x00,
+];
 
-    "cli",
-    "lgdt [rip + realmode_gdtr]",
+// ═══════════════════════════════════════════════════════════════════════════
+//  TRAMP_B (real-mode, copied to 0x0614)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+//    mov   ax, 0
+//    mov   ds, ax
+//    mov   es, ax
+//    mov   fs, ax
+//    mov   gs, ax
+//    mov   ss, ax
+//    mov   sp, 0x7000
+//    sti
+//    mov   dl, 0x80
+//    jmpf  0x0000:0x7C00
 
-    "lea rax, [rip + 2f]",
-    "push 0x08",
-    "push rax",
-    "retfq",
-    "2:",
-    ".code32",
+const TRAMP_B: [u8; 24] = [
+    0xB8, 0x00, 0x00,
+    0x8E, 0xD8,
+    0x8E, 0xC0,
+    0x8E, 0xE0,
+    0x8E, 0xE8,
+    0x8E, 0xD0,
+    0xBC, 0x00, 0x70,
+    0xFB,
+    0xB2, 0x80,
+    0xEA, 0x00, 0x7C, 0x00, 0x00,
+];
 
-    "mov eax, cr0",
-    "and eax, 0x7FFFFFFF",
-    "mov cr0, eax",
-
-    "mov eax, cr4",
-    "and eax, 0xFFFFFFDF",
-    "mov cr4, eax",
-
-    "mov ecx, 0xC0000080",
-    "rdmsr",
-    "and eax, 0xFFFFFEFF",
-    "wrmsr",
-
-    "mov eax, cr0",
-    "and eax, 0xFFFFFFFE",
-    "mov cr0, eax",
-
-    ".code16",
-    // Hand-encoded ljmp $0x10, $3f
-    ".byte 0xEA",
-    ".long 3f",
-    ".word 0x0010",
-    "3:",
-
-    "mov ax, 0x18",
-    "mov ds, ax",
-    "mov es, ax",
-    "mov fs, ax",
-    "mov gs, ax",
-    "mov ss, ax",
-    "mov sp, 0x7000",
-
-    "mov dl, 0x80",
-    "sti",
-
-    // Hand-encoded ljmp $0, $0x7C00
-    ".byte 0xEA",
-    ".word 0x7C00",
-    ".word 0x0000",
-);
-
-unsafe fn jump_to_real_mode() -> ! {
-    efi_jump_to_rm();
-    loop {
-        core::arch::asm!("hlt");
+/// Copy all trampoline bytecodes to low memory.
+/// Must be called **before** ExitBootServices.
+fn copy_trampolines() {
+    unsafe {
+        // Initialise GDTR
+        GDTR = Gdtr {
+            limit: (core::mem::size_of::<GdtTable>() - 1) as u16,
+            base: &GDT as *const GdtTable as u64,
+        };
+        // Copy code
+        core::slice::from_raw_parts_mut(0x0500 as *mut u8, MODE_SWITCH.len())
+            .copy_from_slice(&MODE_SWITCH);
+        core::slice::from_raw_parts_mut(0x0600 as *mut u8, TRAMP_A.len())
+            .copy_from_slice(&TRAMP_A);
+        core::slice::from_raw_parts_mut(0x0614 as *mut u8, TRAMP_B.len())
+            .copy_from_slice(&TRAMP_B);
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Mode-switch entry (naked function)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[unsafe(naked)]
+unsafe extern "C" fn jump_to_real_mode() -> ! {
+    naked_asm!(
+        "cli",
+        "lgdt [rip + {gdtr}]",
+        "mov rax, 0x0500",
+        "push 0x08",
+        "push rax",
+        "retfq",
+        gdtr = sym GDTR,
+    )
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -168,7 +189,6 @@ fn parse_el_torito(
         return None;
     }
 
-    // Prefer BIOS entry (0x88), fall back to UEFI (0x90)
     let mut best: Option<(u32, u16)> = None;
     for i in 0..16 {
         let off = i * 32;
@@ -232,7 +252,7 @@ pub fn boot_iso(
 
     // Allocate pages at 1 MiB as a temporary read buffer
     let num_pages = (total_bytes + 4095) / 4096;
-    let mut tmp_addr: u64 = 0x100000; // 1 MiB
+    let mut tmp_addr: u64 = 0x100000;
     let status = unsafe {
         (bs.allocate_pages)(
             AllocateType::AllocateAddress,
@@ -262,14 +282,12 @@ pub fn boot_iso(
 
     print_raw(st, b"Boot image loaded.\r\n\0");
 
-    // ── ExitBootServices ──────────────────────────────────────
-    // Get memory map to obtain the map key.
+    // ── Get memory map ──────────────────────────────────────────
     let mut map_size: usize = 0;
     let mut map_key: u64 = 0;
     let mut desc_size: u64 = 0;
     let mut desc_version: u32 = 0;
 
-    // First call to get required buffer size
     let mut dummy_desc: MemoryDescriptor = MemoryDescriptor {
         ty: 0,
         pad: 0,
@@ -288,10 +306,8 @@ pub fn boot_iso(
         );
     }
 
-    // Use a 64 KB static buffer for the memory map
     map_size += desc_size as usize * 4;
     if map_size > 65536 {
-        map_size = 65536;
         die(st, b"ERROR: Memory map too large.\r\n\0");
     }
     static mut MEM_MAP_BUF: [u8; 65536] = [0u8; 65536];
@@ -307,7 +323,7 @@ pub fn boot_iso(
         );
     }
 
-    // Now copy boot image from temp to 0x7C00
+    // Copy boot image from temp to 0x7C00
     let boot_addr = 0x7C00usize as *mut u8;
     unsafe {
         for i in 0..total_bytes {
@@ -315,17 +331,15 @@ pub fn boot_iso(
         }
     }
 
-    // Write boot cookie
-    let cookie_ptr = 0x7B00usize as *mut u32;
-    unsafe {
-        *cookie_ptr = 0x544F4F42u32; // "BOOT"
-    }
+    // Copy trampolines to low memory (must be done before ExitBootServices
+    // so the memory is accessible in long mode identity-mapped region).
+    copy_trampolines();
 
     // Exit boot services
-    let image_handle = core::ptr::null_mut::<c_void>(); // We'll pass 0 — UEFI spec allows NULL
+    let image_handle = core::ptr::null_mut::<c_void>();
     let exit_status = unsafe { (bs.exit_boot_services)(image_handle, map_key) };
     if exit_status != EFI_SUCCESS {
-        // Try again — map key may have changed
+        // Try again with updated map key
         unsafe {
             (bs.get_memory_map)(
                 &mut map_size,
@@ -335,10 +349,7 @@ pub fn boot_iso(
                 &mut desc_version,
             );
         }
-        let exit_status2 = unsafe { (bs.exit_boot_services)(image_handle, map_key) };
-        if exit_status2 != EFI_SUCCESS {
-            // Last resort: just go for it
-        }
+        let _ = unsafe { (bs.exit_boot_services)(image_handle, map_key) };
     }
 
     // ── Transition to real mode and jump ──────────────────────
@@ -415,7 +426,5 @@ pub fn show_menu(
             show_menu(st, &new_files, new_count, ctx, bio_ref, bio_ptr, mid);
         }
     }
-    // All inner branches diverge via boot_iso() or recursive show_menu().
-    // Satisfy -> ! with an unreachable diverging tail.
     halt_or_reboot(st)
 }
