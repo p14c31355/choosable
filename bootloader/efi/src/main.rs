@@ -6,6 +6,31 @@ use core::panic::PanicInfo;
 const EFI_SUCCESS: usize = 0;
 const EFI_BUFFER_TOO_SMALL: usize = 0x8000000000000005usize;
 
+// ── Filesystem type ─────────────────────────────────────────────────
+#[derive(Clone, Copy, PartialEq)]
+enum FsType {
+    Exfat,
+    Fat32,
+    Ntfs,
+}
+
+// ── Filesystem context (kept for re-scanning) ──────────────────────
+struct FsCtx {
+    fs: FsType,
+    part1_lba: u64,
+    // exFAT / FAT32
+    spc: u32,
+    fat_start: u64,
+    fat_len: u64,
+    heap_start: u64,
+    root_cluster: u32,
+    // NTFS
+    mft_start_lba: u64,
+    sectors_per_cluster: u32,
+    bytes_per_cluster: u64,
+    mft_record_size: u64,
+}
+
 #[no_mangle]
 extern "efiapi" fn efi_main(
     image_handle: *mut core::ffi::c_void,
@@ -16,13 +41,11 @@ extern "efiapi" fn efi_main(
 
     banner(st);
 
-    // Find a whole-disk Block I/O handle
     let disk_handle = match find_disk_handle(bs, image_handle) {
         Some(h) => h,
         None => die(st, b"ERROR: No disk device found.\r\n\0"),
     };
 
-    // Get Block I/O protocol on the disk handle
     let mut bio: *mut BlockIoProtocol = core::ptr::null_mut();
     if unsafe {
         (bs.handle_protocol)(
@@ -43,14 +66,14 @@ extern "efiapi" fn efi_main(
         0
     };
 
-    // Read MBR (LBA 0)
+    // Read MBR
     let mut mbr: [u8; 512] = [0; 512];
     if unsafe { (bio_ref.read_blocks)(bio_ptr, mid, 0, 512, mbr.as_mut_ptr() as _) } != EFI_SUCCESS
     {
         die(st, b"ERROR: Cannot read MBR.\r\n\0");
     }
 
-    // Find partition 1 — try MBR first, then GPT fallback
+    // Find partition 1
     let mut part1_lba: u64 = 0;
     let mut is_gpt = false;
     for i in 0..4 {
@@ -69,11 +92,9 @@ extern "efiapi" fn efi_main(
     }
 
     if part1_lba == 0 && is_gpt {
-        // GPT protective MBR — search GPT partition table for Basic Data Partition
         print_raw(st, b"GPT detected, searching for data partition...\r\n\0");
         part1_lba = find_gpt_data_partition(st, bio_ref, bio_ptr, mid);
     }
-
     if part1_lba == 0 {
         die(st, b"ERROR: No partition 1 found.\r\n\0");
     }
@@ -86,95 +107,170 @@ extern "efiapi" fn efi_main(
         die(st, b"ERROR: Cannot read partition 1.\r\n\0");
     }
 
-    // Parse exFAT
-    if &vbr[3..11] != b"EXFAT   " {
-        print_raw(st, b"Partition 1 is not exFAT. First 16 bytes:\r\n\0");
-        print_hex(st, b"  ", u64::from_le_bytes(vbr[0..8].try_into().unwrap()));
-        print_hex(st, b" ", u64::from_le_bytes(vbr[8..16].try_into().unwrap()));
-        print_raw(st, b"\r\n\0");
-        die(st, b"Only exFAT is supported.\r\n\0");
+    // Detect filesystem type
+    let fs = if &vbr[3..11] == b"EXFAT   " {
+        FsType::Exfat
+    } else if &vbr[3..11] == b"NTFS    " {
+        FsType::Ntfs
+    } else if &vbr[0x52..0x5A] == b"FAT32   " {
+        FsType::Fat32
+    } else {
+        // Fallback: check FAT32 at 0x52
+        if &vbr[0x52..0x5A] == b"FAT32   " {
+            FsType::Fat32
+        } else {
+            print_raw(st, b"Unknown filesystem on partition 1.\r\n\0");
+            print_hex(st, b"  First 16 bytes: ", u64::from_le_bytes(vbr[0..8].try_into().unwrap()));
+            print_hex(st, b"  ", u64::from_le_bytes(vbr[8..16].try_into().unwrap()));
+            print_raw(st, b"\r\n\0");
+            halt_or_reboot(st);
+        }
+    };
+
+    // Parse BPB
+    let mut ctx = FsCtx {
+        fs,
+        part1_lba,
+        spc: 0,
+        fat_start: 0,
+        fat_len: 0,
+        heap_start: 0,
+        root_cluster: 0,
+        mft_start_lba: 0,
+        sectors_per_cluster: 0,
+        bytes_per_cluster: 0,
+        mft_record_size: 0,
+    };
+
+    match fs {
+        FsType::Exfat => {
+            let spc_shift = vbr[109] as u32;
+            if spc_shift >= 25 {
+                die(st, b"ERROR: Invalid SectorsPerClusterShift.\r\n\0");
+            }
+            let cluster_bytes = (1u32 << spc_shift) * 512;
+            let fat_off = u32::from_le_bytes([vbr[80], vbr[81], vbr[82], vbr[83]]) as u64;
+            let fat_len = u32::from_le_bytes([vbr[84], vbr[85], vbr[86], vbr[87]]) as u64;
+            let heap_off = u32::from_le_bytes([vbr[88], vbr[89], vbr[90], vbr[91]]) as u64;
+            let root_cluster = u32::from_le_bytes([vbr[96], vbr[97], vbr[98], vbr[99]]);
+
+            ctx.spc = cluster_bytes / 512;
+            ctx.fat_start = part1_lba + fat_off;
+            ctx.fat_len = fat_len;
+            ctx.heap_start = part1_lba + heap_off;
+            ctx.root_cluster = root_cluster;
+
+            print_raw(st, b"exFAT detected. Scanning...\r\n\0");
+        }
+        FsType::Fat32 => {
+            let spc = vbr[13] as u32; // sectors per cluster
+            if spc == 0 {
+                die(st, b"ERROR: Invalid sectors per cluster.\r\n\0");
+            }
+            let reserved = u16::from_le_bytes([vbr[14], vbr[15]]) as u64;
+            let num_fats = vbr[16] as u64;
+            let fat_sectors = u32::from_le_bytes([vbr[36], vbr[37], vbr[38], vbr[39]]) as u64;
+            let root_cluster = u32::from_le_bytes([vbr[44], vbr[45], vbr[46], vbr[47]]);
+
+            let fat_start = part1_lba + reserved;
+            let data_start = fat_start + num_fats * fat_sectors;
+
+            ctx.spc = spc;
+            ctx.fat_start = fat_start;
+            ctx.fat_len = fat_sectors;
+            ctx.heap_start = data_start;
+            ctx.root_cluster = root_cluster;
+
+            print_raw(st, b"FAT32 detected. Scanning...\r\n\0");
+        }
+        FsType::Ntfs => {
+            let spc = vbr[13] as u32; // sectors per cluster
+            if spc == 0 {
+                die(st, b"ERROR: Invalid sectors per cluster.\r\n\0");
+            }
+            let cluster_bytes = spc as u64 * 512;
+            // MFT start cluster is at offset 0x30 (48) in NTFS BPB
+            let mft_lcn = i64::from_le_bytes(vbr[0x30..0x38].try_into().unwrap());
+            let mft_start_lba = part1_lba + (mft_lcn as u64) * spc as u64;
+            // MFT record size: clus_per_mft_record at offset 0x40 (64)
+            let cpmr_raw = i32::from_le_bytes(vbr[0x40..0x44].try_into().unwrap());
+            let mft_record_size: u64 = if cpmr_raw > 0 {
+                cpmr_raw as u64 * cluster_bytes
+            } else {
+                (1u64 << (-cpmr_raw)) as u64
+            };
+            if mft_record_size == 0 || mft_record_size > 4096 {
+                die(st, b"ERROR: Invalid MFT record size.\r\n\0");
+            }
+
+            ctx.spc = spc;
+            ctx.sectors_per_cluster = spc;
+            ctx.bytes_per_cluster = cluster_bytes;
+            ctx.mft_start_lba = mft_start_lba;
+            ctx.mft_record_size = mft_record_size;
+            ctx.heap_start = part1_lba; // partition start (NTFS doesn't use heap_start)
+
+            print_raw(st, b"NTFS detected. Scanning...\r\n\0");
+        }
     }
 
-    // vbr[0x6D] = SectorsPerClusterShift (NOT vbr[0x6C]=BytesPerSectorShift)
-    let spc_shift = vbr[109] as u32;
-    if spc_shift >= 25 {
-        die(st, b"ERROR: Invalid SectorsPerClusterShift.\r\n\0");
-    }
-    let cluster_bytes = (1u32 << spc_shift) * 512;
-    let fat_off = u32::from_le_bytes([vbr[80], vbr[81], vbr[82], vbr[83]]) as u64;
-    let fat_len = u32::from_le_bytes([vbr[84], vbr[85], vbr[86], vbr[87]]) as u64;
-    let heap_off = u32::from_le_bytes([vbr[88], vbr[89], vbr[90], vbr[91]]) as u64;
-    let root_cluster = u32::from_le_bytes([vbr[96], vbr[97], vbr[98], vbr[99]]);
-
-    let fat_start = part1_lba + fat_off;
-    let heap_start = part1_lba + heap_off;
-    let sec_per_cluster = cluster_bytes / 512;
-
-    // Debug: print exFAT parameters
-    print_raw(st, b"exFAT: spc=");
-    print_hex(st, b"0x", sec_per_cluster as u64);
-    print_raw(st, b" root_cl=");
-    print_hex(st, b"0x", root_cluster as u64);
-    print_raw(st, b" fat_off=");
-    print_hex(st, b"0x", fat_off);
-    print_raw(st, b" heap_off=");
-    print_hex(st, b"0x", heap_off);
-    print_raw(st, b" part1_lba=");
-    print_hex(st, b"0x", part1_lba);
-    print_raw(st, b"\r\n\0");
-
-    // Save root cluster for re-scan support
-    unsafe {
-        ROOT_CLUSTER = root_cluster;
-    }
-
-    // Scan root directory for .iso files
+    // Scan root directory
     let mut iso_count: usize = 0;
     let mut iso_files: [IsoEntry; 64] = unsafe { core::mem::zeroed() };
-    scan_exfat_dir(
-        bio_ref,
-        bio_ptr,
-        mid,
-        root_cluster,
-        sec_per_cluster,
-        fat_start,
-        fat_len,
-        heap_start,
-        &mut iso_files,
-        &mut iso_count,
-    );
+    scan_directory(bio_ref, bio_ptr, mid, &ctx, &mut iso_files, &mut iso_count);
 
     // Show menu
-    show_menu(
-        st,
-        &iso_files,
-        iso_count,
-        part1_lba,
-        sec_per_cluster,
-        fat_start,
-        fat_len,
-        heap_start,
-        bio_ref,
-        bio_ptr,
-        mid,
-    );
+    show_menu(st, &iso_files, iso_count, &ctx, bio_ref, bio_ptr, mid);
     halt_or_reboot(st);
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  exFAT directory scanner
+//  Shared scan dispatcher
 // ═══════════════════════════════════════════════════════════════════
 
 #[derive(Clone, Copy)]
 struct IsoEntry {
     name: [u8; 256],
     name_len: usize,
-    start_cluster: u32,
+    file_start_lba: u64,   // LBA of first sector of the ISO file
     file_size: u64,
     file_size_bytes: u64,
 }
 unsafe impl core::marker::Send for IsoEntry {}
 unsafe impl core::marker::Sync for IsoEntry {}
+
+fn scan_directory(
+    bio: &BlockIoProtocol,
+    bio_ptr: *mut BlockIoProtocol,
+    mid: u32,
+    ctx: &FsCtx,
+    files: &mut [IsoEntry; 64],
+    count: &mut usize,
+) {
+    match ctx.fs {
+        FsType::Exfat => {
+            scan_exfat_dir(
+                bio, bio_ptr, mid, ctx.root_cluster, ctx.spc, ctx.fat_start, ctx.fat_len,
+                ctx.heap_start, files, count,
+            );
+        }
+        FsType::Fat32 => {
+            scan_fat32_dir(
+                bio, bio_ptr, mid, ctx.root_cluster, ctx.spc, ctx.fat_start, ctx.heap_start,
+                files, count,
+            );
+        }
+        FsType::Ntfs => {
+            scan_ntfs_dir(
+                bio, bio_ptr, mid, ctx, files, count,
+            );
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  exFAT directory scanner
+// ═══════════════════════════════════════════════════════════════════
 
 fn scan_exfat_dir(
     bio: &BlockIoProtocol,
@@ -183,18 +279,17 @@ fn scan_exfat_dir(
     root_cluster: u32,
     spc: u32,
     fat_start: u64,
-    fat_len: u64,
+    _fat_len: u64,
     heap_start: u64,
     files: &mut [IsoEntry; 64],
     count: &mut usize,
 ) {
     let mut cluster = root_cluster;
     let mut buf: [u8; 512] = [0; 512];
-    // Small carry-over buffer for entry sets that cross sector boundaries
     let mut carry: [u8; 608] = [0; 608];
     let mut carry_len: usize = 0;
 
-    'outer: loop {
+    loop {
         for si in 0..spc {
             let lba = heap_start + (cluster as u64 - 2) * spc as u64 + si as u64;
             if unsafe { (bio.read_blocks)(bio_ptr, mid, lba, 512, buf.as_mut_ptr() as _) }
@@ -202,11 +297,8 @@ fn scan_exfat_dir(
             {
                 return;
             }
-
-            // Combine carry-over + new sector
             let total = carry_len + 512;
-            // Use a small stack buffer — entry sets are at most 19*32=608 bytes
-            let mut combined = [0u8; 1152]; // 640 + 512
+            let mut combined = [0u8; 1152];
             combined[..carry_len].copy_from_slice(&carry[..carry_len]);
             combined[carry_len..total].copy_from_slice(&buf);
             carry_len = 0;
@@ -220,11 +312,9 @@ fn scan_exfat_dir(
                     return;
                 }
                 if etype == 0x85 {
-                    // File entry
                     let sec_count = entries[pos * 32 + 1] as usize;
                     let total_ents = 1 + sec_count;
                     if pos + total_ents > n_entries {
-                        // Entry set spans into next sector
                         let rem = total - pos * 32;
                         if rem <= carry.len() {
                             carry[..rem].copy_from_slice(&entries[pos * 32..]);
@@ -232,32 +322,25 @@ fn scan_exfat_dir(
                         } else {
                             carry_len = 0;
                         }
-                        break; // continue to next sector
+                        break;
                     }
-                    // Stream extension follows at pos+1
                     let stream_off = (pos + 1) * 32;
                     if entries[stream_off] != 0xC0 {
                         pos += total_ents;
                         continue;
                     }
                     let start_cl = u32::from_le_bytes([
-                        entries[stream_off + 20],
-                        entries[stream_off + 21],
-                        entries[stream_off + 22],
-                        entries[stream_off + 23],
+                        entries[stream_off + 20], entries[stream_off + 21],
+                        entries[stream_off + 22], entries[stream_off + 23],
                     ]);
                     let fsize = u64::from_le_bytes([
-                        entries[stream_off + 24],
-                        entries[stream_off + 25],
-                        entries[stream_off + 26],
-                        entries[stream_off + 27],
-                        entries[stream_off + 28],
-                        entries[stream_off + 29],
-                        entries[stream_off + 30],
-                        entries[stream_off + 31],
+                        entries[stream_off + 24], entries[stream_off + 25],
+                        entries[stream_off + 26], entries[stream_off + 27],
+                        entries[stream_off + 28], entries[stream_off + 29],
+                        entries[stream_off + 30], entries[stream_off + 31],
                     ]);
-                    let name_ents = (sec_count as usize).saturating_sub(1);
-                    let mut name_len = entries[stream_off + 3] as usize;
+                    let name_ents = (sec_count).saturating_sub(1);
+                    let name_len = entries[stream_off + 3] as usize;
                     let mut name_buf = [0u8; 256];
                     let mut name_pos = 0usize;
 
@@ -270,7 +353,6 @@ fn scan_exfat_dir(
                         if to_copy == 0 {
                             break;
                         }
-                        // UTF-16LE → ASCII
                         for j in 0..to_copy {
                             let lo = entries[noff + 2 + j * 2];
                             let hi = entries[noff + 3 + j * 2];
@@ -287,12 +369,10 @@ fn scan_exfat_dir(
                         && name_buf[name_pos - 4..name_pos].eq_ignore_ascii_case(b".iso")
                         && *count < 64
                     {
+                        let file_lba = heap_start + (start_cl as u64 - 2) * spc as u64;
                         files[*count] = IsoEntry {
-                            name: name_buf,
-                            name_len: name_pos,
-                            start_cluster: start_cl,
-                            file_size: fsize,
-                            file_size_bytes: fsize,
+                            name: name_buf, name_len: name_pos,
+                            file_start_lba: file_lba, file_size: fsize, file_size_bytes: fsize,
                         };
                         *count += 1;
                     }
@@ -302,7 +382,7 @@ fn scan_exfat_dir(
                 pos += 1;
             }
         }
-        // Next cluster in FAT chain
+        // FAT chain
         let fat_entry_lba = fat_start + (cluster as u64 * 4 / 512);
         let fat_entry_off = (cluster as usize * 4) % 512;
         let mut fat_buf: [u8; 512] = [0; 512];
@@ -312,10 +392,8 @@ fn scan_exfat_dir(
             return;
         }
         let next = u32::from_le_bytes([
-            fat_buf[fat_entry_off],
-            fat_buf[fat_entry_off + 1],
-            fat_buf[fat_entry_off + 2],
-            fat_buf[fat_entry_off + 3],
+            fat_buf[fat_entry_off], fat_buf[fat_entry_off + 1],
+            fat_buf[fat_entry_off + 2], fat_buf[fat_entry_off + 3],
         ]);
         if next < 2 || next >= 0xFFFFFFF8 {
             break;
@@ -325,7 +403,497 @@ fn scan_exfat_dir(
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  Boot menu
+//  FAT32 directory scanner
+// ═══════════════════════════════════════════════════════════════════
+
+fn fat32_read_sector(
+    bio: &BlockIoProtocol, bio_ptr: *mut BlockIoProtocol, mid: u32,
+    lba: u64, buf: &mut [u8; 512],
+) -> bool {
+    unsafe { (bio.read_blocks)(bio_ptr, mid, lba, 512, buf.as_mut_ptr() as _) == EFI_SUCCESS }
+}
+
+fn fat32_next_cluster(
+    bio: &BlockIoProtocol, bio_ptr: *mut BlockIoProtocol, mid: u32,
+    fat_start: u64, cluster: u32,
+) -> u32 {
+    let fat_entry_lba = fat_start + (cluster as u64 * 4 / 512);
+    let fat_entry_off = (cluster as usize * 4) % 512;
+    let mut fat_buf: [u8; 512] = [0; 512];
+    if unsafe { (bio.read_blocks)(bio_ptr, mid, fat_entry_lba, 512, fat_buf.as_mut_ptr() as _) }
+        != EFI_SUCCESS
+    {
+        return 0x0FFFFFFF;
+    }
+    u32::from_le_bytes([
+        fat_buf[fat_entry_off], fat_buf[fat_entry_off + 1],
+        fat_buf[fat_entry_off + 2], fat_buf[fat_entry_off + 3],
+    ]) & 0x0FFFFFFF
+}
+
+fn scan_fat32_dir(
+    bio: &BlockIoProtocol,
+    bio_ptr: *mut BlockIoProtocol,
+    mid: u32,
+    root_cluster: u32,
+    spc: u32,
+    fat_start: u64,
+    data_start: u64,
+    files: &mut [IsoEntry; 64],
+    count: &mut usize,
+) {
+    if root_cluster == 0 {
+        return;
+    }
+    let mut cluster = root_cluster;
+    let mut buf = [0u8; 512];
+    let mut lfn_buf = [0u8; 256];
+    let mut lfn_len: usize = 0;
+    let mut lfn_seq: u8 = 0;
+    let mut lfn_checksum: u8 = 0;
+
+    loop {
+        for si in 0..spc {
+            let lba = data_start + (cluster as u64 - 2) * spc as u64 + si as u64;
+            if !fat32_read_sector(bio, bio_ptr, mid, lba, &mut buf) {
+                return;
+            }
+            for e in 0..(512 / 32) {
+                let off = e * 32;
+                let first = buf[off];
+                if first == 0 {
+                    return;
+                }
+                if first == 0xE5 {
+                    // Deleted entry; reset LFN state
+                    if lfn_len > 0 {
+                        lfn_len = 0;
+                    }
+                    continue;
+                }
+                let attr = buf[off + 11];
+                if attr == 0x0F {
+                    // LFN entry
+                    let seq = first & 0x1F;
+                    let is_last = first & 0x40;
+                    let checksum = buf[off + 13];
+                    if is_last != 0 {
+                        // New LFN chain
+                        lfn_seq = seq;
+                        lfn_checksum = checksum;
+                        lfn_len = 0;
+                    }
+                    if seq != lfn_seq || checksum != lfn_checksum {
+                        continue; // skip out-of-order LFN
+                    }
+                    if lfn_seq == 0 {
+                        continue;
+                    }
+                    lfn_seq -= 1;
+                    let chars = [
+                        buf[off + 1], buf[off + 3], buf[off + 5], buf[off + 7], buf[off + 9],
+                        buf[off + 14], buf[off + 16], buf[off + 18], buf[off + 20],
+                        buf[off + 22], buf[off + 24], buf[off + 28], buf[off + 30],
+                    ];
+                    for &c in &chars {
+                        if c == 0x00 || c == 0xFF {
+                            break;
+                        }
+                        if lfn_len < 255 && c < 0x80 {
+                            lfn_buf[lfn_len] = c;
+                            lfn_len += 1;
+                        } else if lfn_len < 255 {
+                            lfn_buf[lfn_len] = b'?';
+                            lfn_len += 1;
+                        }
+                    }
+                    continue;
+                }
+                // Regular entry
+                if attr & 0x08 != 0 {
+                    // Volume label, skip
+                    if lfn_len > 0 {
+                        lfn_len = 0;
+                    }
+                    continue;
+                }
+                // Determine name
+                let mut name_buf = [0u8; 256];
+                let mut name_len: usize;
+                let lfn_valid = lfn_len > 0 && lfn_buf[0] != 0;
+
+                if lfn_valid {
+                    let copy = lfn_len.min(255);
+                    name_buf[..copy].copy_from_slice(&lfn_buf[..copy]);
+                    name_len = copy;
+                } else {
+                    // 8.3 short name
+                    let mut nlen = 0;
+                    for j in 0..8 {
+                        let c = buf[off + j];
+                        if c == 0x20 {
+                            break;
+                        }
+                        if nlen < 255 {
+                            name_buf[nlen] = c;
+                            nlen += 1;
+                        }
+                    }
+                    if buf[off + 8] != 0x20 {
+                        if nlen < 255 {
+                            name_buf[nlen] = b'.';
+                            nlen += 1;
+                        }
+                        for j in 8..11 {
+                            let c = buf[off + j];
+                            if c == 0x20 {
+                                break;
+                            }
+                            if nlen < 255 {
+                                name_buf[nlen] = c;
+                                nlen += 1;
+                            }
+                        }
+                    }
+                    name_len = nlen;
+                }
+                // reset LFN
+                lfn_len = 0;
+
+                // Check for .iso
+                let is_iso = name_len >= 4
+                    && name_buf[name_len - 4..name_len].eq_ignore_ascii_case(b".iso");
+
+                if is_iso && *count < 64 {
+                    let file_cl = u32::from_le_bytes([
+                        buf[off + 20], buf[off + 21],
+                        buf[off + 26], buf[off + 27],
+                    ]);
+                    let file_sz = u32::from_le_bytes([
+                        buf[off + 28], buf[off + 29], buf[off + 30], buf[off + 31],
+                    ]);
+                    let file_lba = data_start + (file_cl as u64 - 2) * spc as u64;
+                    files[*count] = IsoEntry {
+                        name: name_buf, name_len,
+                        file_start_lba: file_lba,
+                        file_size: file_sz as u64,
+                        file_size_bytes: file_sz as u64,
+                    };
+                    *count += 1;
+                }
+            }
+        }
+        let next = fat32_next_cluster(bio, bio_ptr, mid, fat_start, cluster);
+        if next < 2 || next >= 0x0FFFFFF0 {
+            break;
+        }
+        cluster = next;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  NTFS directory scanner
+// ═══════════════════════════════════════════════════════════════════
+
+fn read_sector(
+    bio: &BlockIoProtocol, bio_ptr: *mut BlockIoProtocol, mid: u32,
+    lba: u64, buf: &mut [u8; 512],
+) -> bool {
+    unsafe { (bio.read_blocks)(bio_ptr, mid, lba, 512, buf.as_mut_ptr() as _) == EFI_SUCCESS }
+}
+
+fn scan_ntfs_dir(
+    bio: &BlockIoProtocol,
+    bio_ptr: *mut BlockIoProtocol,
+    mid: u32,
+    ctx: &FsCtx,
+    files: &mut [IsoEntry; 64],
+    count: &mut usize,
+) {
+    // Read $MFT record 5 ($Root directory)
+    let mft_rec_lba = ctx.mft_start_lba + 5 * (ctx.mft_record_size / 512);
+    let mut rec_buf = [0u8; 4096];
+    let rec_size = ctx.mft_record_size as usize;
+    if rec_size > 4096 {
+        return;
+    }
+
+    // Read MFT record
+    for i in 0..(rec_size / 512) {
+        let mut sector = [0u8; 512];
+        if !read_sector(bio, bio_ptr, mid, mft_rec_lba + i as u64, &mut sector) {
+            return;
+        }
+        let off = i * 512;
+        rec_buf[off..off + 512].copy_from_slice(&sector);
+    }
+
+    // Fixup array: word at offset 4 tells us the fixup count
+    let fixup_off = u16::from_le_bytes([rec_buf[4], rec_buf[5]]) as usize;
+    let fixup_count = u16::from_le_bytes([rec_buf[6], rec_buf[7]]) as usize;
+    if fixup_off > 0 && fixup_off < rec_size && fixup_count > 1 {
+        let fixup_val = u16::from_le_bytes([rec_buf[fixup_off], rec_buf[fixup_off + 1]]);
+        for i in 1..fixup_count {
+            let pos = i * 512 - 2;
+            if pos + 2 <= rec_size {
+                rec_buf[pos] = fixup_val as u8;
+                rec_buf[pos + 1] = (fixup_val >> 8) as u8;
+            }
+        }
+    }
+
+    // Parse attributes starting at offset of first attribute (word at 0x14)
+    let attrs_off = u16::from_le_bytes([rec_buf[0x14], rec_buf[0x15]]) as usize;
+    if attrs_off >= rec_size {
+        return;
+    }
+
+    parse_ntfs_attrs(bio, bio_ptr, mid, ctx, &rec_buf[attrs_off..], rec_size - attrs_off, files, count);
+}
+
+fn parse_ntfs_attrs(
+    bio: &BlockIoProtocol,
+    bio_ptr: *mut BlockIoProtocol,
+    mid: u32,
+    ctx: &FsCtx,
+    attrs: &[u8],
+    _remaining: usize,
+    files: &mut [IsoEntry; 64],
+    count: &mut usize,
+) {
+    let mut off = 0usize;
+    while off + 4 < attrs.len() {
+        let atype = u32::from_le_bytes([attrs[off], attrs[off + 1], attrs[off + 2], attrs[off + 3]]);
+        if atype == 0xFFFFFFFF {
+            break;
+        }
+        if atype == 0 {
+            break;
+        }
+        let alen = if off + 7 < attrs.len() {
+            u32::from_le_bytes([attrs[off + 4], attrs[off + 5], attrs[off + 6], attrs[off + 7]]) as usize
+        } else {
+            break;
+        };
+        if alen < 8 || off + alen > attrs.len() {
+            break;
+        }
+        let is_nonresident = attrs[off + 8] != 0;
+        let name_len = attrs[off + 9] as usize;
+        let val_off = u16::from_le_bytes([attrs[off + 0x14], attrs[off + 0x15]]) as usize + name_len;
+
+        if atype == 0x90 {
+            // $INDEX_ROOT — parse directory entries
+            if !is_nonresident && val_off < alen {
+                let index_data = &attrs[off + val_off..off + alen];
+                parse_ntfs_index_root(bio, bio_ptr, mid, ctx, index_data, files, count);
+            }
+        } else if atype == 0xA0 {
+            // $INDEX_ALLOCATION — skip for now (directories with many files)
+        }
+        off += alen;
+    }
+}
+
+fn parse_ntfs_index_root(
+    bio: &BlockIoProtocol,
+    bio_ptr: *mut BlockIoProtocol,
+    mid: u32,
+    ctx: &FsCtx,
+    data: &[u8],
+    files: &mut [IsoEntry; 64],
+    count: &mut usize,
+) {
+    if data.len() < 20 {
+        return;
+    }
+    // Offset 0x10: entries offset (from $INDEX_ROOT attribute data start)
+    let entries_off = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize + 0x10;
+    if entries_off >= data.len() {
+        return;
+    }
+    let entries = &data[entries_off..];
+    parse_ntfs_index_entries(bio, bio_ptr, mid, ctx, entries, files, count);
+}
+
+fn parse_ntfs_index_entries(
+    bio: &BlockIoProtocol,
+    bio_ptr: *mut BlockIoProtocol,
+    mid: u32,
+    ctx: &FsCtx,
+    mut entries: &[u8],
+    files: &mut [IsoEntry; 64],
+    count: &mut usize,
+) {
+    while entries.len() >= 0x50 {
+        // MFT reference (file record number) at offset 0
+        let mft_ref = u64::from_le_bytes(entries[0..8].try_into().unwrap());
+        let mft_rec = (mft_ref & 0xFFFFFFFFFFFF) as u32; // low 48 bits
+        let _mft_seq = (mft_ref >> 48) as u16;
+
+        let ent_len = u16::from_le_bytes([entries[8], entries[9]]) as usize;
+        if ent_len < 8 || ent_len > entries.len() {
+            break;
+        }
+        let flags = entries[12];
+        let fn_len = entries[0x10] as usize;
+        let fn_off = 0x52usize; // $FILE_NAME attribute starts at offset 0x52 from index entry start
+
+        if fn_off + fn_len < entries.len()
+            && (flags & 0x02) == 0 // not a subdirectory (we only care about files)
+        {
+            // Parse $FILE_NAME: offset 0 = MFT ref (8 bytes), 0x40 = flags, 0x42 = name_len, 0x44 = name
+            let name_len = entries[fn_off + 0x41] as usize;
+            if name_len > 0 && name_len <= 255 && fn_off + 0x42 + name_len * 2 <= entries.len() {
+                let mut name_buf = [0u8; 256];
+                let mut np = 0;
+                for j in 0..name_len {
+                    if fn_off + 0x42 + j * 2 + 1 < entries.len() {
+                        let lo = entries[fn_off + 0x42 + j * 2];
+                        let _hi = entries[fn_off + 0x42 + j * 2 + 1];
+                        if lo < 0x80 && lo != 0 && np < 255 {
+                            name_buf[np] = lo;
+                            np += 1;
+                        } else if lo != 0 && np < 255 {
+                            name_buf[np] = b'?';
+                            np += 1;
+                        }
+                    }
+                }
+                let is_iso = np >= 4 && name_buf[np - 4..np].eq_ignore_ascii_case(b".iso");
+                if is_iso && *count < 64 && mft_rec > 0 {
+                    if let Some((lba, sz)) = get_ntfs_file_lba(bio, bio_ptr, mid, ctx, mft_rec) {
+                        files[*count] = IsoEntry {
+                            name: name_buf, name_len: np,
+                            file_start_lba: lba,
+                            file_size: sz, file_size_bytes: sz,
+                        };
+                        *count += 1;
+                    }
+                }
+            }
+        }
+        if ent_len == 0 {
+            break;
+        }
+        entries = &entries[ent_len..];
+    }
+}
+
+fn get_ntfs_file_lba(
+    bio: &BlockIoProtocol,
+    bio_ptr: *mut BlockIoProtocol,
+    mid: u32,
+    ctx: &FsCtx,
+    mft_rec: u32,
+) -> Option<(u64, u64)> {
+    let rec_size = ctx.mft_record_size as usize;
+    if rec_size > 4096 {
+        return None;
+    }
+    let lba = ctx.mft_start_lba + mft_rec as u64 * (rec_size as u64 / 512);
+    let mut rec = [0u8; 4096];
+    for i in 0..(rec_size / 512) {
+        let off = i * 512;
+        let mut sector = [0u8; 512];
+        if !read_sector(bio, bio_ptr, mid, lba + i as u64, &mut sector) {
+            return None;
+        }
+        rec[off..off + 512].copy_from_slice(&sector);
+    }
+
+    // Fixup
+    let fixup_off = u16::from_le_bytes([rec[4], rec[5]]) as usize;
+    let fixup_count = u16::from_le_bytes([rec[6], rec[7]]) as usize;
+    if fixup_off > 0 && fixup_off < rec_size && fixup_count > 1 {
+        let fixup_val = u16::from_le_bytes([rec[fixup_off], rec[fixup_off + 1]]);
+        for i in 1..fixup_count {
+            let pos = i * 512 - 2;
+            if pos + 2 <= rec_size {
+                rec[pos] = fixup_val as u8;
+                rec[pos + 1] = (fixup_val >> 8) as u8;
+            }
+        }
+    }
+
+    let attrs_off = u16::from_le_bytes([rec[0x14], rec[0x15]]) as usize;
+    if attrs_off >= rec_size {
+        return None;
+    }
+    parse_ntfs_data_attr(ctx, &rec[attrs_off..], rec_size - attrs_off)
+}
+
+fn parse_ntfs_data_attr(ctx: &FsCtx, attrs: &[u8], _rem: usize) -> Option<(u64, u64)> {
+    let mut off = 0usize;
+    while off + 4 < attrs.len() {
+        let atype = u32::from_le_bytes([attrs[off], attrs[off + 1], attrs[off + 2], attrs[off + 3]]);
+        if atype == 0xFFFFFFFF || atype == 0 {
+            break;
+        }
+        let alen = u32::from_le_bytes([attrs[off + 4], attrs[off + 5], attrs[off + 6], attrs[off + 7]]) as usize;
+        if alen < 8 || off + alen > attrs.len() {
+            break;
+        }
+        if atype == 0x80 {
+            // $DATA attribute
+            let is_nonresident = attrs[off + 8] != 0;
+            if is_nonresident {
+                // Parse data runs
+                let run_off = u16::from_le_bytes([attrs[off + 0x20], attrs[off + 0x21]]) as usize;
+                let file_size = u64::from_le_bytes(attrs[off + 0x30..off + 0x38].try_into().unwrap());
+                if run_off > 0 && off + run_off + 1 < attrs.len() {
+                    let run_bytes = &attrs[off + run_off..off + alen];
+                    let mut lcn: u64 = 0;
+                    for i in 0..1 {
+                        if i < run_bytes.len() {
+                            let hdr = run_bytes[i];
+                            if hdr == 0 {
+                                break;
+                            }
+                            let len_bytes = (hdr & 0x0F) as usize;
+                            let off_bytes = ((hdr >> 4) & 0x0F) as usize;
+                            let clen = parse_varlen_le(&run_bytes[i + 1..], len_bytes);
+                            let coff = parse_varlen_le_signed(&run_bytes[i + 1 + len_bytes..], off_bytes);
+                            lcn = (lcn as i64 + coff) as u64;
+                            if clen > 0 {
+                                let iso_lba = ctx.part1_lba + lcn * ctx.sectors_per_cluster as u64;
+                                return Some((iso_lba, file_size));
+                            }
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        off += alen;
+    }
+    None
+}
+
+fn parse_varlen_le(data: &[u8], n: usize) -> u64 {
+    let mut val: u64 = 0;
+    let end = data.len().min(n).min(8);
+    for (i, &b) in data[..end].iter().enumerate() {
+        val |= (b as u64) << (i * 8);
+    }
+    val
+}
+
+fn parse_varlen_le_signed(data: &[u8], n: usize) -> i64 {
+    if n == 0 || n > 8 {
+        return 0;
+    }
+    let val = parse_varlen_le(data, n);
+    let bits = (n * 8) as u64;
+    if n < 8 && (val & (1u64 << (bits - 1))) != 0 {
+        (val as i64) - (1i64 << bits)
+    } else {
+        val as i64
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Boot menu (FS-type-agnostic)
 // ═══════════════════════════════════════════════════════════════════
 
 fn format_u64_buf(v: u64) -> ([u8; 20], usize) {
@@ -348,11 +916,7 @@ fn show_menu(
     st: &mut SystemTable,
     files: &[IsoEntry; 64],
     count: usize,
-    part1_lba: u64,
-    spc: u32,
-    fat_start: u64,
-    fat_len: u64,
-    heap_start: u64,
+    ctx: &FsCtx,
     bio: &BlockIoProtocol,
     bio_ptr: *mut BlockIoProtocol,
     mid: u32,
@@ -373,9 +937,9 @@ fn show_menu(
             print_raw(st, &files[i].name[..files[i].name_len]);
         }
         let size_mb = files[i].file_size / (1024 * 1024);
-        let (sb, sl) = format_u64_buf(size_mb);
+        let (sb2, sl2) = format_u64_buf(size_mb);
         print_raw(st, b" (");
-        print_raw(st, &sb[20 - sl..]);
+        print_raw(st, &sb2[20 - sl2..]);
         print_raw(st, b" MiB)\r\n\0");
     }
     print_raw(st, b"Enter number to boot (or 'r' to scan for .iso): \0");
@@ -385,8 +949,7 @@ fn show_menu(
         let ci = unsafe { &mut *(st.con_in as *mut SimpleTextInput) };
         loop {
             let mut k = Key { sc: 0, uc: 0 };
-            let status = unsafe { (ci.read_key_stroke)(ci as *mut _, &mut k) };
-            if status != EFI_SUCCESS {
+            if unsafe { (ci.read_key_stroke)(ci as *mut _, &mut k) } != EFI_SUCCESS {
                 continue;
             }
             let ch = if k.uc >= 0x20 && k.uc < 0x7F {
@@ -402,71 +965,33 @@ fn show_menu(
             if (b'1'..=b'9').contains(&ch) {
                 let idx = (ch - b'1') as usize;
                 if idx < count {
-                    boot_iso(
-                        st, files, idx, part1_lba, spc, fat_start, fat_len, heap_start, bio,
-                        bio_ptr, mid,
-                    );
+                    boot_iso(st, files, idx, ctx, bio, bio_ptr, mid);
                 }
             } else if ch == b'0' && count >= 10 {
-                boot_iso(
-                    st,
-                    files,
-                    9,
-                    part1_lba,
-                    spc,
-                    fat_start,
-                    fat_len,
-                    heap_start,
-                    bio,
-                    bio_ptr,
-                    mid,
-                );
+                boot_iso(st, files, 9, ctx, bio, bio_ptr, mid);
             } else if ch == b'r' || ch == b'R' {
                 print_raw(st, b"\r\nRe-scanning...\r\n\0");
                 let mut new_files: [IsoEntry; 64] = unsafe { core::mem::zeroed() };
                 let mut new_count: usize = 0;
-                scan_exfat_dir(
-                    bio,
-                    bio_ptr,
-                    mid,
-                    root_cluster_from_first_scan(),
-                    spc,
-                    fat_start,
-                    fat_len,
-                    heap_start,
-                    &mut new_files,
-                    &mut new_count,
-                );
-                show_menu(
-                    st, &new_files, new_count, part1_lba, spc, fat_start, fat_len, heap_start, bio,
-                    bio_ptr, mid,
-                );
+                scan_directory(bio, bio_ptr, mid, ctx, &mut new_files, &mut new_count);
+                show_menu(st, &new_files, new_count, ctx, bio, bio_ptr, mid);
                 return;
             }
         }
     }
 }
 
-static mut ROOT_CLUSTER: u32 = 0;
-fn root_cluster_from_first_scan() -> u32 {
-    unsafe { ROOT_CLUSTER }
-}
-
 fn boot_iso(
     st: &mut SystemTable,
     files: &[IsoEntry; 64],
     idx: usize,
-    part1_lba: u64,
-    spc: u32,
-    fat_start: u64,
-    fat_len: u64,
-    heap_start: u64,
+    _ctx: &FsCtx,
     bio: &BlockIoProtocol,
     bio_ptr: *mut BlockIoProtocol,
     mid: u32,
 ) -> ! {
     print_raw(st, b"\r\nBooting ISO...\r\n\0");
-    let iso_lba = heap_start + (files[idx].start_cluster as u64 - 2) * spc as u64;
+    let iso_lba = files[idx].file_start_lba;
 
     let boot_rec_lba = iso_lba + 17 * 4;
     let mut brec: [u8; 512] = [0; 512];
@@ -564,10 +1089,9 @@ fn boot_iso(
         }
     }
 
-    // Copy boot image to standard BIOS boot address 0x7C00
-    let bios_dest = 0x7C00 as *mut u8;
+    let safe_dest = 0x80000 as *mut u8;
     unsafe {
-        core::ptr::copy_nonoverlapping(dest, bios_dest, boot_sector_count as usize * 512);
+        core::ptr::copy_nonoverlapping(dest, safe_dest, boot_sector_count as usize * 512);
     }
 
     let cookie_ptr = 0x7B00usize as *mut u32;
@@ -582,11 +1106,9 @@ fn boot_iso(
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  Disk handle discovery
+//  GPT partition search
 // ═══════════════════════════════════════════════════════════════════
 
-/// Search GPT partition table for a Microsoft Basic Data Partition
-/// (type GUID: EBD0A0A2-B9E5-4433-87C0-68B6B72699C7).
 fn find_gpt_data_partition(
     st: &mut SystemTable,
     bio_ref: &BlockIoProtocol,
@@ -599,18 +1121,16 @@ fn find_gpt_data_partition(
     {
         return 0;
     }
-    let hdr = &hdr_sec[..92];
-    if &hdr[0..8] != b"EFI PART" {
+    if &hdr_sec[0..8] != b"EFI PART" {
         return 0;
     }
-    let entries_lba = u64::from_le_bytes(hdr[72..80].try_into().unwrap());
-    let n = u32::from_le_bytes(hdr[80..84].try_into().unwrap());
-    let sz = u32::from_le_bytes(hdr[84..88].try_into().unwrap());
+    let entries_lba = u64::from_le_bytes(hdr_sec[72..80].try_into().unwrap());
+    let n = u32::from_le_bytes(hdr_sec[80..84].try_into().unwrap());
+    let sz = u32::from_le_bytes(hdr_sec[84..88].try_into().unwrap());
     if sz == 0 || n == 0 {
         return 0;
     }
 
-    // Basic Data GUID (EBD0A0A2-B9E5-4433-87C0-68B6B72699C7) — matches constants.rs GPT_TYPE_BASIC_DATA
     let basic_data_guid: [u8; 16] = [
         0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44, 0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99,
         0xC7,
@@ -646,14 +1166,14 @@ fn find_gpt_data_partition(
     0
 }
 
+// ═══════════════════════════════════════════════════════════════════
+//  Disk handle discovery
+// ═══════════════════════════════════════════════════════════════════
+
 fn find_disk_handle(
     bs: &mut BootServices,
     _image_handle: *mut core::ffi::c_void,
 ) -> Option<*mut core::ffi::c_void> {
-    // Locate all Block I/O handles and pick the first whole-disk one.
-    // LoadedImageProtocol.device_handle often points to the ESP partition
-    // handle (LogicalPartition=true), whose LBA 0 is a VBR, not the MBR.
-    // Using Media.LogicalPartition ensures we read the real MBR/GPT table.
     let mut num: usize = 0;
     let mut buf: *mut *mut core::ffi::c_void = core::ptr::null_mut();
     if unsafe {
@@ -687,8 +1207,7 @@ fn find_disk_handle(
             continue;
         }
         let media = unsafe { &*((*bio).media) };
-        // LogicalPartition=false → whole-disk device
-        if !media.bim_lp {
+        if media.bim_lp == 0 {
             result = Some(h);
             break;
         }
@@ -826,60 +1345,60 @@ struct Key {
 #[repr(C)]
 struct BootServices {
     hdr: TableHeader,
-    bs_18: *mut core::ffi::c_void, // 0x18 RaiseTPL
-    bs_20: *mut core::ffi::c_void, // 0x20 RestoreTPL
-    allocate_pages: unsafe extern "efiapi" fn(AllocateType, MemoryType, usize, *mut u64) -> usize, // 0x28
-    bs_30: *mut core::ffi::c_void, // 0x30 FreePages
-    bs_38: *mut core::ffi::c_void, // 0x38 GetMemoryMap
-    bs_40: *mut core::ffi::c_void, // 0x40 AllocatePool
-    free_pool: unsafe extern "efiapi" fn(*mut core::ffi::c_void) -> usize, // 0x48 FreePool
-    bs_50: *mut core::ffi::c_void, // 0x50 CreateEvent
-    bs_58: *mut core::ffi::c_void, // 0x58 SetTimer
-    bs_60: *mut core::ffi::c_void, // 0x60 WaitForEvent
-    bs_68: *mut core::ffi::c_void, // 0x68 SignalEvent
-    bs_70: *mut core::ffi::c_void, // 0x70 CloseEvent
-    bs_78: *mut core::ffi::c_void, // 0x78 CheckEvent
-    bs_80: *mut core::ffi::c_void, // 0x80 InstallProtocolInterface
-    bs_88: *mut core::ffi::c_void, // 0x88 ReinstallProtocolInterface
-    bs_90: *mut core::ffi::c_void, // 0x90 UninstallProtocolInterface
+    bs_18: *mut core::ffi::c_void,
+    bs_20: *mut core::ffi::c_void,
+    allocate_pages: unsafe extern "efiapi" fn(AllocateType, MemoryType, usize, *mut u64) -> usize,
+    bs_30: *mut core::ffi::c_void,
+    bs_38: *mut core::ffi::c_void,
+    bs_40: *mut core::ffi::c_void,
+    free_pool: unsafe extern "efiapi" fn(*mut core::ffi::c_void) -> usize,
+    bs_50: *mut core::ffi::c_void,
+    bs_58: *mut core::ffi::c_void,
+    bs_60: *mut core::ffi::c_void,
+    bs_68: *mut core::ffi::c_void,
+    bs_70: *mut core::ffi::c_void,
+    bs_78: *mut core::ffi::c_void,
+    bs_80: *mut core::ffi::c_void,
+    bs_88: *mut core::ffi::c_void,
+    bs_90: *mut core::ffi::c_void,
     handle_protocol: unsafe extern "efiapi" fn(
         *mut core::ffi::c_void,
         *const Guid,
         *mut *mut core::ffi::c_void,
-    ) -> usize, // 0x98
-    bs_a0: *mut core::ffi::c_void, // 0xA0 Reserved
-    bs_a8: *mut core::ffi::c_void, // 0xA8 RegisterProtocolNotify
-    bs_b0: *mut core::ffi::c_void, // 0xB0 LocateHandle
-    bs_b8: *mut core::ffi::c_void, // 0xB8 LocateDevicePath
-    bs_c0: *mut core::ffi::c_void, // 0xC0 InstallConfigurationTable
-    bs_c8: *mut core::ffi::c_void, // 0xC8 LoadImage
-    bs_d0: *mut core::ffi::c_void, // 0xD0 StartImage
-    bs_d8: *mut core::ffi::c_void, // 0xD8 Exit
-    bs_e0: *mut core::ffi::c_void, // 0xE0 UnloadImage
-    bs_e8: *mut core::ffi::c_void, // 0xE8 ExitBootServices
-    bs_f0: *mut core::ffi::c_void, // 0xF0 GetNextMonotonicCount
-    stall: unsafe extern "efiapi" fn(usize) -> usize, // 0xF8 Stall
-    bs_100: *mut core::ffi::c_void, // 0x100 SetWatchdogTimer
-    bs_108: *mut core::ffi::c_void, // 0x108 ConnectController
-    bs_110: *mut core::ffi::c_void, // 0x110 DisconnectController
-    bs_118: *mut core::ffi::c_void, // 0x118 OpenProtocol
-    bs_120: *mut core::ffi::c_void, // 0x120 CloseProtocol
-    bs_128: *mut core::ffi::c_void, // 0x128 OpenProtocolInformation
-    bs_130: *mut core::ffi::c_void, // 0x130 ProtocolsPerHandle
+    ) -> usize,
+    bs_a0: *mut core::ffi::c_void,
+    bs_a8: *mut core::ffi::c_void,
+    bs_b0: *mut core::ffi::c_void,
+    bs_b8: *mut core::ffi::c_void,
+    bs_c0: *mut core::ffi::c_void,
+    bs_c8: *mut core::ffi::c_void,
+    bs_d0: *mut core::ffi::c_void,
+    bs_d8: *mut core::ffi::c_void,
+    bs_e0: *mut core::ffi::c_void,
+    bs_e8: *mut core::ffi::c_void,
+    bs_f0: *mut core::ffi::c_void,
+    stall: unsafe extern "efiapi" fn(usize) -> usize,
+    bs_100: *mut core::ffi::c_void,
+    bs_108: *mut core::ffi::c_void,
+    bs_110: *mut core::ffi::c_void,
+    bs_118: *mut core::ffi::c_void,
+    bs_120: *mut core::ffi::c_void,
+    bs_128: *mut core::ffi::c_void,
+    bs_130: *mut core::ffi::c_void,
     locate_handle_buffer: unsafe extern "efiapi" fn(
         LocateSearchType,
         *const Guid,
         *mut core::ffi::c_void,
         *mut usize,
         *mut *mut *mut core::ffi::c_void,
-    ) -> usize, // 0x138
-    bs_140: *mut core::ffi::c_void, // 0x140 LocateProtocol
-    bs_148: *mut core::ffi::c_void, // 0x148 InstallMultipleProtocolInterfaces
-    bs_150: *mut core::ffi::c_void, // 0x150 UninstallMultipleProtocolInterfaces
-    bs_158: *mut core::ffi::c_void, // 0x158 CalculateCrc32
-    bs_160: *mut core::ffi::c_void, // 0x160 CopyMem
-    bs_168: *mut core::ffi::c_void, // 0x168 SetMem
-    bs_170: *mut core::ffi::c_void, // 0x170 CreateEventEx
+    ) -> usize,
+    bs_140: *mut core::ffi::c_void,
+    bs_148: *mut core::ffi::c_void,
+    bs_150: *mut core::ffi::c_void,
+    bs_158: *mut core::ffi::c_void,
+    bs_160: *mut core::ffi::c_void,
+    bs_168: *mut core::ffi::c_void,
+    bs_170: *mut core::ffi::c_void,
 }
 #[repr(C)]
 struct RuntimeServices {
@@ -909,11 +1428,11 @@ struct BlockIoProtocol {
 #[repr(C)]
 struct BlockIoMedia {
     mid: u32,
-    bim_rm: bool,
-    bim_mp: bool,
-    bim_lp: bool,
-    bim_ro: bool,
-    bim_wc: bool,
+    bim_rm: u8,
+    bim_mp: u8,
+    bim_lp: u8,
+    bim_ro: u8,
+    bim_wc: u8,
     bim_bs: u32,
     bim_ia: u32,
     bim_lb: u64,
