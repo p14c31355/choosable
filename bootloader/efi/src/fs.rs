@@ -394,10 +394,10 @@ fn scan_fat32_dir(
 
                 if is_iso && *count < 64 {
                     let file_cl = u32::from_le_bytes([
-                        buf[off + 20],
-                        buf[off + 21],
                         buf[off + 26],
                         buf[off + 27],
+                        buf[off + 20],
+                        buf[off + 21],
                     ]);
                     let file_sz = u32::from_le_bytes([
                         buf[off + 28],
