@@ -633,7 +633,7 @@ fn scan_ntfs_dir(
     // Fixup array: word at offset 4 tells us the fixup count
     let fixup_off = u16::from_le_bytes([rec_buf[4], rec_buf[5]]) as usize;
     let fixup_count = u16::from_le_bytes([rec_buf[6], rec_buf[7]]) as usize;
-    if fixup_off > 0 && fixup_off < rec_size && fixup_count > 1 {
+    if fixup_off > 0 && fixup_off + 2 <= rec_size && fixup_count > 1 {
         let fixup_val = u16::from_le_bytes([rec_buf[fixup_off], rec_buf[fixup_off + 1]]);
         for i in 1..fixup_count {
             let pos = i * 512 - 2;
@@ -805,7 +805,7 @@ fn get_ntfs_file_lba(
     // Fixup
     let fixup_off = u16::from_le_bytes([rec[4], rec[5]]) as usize;
     let fixup_count = u16::from_le_bytes([rec[6], rec[7]]) as usize;
-    if fixup_off > 0 && fixup_off < rec_size && fixup_count > 1 {
+    if fixup_off > 0 && fixup_off + 2 <= rec_size && fixup_count > 1 {
         let fixup_val = u16::from_le_bytes([rec[fixup_off], rec[fixup_off + 1]]);
         for i in 1..fixup_count {
             let pos = i * 512 - 2;
@@ -844,7 +844,7 @@ fn parse_ntfs_data_attr(ctx: &FsCtx, attrs: &[u8], _rem: usize) -> Option<(u64, 
                 // Parse data runs
                 let run_off = u16::from_le_bytes([attrs[off + 0x20], attrs[off + 0x21]]) as usize;
                 let file_size = u64::from_le_bytes(attrs[off + 0x30..off + 0x38].try_into().unwrap());
-                if run_off > 0 && off + run_off + 1 < attrs.len() {
+                if run_off > 0 && run_off < alen && off + run_off < attrs.len() {
                     let run_bytes = &attrs[off + run_off..off + alen];
                     let mut lcn: u64 = 0;
                     for i in 0..1 {
@@ -1057,19 +1057,8 @@ fn boot_iso(
         )
     };
     if status != EFI_SUCCESS {
-        pages = 0;
-        let status = unsafe {
-            (bs.allocate_pages)(
-                AllocateType::AllocateAnyPages,
-                MemoryType::EfiLoaderData,
-                num_pages,
-                &mut pages,
-            )
-        };
-        if status != EFI_SUCCESS {
-            print_raw(st, b"AllocatePages failed.\r\n\0");
-            halt_or_reboot(st);
-        }
+        print_raw(st, b"ERROR: Failed to allocate memory at 0x80000.\r\n\0");
+        halt_or_reboot(st);
     }
     let dest = pages as *mut u8;
     let mut sector_buf: [u8; 512] = [0; 512];
