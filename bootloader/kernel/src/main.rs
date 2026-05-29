@@ -583,7 +583,7 @@ fn get_ntfs_file_info(ctx: &FsCtx, mft_rec: u32) -> Option<(u64, u64)> {
     // Fixup
     let fixup_off = u16::from_le_bytes([rec[4], rec[5]]) as usize;
     let fixup_count = u16::from_le_bytes([rec[6], rec[7]]) as usize;
-    if fixup_off > 0 && fixup_off < rec_size && fixup_count > 1 {
+    if fixup_off > 0 && fixup_off + 2 <= rec_size && fixup_count > 1 {
         let fixup_val = u16::from_le_bytes([rec[fixup_off], rec[fixup_off + 1]]);
         for i in 1..fixup_count {
             let pos = i * 512 - 2;
