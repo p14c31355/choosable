@@ -699,15 +699,14 @@ fn scan_ntfs_dir(ctx: &FsCtx, files: &mut [DirEntry], file_count: &mut usize) {
                             if ent_len < 8 || ent_len > entries.len() {
                                 break;
                             }
-                            let flags = entries[12];
-                            let fn_off = 0x52usize;
-                            if fn_off + 0x42 <= entries.len() && (flags & 0x02) == 0 {
-                                let name_len = entries[fn_off + 0x41] as usize;
-                                if name_len > 0 && name_len <= 255 && fn_off + 0x42 + name_len * 2 <= entries.len() {
+                            let fn_off = 0x10usize;
+                            if fn_off + 66 <= entries.len() && (flags & 0x02) == 0 {
+                                let name_len = entries[fn_off + 64] as usize;
+                                if name_len > 0 && name_len <= 255 && fn_off + 66 + name_len * 2 <= entries.len() {
                                     let mut name_buf = [0u8; 256];
                                     let mut np = 0;
                                     for j in 0..name_len {
-                                        let lo = entries[fn_off + 0x42 + j * 2];
+                                        let lo = entries[fn_off + 66 + j * 2];
                                         if lo < 0x80 && lo != 0 && np < 255 {
                                             name_buf[np] = lo;
                                             np += 1;
