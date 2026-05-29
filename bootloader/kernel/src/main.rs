@@ -970,7 +970,7 @@ pub extern "C" fn _start() -> ! {
     match fs {
         FsType::Exfat => {
             let spc_shift = vbr[109] as u32;
-            if spc_shift >= 25 {
+            if spc_shift > 16 {
                 vga_print(3, 2, b"Invalid SectorsPerClusterShift.", 0x0C);
                 loop { unsafe { core::arch::asm!("hlt") } }
             }
