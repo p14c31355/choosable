@@ -37,63 +37,15 @@ pub struct SystemTable {
 #[repr(C)]
 pub struct BootServices {
     pub hdr: TableHeader,
-    pub bs_18: *mut c_void,
-    pub bs_20: *mut c_void,
+    // ── 0x018–0x020 ──
+    pub raise_tpl: *mut c_void,         // 0x018
+    pub restore_tpl: *mut c_void,       // 0x020
+    // ── 0x028 ──
     pub allocate_pages:
         unsafe extern "efiapi" fn(AllocateType, MemoryType, usize, *mut u64) -> usize,
-    pub bs_30: *mut c_void,
-    pub bs_38: *mut c_void,
-    pub bs_40: *mut c_void,
-    pub free_pool: unsafe extern "efiapi" fn(*mut c_void) -> usize,
-    pub bs_50: *mut c_void,
-    pub bs_58: *mut c_void,
-    pub bs_60: *mut c_void,
-    pub bs_68: *mut c_void,
-    pub bs_70: *mut c_void,
-    pub bs_78: *mut c_void,
-    pub bs_80: *mut c_void,
-    pub bs_88: *mut c_void,
-    pub bs_90: *mut c_void,
-    pub bs_98: *mut c_void,
-    pub handle_protocol: unsafe extern "efiapi" fn(
-        *mut c_void,
-        *const Guid,
-        *mut *mut c_void,
-    ) -> usize,
-    pub bs_a0: *mut c_void,
-    pub bs_a8: *mut c_void,
-    pub bs_b0: *mut c_void,
-    pub bs_b8: *mut c_void,
-    pub bs_c0: *mut c_void,
-    pub bs_c8: *mut c_void,
-    pub bs_d0: *mut c_void,
-    pub bs_d8: *mut c_void,
-    pub bs_e0: *mut c_void,
-    pub bs_e8: *mut c_void,
-    pub bs_f0: *mut c_void,
-    pub stall: unsafe extern "efiapi" fn(usize) -> usize,
-    pub bs_100: *mut c_void,
-    pub bs_108: *mut c_void,
-    pub bs_110: *mut c_void,
-    pub bs_118: *mut c_void,
-    pub bs_120: *mut c_void,
-    pub bs_128: *mut c_void,
-    pub bs_130: *mut c_void,
-    pub locate_handle_buffer: unsafe extern "efiapi" fn(
-        LocateSearchType,
-        *const Guid,
-        *mut c_void,
-        *mut usize,
-        *mut *mut *mut c_void,
-    ) -> usize,
-    pub bs_140: *mut c_void,
-    pub bs_148: *mut c_void,
-    pub bs_150: *mut c_void,
-    pub bs_158: *mut c_void,
-    pub bs_160: *mut c_void,
-    pub bs_168: *mut c_void,
-    pub bs_170: *mut c_void,
-    pub bs_178: *mut c_void,
+    // ── 0x030 ──
+    pub free_pages: *mut c_void,        // 0x030
+    // ── 0x038 ──
     pub get_memory_map: unsafe extern "efiapi" fn(
         *mut usize,
         *mut MemoryDescriptor,
@@ -101,8 +53,65 @@ pub struct BootServices {
         *mut u64,
         *mut u32,
     ) -> usize,
-    pub bs_188: *mut c_void,
-    pub exit_boot_services: unsafe extern "efiapi" fn(*mut c_void, u64) -> usize,
+    // ── 0x040 ──
+    pub allocate_pool: *mut c_void,     // 0x040
+    // ── 0x048 ──
+    pub free_pool: unsafe extern "efiapi" fn(*mut c_void) -> usize,
+    // ── 0x050–0x078 ──
+    pub create_event: *mut c_void,      // 0x050
+    pub set_timer: *mut c_void,         // 0x058
+    pub wait_for_event: *mut c_void,    // 0x060
+    pub signal_event: *mut c_void,      // 0x068
+    pub close_event: *mut c_void,       // 0x070
+    pub check_event: *mut c_void,       // 0x078
+    // ── 0x080–0x098 ──
+    pub install_protocol_interface: *mut c_void,       // 0x080
+    pub reinstall_protocol_interface: *mut c_void,     // 0x088
+    pub uninstall_protocol_interface: *mut c_void,     // 0x090
+    pub handle_protocol: unsafe extern "efiapi" fn(    // 0x098
+        *mut c_void,
+        *const Guid,
+        *mut *mut c_void,
+    ) -> usize,
+    // ── 0x0A0 ──
+    pub reserved: *mut c_void,          // 0x0A0 (must be NULL)
+    // ── 0x0A8–0x0B0 ──
+    pub register_protocol_notify: *mut c_void,  // 0x0A8
+    pub locate_handle: *mut c_void,              // 0x0B0
+    // ── 0x0B8–0x0E8 ──
+    pub locate_device_path: *mut c_void,        // 0x0B8
+    pub install_configuration_table: *mut c_void, // 0x0C0
+    pub load_image: *mut c_void,                 // 0x0C8
+    pub start_image: *mut c_void,                // 0x0D0
+    pub exit: *mut c_void,                       // 0x0D8
+    pub unload_image: *mut c_void,               // 0x0E0
+    pub exit_boot_services: unsafe extern "efiapi" fn(*mut c_void, u64) -> usize, // 0x0E8
+    // ── 0x0F0–0x0F8 ──
+    pub get_next_monotonic_count: *mut c_void,  // 0x0F0
+    pub stall: unsafe extern "efiapi" fn(usize) -> usize,  // 0x0F8
+    // ── 0x100–0x138 ──
+    pub set_watchdog_timer: *mut c_void,        // 0x100
+    pub connect_controller: *mut c_void,         // 0x108
+    pub disconnect_controller: *mut c_void,      // 0x110
+    pub open_protocol: *mut c_void,              // 0x118
+    pub close_protocol: *mut c_void,             // 0x120
+    pub open_protocol_information: *mut c_void,  // 0x128
+    pub protocols_per_handle: *mut c_void,       // 0x130
+    pub locate_handle_buffer: unsafe extern "efiapi" fn(    // 0x138
+        LocateSearchType,
+        *const Guid,
+        *mut c_void,
+        *mut usize,
+        *mut *mut *mut c_void,
+    ) -> usize,
+    // ── 0x140–0x168 ──
+    pub locate_protocol: *mut c_void,                      // 0x140
+    pub install_multiple_protocol_interfaces: *mut c_void, // 0x148
+    pub uninstall_multiple_protocol_interfaces: *mut c_void, // 0x150
+    pub calculate_crc32: *mut c_void,                      // 0x158
+    pub copy_mem: *mut c_void,                             // 0x160
+    pub set_mem: *mut c_void,                              // 0x168
+    pub create_event_ex: *mut c_void,                      // 0x170
 }
 
 #[repr(C)]
