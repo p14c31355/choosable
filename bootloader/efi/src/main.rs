@@ -572,11 +572,13 @@ fn find_gpt_data_partition(
     bio_ptr: *mut BlockIoProtocol,
     mid: u32,
 ) -> u64 {
-    let mut hdr: [u8; 92] = [0; 92];
-    if unsafe { (bio_ref.read_blocks)(bio_ptr, mid, 1, 512, hdr.as_mut_ptr() as _) } != EFI_SUCCESS
+    let mut hdr_sec: [u8; 512] = [0; 512];
+    if unsafe { (bio_ref.read_blocks)(bio_ptr, mid, 1, 512, hdr_sec.as_mut_ptr() as _) }
+        != EFI_SUCCESS
     {
         return 0;
     }
+    let hdr = &hdr_sec[..92];
     if &hdr[0..8] != b"EFI PART" {
         return 0;
     }

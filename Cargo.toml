@@ -1,3 +1,10 @@
+[workspace]
+members = [
+    ".",
+    "bootloader",
+]
+resolver = "2"
+
 [package]
 name = "choosable"
 version = "0.1.0"
