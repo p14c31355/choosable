@@ -623,25 +623,12 @@ fn find_gpt_data_partition(
 
 fn find_disk_handle(
     bs: &mut BootServices,
-    image_handle: *mut core::ffi::c_void,
+    _image_handle: *mut core::ffi::c_void,
 ) -> Option<*mut core::ffi::c_void> {
-    // Try LoadedImageProtocol first
-    let mut lip: *mut LoadedImageProtocol = core::ptr::null_mut();
-    if unsafe {
-        (bs.handle_protocol)(
-            image_handle,
-            &LOADED_IMAGE_PROTOCOL_GUID,
-            &mut lip as *mut _ as _,
-        )
-    } == EFI_SUCCESS
-        && !lip.is_null()
-    {
-        let dh = unsafe { (*lip).device_handle };
-        if !dh.is_null() {
-            return Some(dh);
-        }
-    }
-    // Fallback: locate all Block I/O handles
+    // Locate all Block I/O handles and pick the first whole-disk one.
+    // LoadedImageProtocol.device_handle often points to the ESP partition
+    // handle (LogicalPartition=true), whose LBA 0 is a VBR, not the MBR.
+    // Using Media.LogicalPartition ensures we read the real MBR/GPT table.
     let mut num: usize = 0;
     let mut buf: *mut *mut core::ffi::c_void = core::ptr::null_mut();
     if unsafe {
@@ -652,15 +639,35 @@ fn find_disk_handle(
             &mut num,
             &mut buf,
         )
-    } == EFI_SUCCESS
-        && !buf.is_null()
-        && num > 0
+    } != EFI_SUCCESS
+        || buf.is_null()
+        || num == 0
     {
-        let first = unsafe { *buf };
-        unsafe { (bs.free_pool)(buf as *mut core::ffi::c_void) };
-        return Some(first);
+        return None;
     }
-    None
+
+    let handles = unsafe { core::slice::from_raw_parts(buf, num) };
+    let mut result: Option<*mut core::ffi::c_void> = None;
+
+    for &h in handles {
+        let mut bio: *mut BlockIoProtocol = core::ptr::null_mut();
+        if unsafe {
+            (bs.handle_protocol)(h, &BLOCK_IO_PROTOCOL_GUID, &mut bio as *mut _ as _)
+        } != EFI_SUCCESS
+            || bio.is_null()
+        {
+            continue;
+        }
+        let media = unsafe { &*((*bio).media) };
+        // LogicalPartition=false → whole-disk device
+        if !media.bim_lp {
+            result = Some(h);
+            break;
+        }
+    }
+
+    unsafe { (bs.free_pool)(buf as *mut core::ffi::c_void) };
+    result
 }
 
 // ═══════════════════════════════════════════════════════════════════
