@@ -292,6 +292,13 @@ pub struct VirtualBlockIo {
     pub real_media_id: u32,
 }
 
+pub const DEVICE_PATH_PROTOCOL_GUID: Guid = Guid {
+    d1: 0x09576e91,
+    d2: 0x6d3f,
+    d3: 0x11d2,
+    d4: [0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
+};
+
 pub const BLOCK_IO_PROTOCOL_GUID: Guid = Guid {
     d1: 0x964e5b21,
     d2: 0x6459,

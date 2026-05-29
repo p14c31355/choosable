@@ -321,11 +321,11 @@ fn uefi_chainload_iso(
     }
 
     // ── Create virtual CD-ROM from the ISO file ──────────────────────
-    let cdrom_handle = crate::virtual_blockio::create_virtual_cdrom(
+    let cdrom_tuple = crate::virtual_blockio::create_virtual_cdrom(
         bs, iso_lba, bio_ptr, mid, iso_size,
     );
-    let device_handle = match cdrom_handle {
-        Some(h) => h,
+    let (device_handle, cdrom_dp) = match cdrom_tuple {
+        Some((h, dp)) => (h, dp),
         None => {
             print_raw(st, b"ERROR: Failed to create virtual CD-ROM.\r\n\0");
             return;
@@ -381,10 +381,13 @@ fn uefi_chainload_iso(
             unsafe {
                 // Point DeviceHandle to the virtual CD-ROM (not USB disk)
                 (*lip).device_handle = device_handle;
-                // FilePath was already set by LoadImage via the DevicePath parameter,
-                // but LoadImage may overwrite it — ensure it stays.
-                if (*lip).file_path.is_null() {
-                    (*lip).file_path = device_path;
+                // Use CD-ROM DevicePath as FilePath for proper boot device identification
+                // (cdrom_dp is the device path of the CD-ROM itself;
+                //  device_path is the HD+FilePath node for /EFI/BOOT/BOOTX64.EFI.
+                //  Both are valid; we use the file path for LoadedImageProtocol.)
+                (*lip).file_path = device_path;
+                if !cdrom_dp.is_null() {
+                    let _ = cdrom_dp; // already installed on the handle
                 }
             }
         }
