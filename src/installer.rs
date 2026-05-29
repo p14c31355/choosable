@@ -280,7 +280,7 @@ pub fn non_destructive_install(
     //  udev-stopped window.  When we resume, we send ONE trigger so
     //  udisks2 creates D-Bus objects for the final complete state.
     // ═══════════════════════════════════════════════════════════════
-    udev_stop();
+    let _udev_guard = udev_stop();
 
     println!("Writing partition table with new CZBLEFI partition...");
     update_partition_table(disk_path, &mbr, is_gpt, size_bytes, part2_start_sector)?;
