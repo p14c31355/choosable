@@ -1290,7 +1290,7 @@ pub fn update_choosable(disk_path: &str, secure_boot: Option<bool>, yes: bool) -
             mbr_bytes[510] = MBR_SIGNATURE_55;
             mbr_bytes[511] = MBR_SIGNATURE_AA;
 
-            let lba: u32 = 34u32.to_le();
+            let lba: u32 = 34;
             let needle: [u8; 4] = [0xC7, 0x06, 0xC8, 0x07];
             for i in 0..(boot_code_len.saturating_sub(8)) {
                 if mbr_bytes[i..i + 4] == needle {
