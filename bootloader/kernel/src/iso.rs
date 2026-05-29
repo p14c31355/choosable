@@ -172,7 +172,41 @@ extern "C" {
 }
 
 core::arch::global_asm!(
+    // ═══════════════════════════════════════════════════════════════════
+    //  Realmode stub — copied to low memory (0x0600) before transition.
+    //  Must be position-independent raw machine code.
+    // ═══════════════════════════════════════════════════════════════════
+    ".global realmode_stub",
+    "realmode_stub:",
+    ".code16",
+
+    // Set up real-mode segments
+    "mov ax, 0x0000",
+    "mov ds, ax",
+    "mov es, ax",
+    "mov fs, ax",
+    "mov gs, ax",
+    "mov ss, ax",
+    "mov sp, 0x7000",
+
+    // Re-enable interrupts
+    "sti",
+
+    // Set DL = boot drive (0x80 = first hard disk)
+    "mov dl, 0x80",
+
+    // Far jump to ISO boot image at 0x7C00
+    ".byte 0xEA",
+    ".word 0x7C00",
+    ".word 0x0000",
+
+    "realmode_stub_end:",
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  do_chainload — transition from 64-bit long mode → real mode
+    // ═══════════════════════════════════════════════════════════════════
     ".global do_chainload",
+    ".code64",
     "do_chainload:",
 
     // ── 1. Disable interrupts ─────────────────────────
@@ -203,40 +237,28 @@ core::arch::global_asm!(
     "and eax, 0xFFFFFEFF",
     "wrmsr",
 
-    // ── 5. Disable protected mode → real mode ────────
+    // ── 5. Copy realmode stub to 0x0600 (low memory) ─
+    //     Use .att_syntax temporarily for unambiguous immediate
+    //     address loading, then switch back to intel syntax.
+    ".att_syntax prefix",
+    "movl $realmode_stub, %esi",
+    "movl $0x0600, %edi",
+    "movl $(realmode_stub_end - realmode_stub), %ecx",
+    "rep movsb",
+    ".intel_syntax noprefix",
+
+    // ── 6. Disable protected mode → real mode ────────
+    //     Still in 32-bit code segment → D=1, so after PE is cleared
+    //     we can still execute 32-bit instructions (unreal mode).
     "mov eax, cr0",
     "and eax, 0xFFFFFFFE",
     "mov cr0, eax",
 
-    // ── 6. Set up real-mode segments ─────────────────
-    ".code16",
-    // Far jump to 16-bit code segment (selector 0x10)
-    // ljmp $0x10, $3f — hand-encoded:
-    //   opcode 0xEA, 4-byte offset (3f), 2-byte selector (0x0010)
+    // ── 7. Far jump to realmode stub at 0x0600 ───────
+    //     In 32-bit code mode, far-jump default encoding is
+    //     EA [32-bit offset] [16-bit selector], so no 0x66 prefix needed.
     ".byte 0xEA",
-    ".long 3f",
-    ".word 0x0010",
-    "3:",
-
-    "mov ax, 0x18",
-    "mov ds, ax",
-    "mov es, ax",
-    "mov fs, ax",
-    "mov gs, ax",
-    "mov ss, ax",
-    "mov sp, 0x7000",
-
-    // ── 7. Re-enable interrupts ──────────────────────
-    "sti",
-
-    // ── 8. Set DL = boot drive ───────────────────────
-    "mov dl, 0x80",
-
-    // ── 9. Jump to ISO boot image at 0x7C00 ─────────
-    // ljmp $0, $0x7C00 — hand-encoded:
-    //   opcode 0xEA, 2-byte offset (0x7C00), 2-byte selector (0x0000)
-    ".byte 0xEA",
-    ".word 0x7C00",
+    ".long 0x0600",
     ".word 0x0000",
 );
 
