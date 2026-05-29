@@ -147,15 +147,21 @@ pub fn check_tool_work_ok(fs_type: FilesystemType) -> Result<()> {
             }
         }
         FilesystemType::Fat32 => {
-            let status = std::process::Command::new("mkfs.vfat")
+            match std::process::Command::new("mkfs.vfat")
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()
-                .map_err(|_| ChoosableError::ToolNotFound("mkfs.vfat".to_string()))?;
-            if !status.success() {
-                return Err(ChoosableError::ToolNotFound(
-                    "mkfs.vfat does not work on this system".to_string(),
-                ));
+            {
+                Ok(_) => {}
+                Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(ChoosableError::ToolNotFound("mkfs.vfat".to_string()));
+                }
+                Err(e) => {
+                    return Err(ChoosableError::Generic(format!(
+                        "Failed to run mkfs.vfat: {}",
+                        e
+                    )));
+                }
             }
         }
         FilesystemType::Ntfs => {

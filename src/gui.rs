@@ -116,7 +116,12 @@ impl ChoosableApp {
                 self.disks = disks;
                 self.loading = false;
                 self.status = format!("{} disks found.", self.disks.len());
-                if self.selected_disk_index.is_none() && !self.disks.is_empty() {
+                if let Some(index) = self.selected_disk_index {
+                    if index >= self.disks.len() {
+                        self.selected_disk_index =
+                            if self.disks.is_empty() { None } else { Some(0) };
+                    }
+                } else if !self.disks.is_empty() {
                     self.selected_disk_index = Some(0);
                 }
             }

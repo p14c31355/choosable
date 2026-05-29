@@ -364,9 +364,11 @@ fn show_menu(
     }
     print_raw(st, b"\r\n=== Choosable UEFI Boot Menu ===\r\n\0");
     for i in 0..count.min(20) {
-        let num = (i + 1) as u8;
-        let num_s = [b' ', num + b'0', b'.', b' '];
-        print_raw(st, &num_s);
+        let num = (i + 1) as u64;
+        let (sb, sl) = format_u64_buf(num);
+        print_raw(st, b" ");
+        print_raw(st, &sb[20 - sl..]);
+        print_raw(st, b". ");
         if files[i].name_len > 0 && files[i].name[0] != 0 {
             print_raw(st, &files[i].name[..files[i].name_len]);
         }
@@ -405,25 +407,20 @@ fn show_menu(
                         bio_ptr, mid,
                     );
                 }
-            } else if (b'0'..=b'9').contains(&ch) {
-                let idx = (ch - b'0') as usize;
-                if idx == 1 && count >= 10 {
-                    if count >= 10 {
-                        boot_iso(
-                            st,
-                            files,
-                            idx + 9,
-                            part1_lba,
-                            spc,
-                            fat_start,
-                            fat_len,
-                            heap_start,
-                            bio,
-                            bio_ptr,
-                            mid,
-                        );
-                    }
-                }
+            } else if ch == b'0' && count >= 10 {
+                boot_iso(
+                    st,
+                    files,
+                    9,
+                    part1_lba,
+                    spc,
+                    fat_start,
+                    fat_len,
+                    heap_start,
+                    bio,
+                    bio_ptr,
+                    mid,
+                );
             } else if ch == b'r' || ch == b'R' {
                 print_raw(st, b"\r\nRe-scanning...\r\n\0");
                 let mut new_files: [IsoEntry; 64] = unsafe { core::mem::zeroed() };
@@ -519,12 +516,13 @@ fn boot_iso(
     }
 
     let bs = unsafe { &mut *st.boot_services };
+    let num_pages = (boot_sector_count as usize * 512 + 4095) / 4096;
     let mut pages: u64 = 0x100000;
     let status = unsafe {
         (bs.allocate_pages)(
             AllocateType::AllocateAddress,
             MemoryType::EfiLoaderData,
-            1,
+            num_pages,
             &mut pages,
         )
     };
@@ -534,7 +532,7 @@ fn boot_iso(
             (bs.allocate_pages)(
                 AllocateType::AllocateAnyPages,
                 MemoryType::EfiLoaderData,
-                1,
+                num_pages,
                 &mut pages,
             )
         };
@@ -613,6 +611,8 @@ fn find_gpt_data_partition(
     ];
 
     let mut sec: [u8; 512] = [0; 512];
+    let mut current_lba: u64 = 0;
+    let mut loaded = false;
     for i in 0..n.min(128) {
         let eoff = i as usize * sz as usize;
         let lba = entries_lba + (eoff / 512) as u64;
@@ -620,12 +620,14 @@ fn find_gpt_data_partition(
         if boff + 16 > 512 {
             continue;
         }
-        if i as usize % (512usize / sz as usize) == 0 || i == 0 {
+        if !loaded || lba != current_lba {
             if unsafe { (bio_ref.read_blocks)(bio_ptr, mid, lba, 512, sec.as_mut_ptr() as _) }
                 != EFI_SUCCESS
             {
                 break;
             }
+            current_lba = lba;
+            loaded = true;
         }
         if sec[boff..boff + 16] == basic_data_guid {
             let start_lba = u64::from_le_bytes(sec[boff + 32..boff + 40].try_into().unwrap());
