@@ -569,7 +569,7 @@ fn boot_iso(
 
     print_raw(st, b"Boot image loaded. Rebooting...\r\n\0");
     let rt = unsafe { &mut *st.runtime_services };
-    unsafe { (rt.reset_system)(ResetType::ResetCold, 0, 0, core::ptr::null_mut()) };
+    unsafe { (rt.reset_system)(ResetType::ResetWarm, 0, 0, core::ptr::null_mut()) };
     loop {
         unsafe { core::arch::asm!("hlt") }
     }
