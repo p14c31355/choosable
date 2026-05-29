@@ -10,11 +10,17 @@ fn is_partition_of(dev: &str, disk_path: &str) -> bool {
         if suffix.is_empty() {
             return false; // exact match handled by caller
         }
-        let disk_ends_with_digit = disk_path.chars().last().map_or(false, |c| c.is_ascii_digit());
+        let disk_ends_with_digit = disk_path
+            .chars()
+            .last()
+            .map_or(false, |c| c.is_ascii_digit());
         if disk_ends_with_digit {
             // NVMe / MMC naming: partition suffix must be 'p' followed by digit(s)
             if let Some(part_suffix) = suffix.strip_prefix('p') {
-                part_suffix.chars().next().map_or(false, |c| c.is_ascii_digit())
+                part_suffix
+                    .chars()
+                    .next()
+                    .map_or(false, |c| c.is_ascii_digit())
             } else {
                 false
             }
@@ -41,7 +47,8 @@ pub fn check_swap(disk_path: &str) -> Result<()> {
                 let is_sub_dev = dev == disk_path || is_partition_of(dev, disk_path);
                 if is_sub_dev {
                     return Err(ChoosableError::Generic(format!(
-                        "{} is used as swap, please swapoff it first!", disk_path
+                        "{} is used as swap, please swapoff it first!",
+                        disk_path
                     )));
                 }
             }
@@ -78,7 +85,8 @@ pub fn check_umount_disk(disk_path: &str) -> Result<()> {
                 let is_sub_dev = dev == disk_path || is_partition_of(dev, disk_path);
                 if is_sub_dev {
                     return Err(ChoosableError::Generic(format!(
-                        "{} is still mounted, please unmount it first!", disk_path
+                        "{} is still mounted, please unmount it first!",
+                        disk_path
                     )));
                 }
             }
@@ -100,32 +108,75 @@ pub fn check_tool_work_ok(fs_type: FilesystemType) -> Result<()> {
     match hexdump {
         Ok(s) if s.success() => {}
         _ => {
-            return Err(ChoosableError::ToolNotFound(
-                "hexdump".to_string()
-            ));
+            return Err(ChoosableError::ToolNotFound("hexdump".to_string()));
         }
     }
 
     // Check filesystem-specific formatting tool
-    let (tool_name, tool_arg) = match fs_type {
-        FilesystemType::ExFat => ("mkexfatfs", Some("-V")),
-        FilesystemType::Fat32 => ("mkfs.vfat", None),
-        FilesystemType::Ntfs => ("mkfs.ntfs", Some("-V")),
-    };
-
-    let mut cmd = std::process::Command::new(tool_name);
-    cmd.stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    if let Some(arg) = tool_arg {
-        cmd.arg(arg);
-    }
-    let status = cmd.status()
-        .map_err(|_| ChoosableError::ToolNotFound(tool_name.to_string()))?;
-
-    if !status.success() {
-        return Err(ChoosableError::ToolNotFound(
-            format!("{} does not work on this system", tool_name)
-        ));
+    match fs_type {
+        FilesystemType::ExFat => {
+            // Try mkexfatfs first, then mkfs.exfat as fallback
+            let tools = [
+                ("mkexfatfs", true),   // uses -V
+                ("mkfs.exfat", false), // -V exits with code 1, just check existence
+                ("/usr/sbin/mkfs.exfat", false),
+            ];
+            let mut found = false;
+            for (tool_name, use_version_flag) in &tools {
+                let mut cmd = std::process::Command::new(tool_name);
+                cmd.stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                if *use_version_flag {
+                    cmd.arg("-V");
+                }
+                match cmd.status() {
+                    Ok(_) => {
+                        // mkfs.exfat -V exits with code 1 on success,
+                        // so just check that the command exists and runs
+                        found = true;
+                        break;
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    _ => continue,
+                }
+            }
+            if !found {
+                return Err(ChoosableError::ToolNotFound(
+                    "mkexfatfs or mkfs.exfat is required for exFAT formatting".to_string(),
+                ));
+            }
+        }
+        FilesystemType::Fat32 => {
+            match std::process::Command::new("mkfs.vfat")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+            {
+                Ok(_) => {}
+                Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(ChoosableError::ToolNotFound("mkfs.vfat".to_string()));
+                }
+                Err(e) => {
+                    return Err(ChoosableError::Generic(format!(
+                        "Failed to run mkfs.vfat: {}",
+                        e
+                    )));
+                }
+            }
+        }
+        FilesystemType::Ntfs => {
+            let status = std::process::Command::new("mkfs.ntfs")
+                .arg("-V")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map_err(|_| ChoosableError::ToolNotFound("mkfs.ntfs".to_string()))?;
+            if !status.success() {
+                return Err(ChoosableError::ToolNotFound(
+                    "mkfs.ntfs does not work on this system".to_string(),
+                ));
+            }
+        }
     }
 
     // Check xzcat
@@ -138,9 +189,7 @@ pub fn check_tool_work_ok(fs_type: FilesystemType) -> Result<()> {
     match status {
         Ok(s) if s.success() => {}
         _ => {
-            return Err(ChoosableError::ToolNotFound(
-                "xzcat".to_string()
-            ));
+            return Err(ChoosableError::ToolNotFound("xzcat".to_string()));
         }
     }
 
@@ -156,7 +205,12 @@ pub fn wait_for_partitions(disk_path: &str) -> Result<()> {
         if Path::new(&part1).exists() && Path::new(&part2).exists() {
             return Ok(());
         }
-        println!("Waiting for partitions {} and {} ... (attempt {})", part1, part2, i + 1);
+        println!(
+            "Waiting for partitions {} and {} ... (attempt {})",
+            part1,
+            part2,
+            i + 1
+        );
         std::thread::sleep(std::time::Duration::from_secs(1));
 
         // Try to probe partitions
@@ -169,30 +223,26 @@ pub fn wait_for_partitions(disk_path: &str) -> Result<()> {
         }
     }
 
-    // Create device nodes if they still don't exist (mknod fallback)
-    if !Path::new(&part1).exists() {
-        if let Some(major_minor) = read_dev_major_minor(&part1) {
-            println!("Creating device node {} with mknod...", part1);
-            let _ = std::process::Command::new("mknod")
-                .args(&["-m", "0660", &part1, "b", &major_minor.0.to_string(), &major_minor.1.to_string()])
-                .status();
-        }
-    }
+    // Use partx to add partitions.  `partx -a` works with the kernel directly,
+    // so it is safe even while udev exec-queue is stopped.
+    // Do NOT call `udevadm settle` here — the caller may have stopped udev.
+    println!("Adding partitions for {} via partx...", disk_path);
+    let _ = std::process::Command::new("partx")
+        .args(&["-a", disk_path])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 
-    if !Path::new(&part2).exists() {
-        if let Some(major_minor) = read_dev_major_minor(&part2) {
-            println!("Creating device node {} with mknod...", part2);
-            let _ = std::process::Command::new("mknod")
-                .args(&["-m", "0660", &part2, "b", &major_minor.0.to_string(), &major_minor.1.to_string()])
-                .status();
-        }
-    }
+    // Poll for device nodes — partx adds them synchronously, so they should
+    // appear almost immediately.
+    std::thread::sleep(std::time::Duration::from_millis(500));
 
     if Path::new(&part1).exists() && Path::new(&part2).exists() {
         Ok(())
     } else {
         Err(ChoosableError::Generic(format!(
-            "Partitions {} / {} do not exist after waiting", part1, part2
+            "Partitions {} / {} do not exist after waiting",
+            part1, part2
         )))
     }
 }
@@ -212,17 +262,31 @@ fn read_dev_major_minor(part_path: &str) -> Option<(u32, u32)> {
     None
 }
 
-/// Delete existing partition device nodes (equivalent to `rm -f $PART1 $PART2`)
+/// Delete existing partition device nodes using partx.
+///
+/// `rm -f /dev/sdX1` bypasses udev and causes "No object for D-bus interface"
+/// errors in udisks2.  `partx -d` properly tells the kernel to remove partition
+/// nodes.
+///
+/// NOTE: This function must NOT call `udevadm settle` — it is called while
+/// udev exec-queue is stopped (`--stop-exec-queue`).  `partx -d` works
+/// directly with the kernel and does not require udev.
 pub fn remove_partition_nodes(disk_path: &str) {
     let part1 = get_partition_name(disk_path, 1);
     let part2 = get_partition_name(disk_path, 2);
 
-    if Path::new(&part1).exists() {
-        println!("Removing existing partition node {}", part1);
-        let _ = std::fs::remove_file(&part1);
-    }
-    if Path::new(&part2).exists() {
-        println!("Removing existing partition node {}", part2);
-        let _ = std::fs::remove_file(&part2);
+    if Path::new(&part1).exists() || Path::new(&part2).exists() {
+        println!(
+            "Removing existing partition nodes for {} via partx...",
+            disk_path
+        );
+        let _ = std::process::Command::new("partx")
+            .args(&["-d", disk_path])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+
+        // Brief sleep to let the kernel finish removing nodes
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
 }

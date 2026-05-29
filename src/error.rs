@@ -11,7 +11,9 @@ pub enum ChoosableError {
     #[error("Disk is a partition, not a whole disk: {0}")]
     IsPartition(String),
 
-    #[error("Disk already contains Choosable (version {0}). Use -u to update or -I to force install")]
+    #[error(
+        "Disk already contains Choosable (version {0}). Use -u to update or -I to force install"
+    )]
     AlreadyInstalled(String),
 
     #[error("Disk does not contain Choosable. Use -i to install")]

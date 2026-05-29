@@ -1,12 +1,12 @@
 use crate::constants::*;
-use std::io::{Read, Seek, SeekFrom, Write};
 use crate::error::{ChoosableError, Result};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 /// MBR Partition Table Entry (16 bytes)
 #[derive(Debug, Clone, Copy)]
 #[repr(C, packed)]
 pub struct PartitionTableEntry {
-    pub active: u8,           // 0x00 or 0x80
+    pub active: u8, // 0x00 or 0x80
     pub start_head: u8,
     pub start_sector_cylinder: u16, // bits 0-5: sector, bits 6-15: cylinder
     pub fs_flag: u8,
@@ -146,7 +146,8 @@ impl GptHeader {
         let mut buf = [0u8; 512];
         reader.read_exact(&mut buf)?;
 
-        let header: GptHeader = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const GptHeader) };
+        let header: GptHeader =
+            unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const GptHeader) };
 
         // Validate signature (read via raw pointer to avoid unaligned ref)
         let sig_ptr = std::ptr::addr_of!(header.signature);
@@ -313,7 +314,9 @@ impl GptInfo {
         self.header.write(writer)?;
 
         // Write partition table
-        writer.seek(SeekFrom::Start(self.header.part_table_start_lba * SECTOR_SIZE))?;
+        writer.seek(SeekFrom::Start(
+            self.header.part_table_start_lba * SECTOR_SIZE,
+        ))?;
         let part_ptr = std::ptr::addr_of!(self.partitions) as *const u8;
         let part_bytes = unsafe { std::slice::from_raw_parts(part_ptr, 128 * 128) };
         writer.write_all(part_bytes)?;

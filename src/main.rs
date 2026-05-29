@@ -4,8 +4,8 @@ mod constants;
 mod disk;
 mod disk_layout;
 mod error;
-mod installer;
 mod gui;
+mod installer;
 
 use clap::Parser;
 use cli::{Cli, Commands};
@@ -15,11 +15,38 @@ fn main() -> Result<()> {
     // If no arguments given at all, launch GUI
     let args: Vec<String> = std::env::args().collect();
     if args.len() <= 1 {
-        return gui::run_gui();
+        // Ensure XDG_RUNTIME_DIR for Wayland under sudo
+        if std::env::var("XDG_RUNTIME_DIR").is_err() {
+            let uid = std::env::var("SUDO_UID").ok().or_else(|| {
+                std::fs::read_to_string("/proc/self/status").ok().and_then(|status| {
+                    status
+                        .lines()
+                        .find(|l| l.starts_with("Uid:"))
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .map(|s| s.to_string())
+                })
+            });
+            if let Some(uid) = uid {
+                unsafe {
+                    std::env::set_var("XDG_RUNTIME_DIR", format!("/run/user/{}", uid));
+                }
+            }
+        }
+
+        return match gui::run_gui() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("GUI failed: {}", e);
+                eprintln!("Use 'choosable install <disk>' for CLI mode.");
+                Ok(())
+            }
+        };
     }
 
     // Handle --help / --version without requiring a subcommand
-    if args.len() == 2 && (args[1] == "--help" || args[1] == "-h" || args[1] == "--version" || args[1] == "-V") {
+    if args.len() == 2
+        && (args[1] == "--help" || args[1] == "-h" || args[1] == "--version" || args[1] == "-V")
+    {
         Cli::parse();
         return Ok(());
     }
@@ -43,7 +70,7 @@ fn main() -> Result<()> {
             filesystem,
             yes,
         } => {
-            let secure_boot = !no_secure_boot;
+            let secure_boot = secure_boot || !no_secure_boot;
 
             if non_destructive {
                 let fs_type = installer::FilesystemType::from_str(&filesystem)?;
