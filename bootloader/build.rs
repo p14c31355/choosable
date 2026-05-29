@@ -648,6 +648,9 @@ fn build_kernel_binary(out_dir: &PathBuf) -> Vec<u8> {
     let kdir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("kernel");
     let ktarget = out_dir.join("kernel-target");
 
+    // Clean standalone target dir so `cargo clean` at workspace root is enough
+    let _ = fs::remove_dir_all(kdir.join("target"));
+
     println!("cargo:warning=Building kernel for x86_64-unknown-none...");
     let status = std::process::Command::new("cargo")
         .args(&["build", "--target", "x86_64-unknown-none", "--release"])
@@ -750,6 +753,9 @@ fn extract_flat_from_elf(elf: &[u8]) -> Vec<u8> {
 fn build_efi_binary(out_dir: &PathBuf) -> Vec<u8> {
     let efi_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("efi");
     let efi_target = out_dir.join("efi-target");
+
+    // Clean standalone target dir so `cargo clean` at workspace root is enough
+    let _ = fs::remove_dir_all(efi_dir.join("target"));
 
     println!("cargo:warning=Building EFI for x86_64-unknown-uefi...");
     let s = std::process::Command::new("cargo")

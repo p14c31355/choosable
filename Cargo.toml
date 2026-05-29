@@ -3,6 +3,10 @@ members = [
     ".",
     "bootloader",
 ]
+exclude = [
+    "bootloader/kernel",
+    "bootloader/efi",
+]
 resolver = "2"
 
 [package]
