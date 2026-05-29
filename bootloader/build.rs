@@ -279,27 +279,15 @@ fn build_mbr_boot_sector() -> Vec<u8> {
                                                  // CMP EAX, 0x544F4F42
     c.emit(0x66).emit(0x3D).emit32(0x544F4F42u32); // CMP EAX, BOOT_COOKIE_MAGIC
     let jne_normal = c.jne_ph();
-    // Boot cookie found! DL already has disk number.
-    // Copy boot image from 0x80000 to 0x7C00, then jump to it.
-    // First clear the cookie so subsequent resets don't loop
+    // Boot cookie found! ISO boot image is already at 0x7C00
+    // (loaded there by the kernel before triggering reset).
+    // Clear the cookie so subsequent resets boot normally.
     c.emit(0x66)
         .emit(0xC7)
         .emit(0x06)
         .emit16(cookie_addr)
         .emit32(0); // MOV DWORD [cookie], 0
     c.mov_dl_mem16(dn); // restore DL (may have been clobbered)
-
-    // Copy from 0x80000 to 0x7C00 (512 bytes = 256 words)
-    // MOV SI, 0x0000  (source segment)
-    c.emit(0x66).emit(0xBE).emit32(0x0008_0000u32); // MOV ESI, 0x80000
-    // MOV DI, 0x7C00   (destination at ES:DI = 0x0000:0x7C00)
-    c.emit(0x66).emit(0xBF).emit32(0x7C00u32); // MOV EDI, 0x7C00
-    // MOV CX, 256  (copy 256 dwords = 1024 bytes = 2 sectors)
-    c.emit(0x66).emit(0xB9).emit32(256u32); // MOV ECX, 256
-    // CLD  (clear direction flag = forward copy)
-    c.cld();
-    // REP MOVSD  (32-bit copy)
-    c.emit(0x67).emit(0xF3).emit(0x66).emit(0xA5); // REP MOVSD (with address-size override)
     c.jmp_far(0x0000, 0x7C00);
 
     // ── Normal boot path ────────────────────────────────────────────

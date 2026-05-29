@@ -99,7 +99,7 @@ pub extern "C" fn _start() -> ! {
             vga::vga_print(4, 0, b"exFAT detected. Scanning...", 0x07);
         }
         FsType::Fat32 => {
-            let spc = vbr[13] as u32; // sectors per cluster
+            let spc = vbr[13] as u32;
             if spc == 0 {
                 vga::vga_print(3, 2, b"Invalid sectors per cluster.", 0x0C);
                 loop {
@@ -126,7 +126,7 @@ pub extern "C" fn _start() -> ! {
             vga::vga_print(4, 0, b"FAT32 detected. Scanning...", 0x07);
         }
         FsType::Ntfs => {
-            let spc = vbr[13] as u32; // sectors per cluster
+            let spc = vbr[13] as u32;
             if spc == 0 {
                 vga::vga_print(3, 2, b"Invalid sectors per cluster.", 0x0C);
                 loop {
@@ -134,12 +134,10 @@ pub extern "C" fn _start() -> ! {
                 }
             }
             let cluster_bytes = spc as u64 * 512;
-            // MFT start cluster is at offset 0x30 (48) in NTFS BPB
             let mft_lcn =
                 i64::from_le_bytes(vbr[0x30..0x38].try_into().unwrap());
             let mft_start_lba =
                 part1_lba as u64 + (mft_lcn as u64) * spc as u64;
-            // MFT record size: clus_per_mft_record at offset 0x40 (64)
             let cpmr_raw = vbr[0x40] as i8;
             let mft_record_size: u64 = if cpmr_raw > 0 {
                 cpmr_raw as u64 * cluster_bytes
@@ -165,13 +163,13 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
+    // Initialise chainload GDT descriptor
+    chainload::init_gdtr();
+
     // Scan root directory for .iso files
     let mut iso_files: [DirEntry; 64] = unsafe { core::mem::zeroed() };
     let mut iso_count: usize = 0;
     scan_filesystem(&ctx, &mut iso_files, &mut iso_count);
-
-    // Initialise GDT descriptor for chainload mode switch
-    chainload::init_gdtr();
 
     // Show menu → boot_iso() → chainload_iso() (never returns)
     menu::show_menu(&iso_files, iso_count, &ctx);
