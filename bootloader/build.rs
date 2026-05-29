@@ -526,7 +526,8 @@ fn build_stage2_binary(kernel: &[u8]) -> Vec<u8> {
     // loaded at 0x7C00 and to give the kernel room to grow.
     c.emit(0xBE).emit32(0x9E00); // MOV ESI, 0x9E00 (source)
     c.emit(0xBF).emit32(0x100000); // MOV EDI, 0x100000 (dest)
-    c.emit(0xB9).emit32(0x20000); // MOV ECX, 128*1024 (up to 512 KiB)
+    let kernel_dwords = ((kernel.len() + 3) / 4) as u32;
+    c.emit(0xB9).emit32(kernel_dwords); // MOV ECX, kernel_dwords
     c.emit(0xFC); // CLD
     c.emit(0xF3).emit(0xA5); // REP MOVSD
 
