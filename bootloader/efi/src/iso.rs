@@ -15,8 +15,8 @@ use crate::disk::read_sector;
 use crate::fs::{IsoEntry, FsCtx};
 use crate::output::{die, format_u64_buf, halt_or_reboot, print_raw};
 use crate::protocol::{
-    AllocateType, BlockIoProtocol, BootServices, MemoryType, SystemTable,
-    DevicePathProtocol, EFI_SUCCESS,
+    AllocateType, BlockIoProtocol, BootServices, LoadedImageProtocol, MemoryType, SystemTable,
+    DevicePathProtocol, EFI_SUCCESS, LOADED_IMAGE_PROTOCOL_GUID,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -224,6 +224,7 @@ fn find_efi_boot(
 fn uefi_chainload_iso(
     st: &mut SystemTable,
     image_handle: *mut c_void,
+    disk_handle: *mut c_void,
     files: &[IsoEntry; 64],
     idx: usize,
     bio_ref: &BlockIoProtocol,
@@ -232,6 +233,13 @@ fn uefi_chainload_iso(
 ) {
     let iso_lba = files[idx].file_start_lba;
 
+    let bs = unsafe { &mut *st.boot_services };
+
+    // Disable watchdog timer to prevent firmware reset during chainload
+    unsafe {
+        (bs.set_watchdog_timer)(0, 0x10000, 0, core::ptr::null());
+    }
+
     let (efi_lba, efi_size) = match find_efi_boot(st, bio_ref, bio_ptr, mid, iso_lba) {
         Some(v) => v,
         None => {
@@ -239,8 +247,6 @@ fn uefi_chainload_iso(
             return;
         }
     };
-
-    let bs = unsafe { &mut *st.boot_services };
 
     // Read the EFI executable into a pool-allocated buffer
     let (buf_ptr, buf_len) = match read_extent(bs, bio_ref, bio_ptr, mid, iso_lba, efi_lba, efi_size) {
@@ -266,7 +272,23 @@ fn uefi_chainload_iso(
         )
     };
 
-    if status != EFI_SUCCESS {
+    // Patch LoadedImageProtocol.DeviceHandle to point to the disk handle
+    // so the child image can discover block devices.
+    if status == EFI_SUCCESS {
+        let mut lip: *mut LoadedImageProtocol = core::ptr::null_mut();
+        let lip_status = unsafe {
+            (bs.handle_protocol)(
+                child_handle,
+                &LOADED_IMAGE_PROTOCOL_GUID,
+                &mut lip as *mut _ as _,
+            )
+        };
+        if lip_status == EFI_SUCCESS && !lip.is_null() {
+            unsafe {
+                (*lip).device_handle = disk_handle;
+            }
+        }
+    } else {
         unsafe { (bs.free_pool)(buf_ptr as _); }
         print_raw(st, b"ERROR: LoadImage failed.\r\n\0");
         return;
@@ -296,6 +318,7 @@ fn uefi_chainload_iso(
 pub fn boot_iso(
     st: &mut SystemTable,
     image_handle: *mut c_void,
+    disk_handle: *mut c_void,
     files: &[IsoEntry; 64],
     idx: usize,
     bio_ref: &BlockIoProtocol,
@@ -303,7 +326,7 @@ pub fn boot_iso(
     mid: u32,
 ) {
     print_raw(st, b"\r\nBooting ISO (UEFI chainload)...\r\n\0");
-    uefi_chainload_iso(st, image_handle, files, idx, bio_ref, bio_ptr, mid);
+    uefi_chainload_iso(st, image_handle, disk_handle, files, idx, bio_ref, bio_ptr, mid);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -315,6 +338,7 @@ use crate::fs::scan_directory;
 pub fn show_menu(
     st: &mut SystemTable,
     image_handle: *mut c_void,
+    disk_handle: *mut c_void,
     files: &[IsoEntry; 64],
     count: usize,
     ctx: &FsCtx,
@@ -365,16 +389,16 @@ pub fn show_menu(
         if (b'1'..=b'9').contains(&ch) {
             let idx = (ch - b'1') as usize;
             if idx < count {
-                boot_iso(st, image_handle, files, idx, bio_ref, bio_ptr, mid);
+                boot_iso(st, image_handle, disk_handle, files, idx, bio_ref, bio_ptr, mid);
             }
         } else if ch == b'0' && count >= 10 {
-            boot_iso(st, image_handle, files, 9, bio_ref, bio_ptr, mid);
+            boot_iso(st, image_handle, disk_handle, files, 9, bio_ref, bio_ptr, mid);
         } else if ch == b'r' || ch == b'R' {
             print_raw(st, b"\r\nRe-scanning...\r\n\0");
             let mut new_files: [IsoEntry; 64] = unsafe { core::mem::zeroed() };
             let mut new_count: usize = 0;
             scan_directory(bio_ref, bio_ptr, mid, ctx, &mut new_files, &mut new_count);
-            show_menu(st, image_handle, &new_files, new_count, ctx, bio_ref, bio_ptr, mid);
+            show_menu(st, image_handle, disk_handle, &new_files, new_count, ctx, bio_ref, bio_ptr, mid);
         }
     }
     halt_or_reboot(st)

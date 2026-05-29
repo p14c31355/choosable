@@ -101,7 +101,8 @@ pub struct BootServices {
     pub get_next_monotonic_count: *mut c_void,  // 0x0F0
     pub stall: unsafe extern "efiapi" fn(usize) -> usize,  // 0x0F8
     // ── 0x100–0x138 ──
-    pub set_watchdog_timer: *mut c_void,        // 0x100
+    pub set_watchdog_timer:
+        unsafe extern "efiapi" fn(usize, u64, usize, *const u16) -> usize,  // 0x100
     pub connect_controller: *mut c_void,         // 0x108
     pub disconnect_controller: *mut c_void,      // 0x110
     pub open_protocol: *mut c_void,              // 0x118
@@ -244,6 +245,34 @@ pub struct DevicePathProtocol {
     pub sub_type: u8,
     pub length: [u8; 2],
 }
+
+/// EFI_LOADED_IMAGE_PROTOCOL — the protocol installed on every loaded image.
+#[repr(C)]
+pub struct LoadedImageProtocol {
+    pub revision: u32,
+    pub parent_handle: *mut c_void,
+    pub system_table: *mut SystemTable,
+    // ── device location ──
+    pub device_handle: *mut c_void,
+    pub file_path: *mut c_void,    // DevicePathProtocol *
+    pub _reserved: *mut c_void,
+    // ── image load options ──
+    pub load_options_size: u32,
+    pub load_options: *mut c_void,
+    // ── image location ──
+    pub image_base: *mut c_void,
+    pub image_size: u64,
+    pub image_code_type: u32,
+    pub image_data_type: u32,
+    pub unload: *mut c_void,
+}
+
+pub const LOADED_IMAGE_PROTOCOL_GUID: Guid = Guid {
+    d1: 0x5B1B31A1,
+    d2: 0x9562,
+    d3: 0x11d2,
+    d4: [0x8E, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B],
+};
 
 pub const BLOCK_IO_PROTOCOL_GUID: Guid = Guid {
     d1: 0x964e5b21,
