@@ -821,7 +821,7 @@ pub fn install_choosable(
     // ═══════════════════════════════════════════════════════════════
     //  Stop udev, do EVERYTHING, then resume + notify ONCE.
     // ═══════════════════════════════════════════════════════════════
-    udev_stop();
+    let _udev_guard = udev_stop();
 
     let mut disk = open_disk_readwrite(disk_path)?;
 
