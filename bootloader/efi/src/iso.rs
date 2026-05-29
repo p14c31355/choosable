@@ -274,8 +274,8 @@ fn build_iso_device_path(
         let mut off = 0usize;
         dp.copy_from_nonoverlapping(HD_NODE.as_ptr(), HD_NODE.len());
         off += HD_NODE.len();
-        // Patch PartitionStart (bytes 8-15) with actual partition LBA in bytes
-        *(dp.add(8) as *mut u64) = (part1_lba * 512).to_le();
+        // Patch PartitionStart (bytes 8-15) with actual partition LBA
+        *(dp.add(8) as *mut u64) = part1_lba.to_le();
 
         // File path node header
         dp.add(off).write_volatile(0x04u8); // Type: MEDIA_DEVICE_PATH
