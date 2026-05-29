@@ -95,7 +95,8 @@ extern "efiapi" fn efi_main(
         die(st, b"Only exFAT is supported.\r\n\0");
     }
 
-    let spc_shift = vbr[108] as u32;
+    // vbr[0x6D] = SectorsPerClusterShift (NOT vbr[0x6C]=BytesPerSectorShift)
+    let spc_shift = vbr[109] as u32;
     let cluster_bytes = (1u32 << spc_shift) * 512;
     let fat_off = u32::from_le_bytes([vbr[80], vbr[81], vbr[82], vbr[83]]) as u64;
     let fat_len = u32::from_le_bytes([vbr[84], vbr[85], vbr[86], vbr[87]]) as u64;
@@ -105,6 +106,19 @@ extern "efiapi" fn efi_main(
     let fat_start = part1_lba + fat_off;
     let heap_start = part1_lba + heap_off;
     let sec_per_cluster = cluster_bytes / 512;
+
+    // Debug: print exFAT parameters
+    print_raw(st, b"exFAT: spc=");
+    print_hex(st, b"0x", sec_per_cluster as u64);
+    print_raw(st, b" root_cl=");
+    print_hex(st, b"0x", root_cluster as u64);
+    print_raw(st, b" fat_off=");
+    print_hex(st, b"0x", fat_off);
+    print_raw(st, b" heap_off=");
+    print_hex(st, b"0x", heap_off);
+    print_raw(st, b" part1_lba=");
+    print_hex(st, b"0x", part1_lba);
+    print_raw(st, b"\r\n\0");
 
     // Save root cluster for re-scan support
     unsafe {
