@@ -299,7 +299,7 @@ fn build_mbr_boot_sector() -> Vec<u8> {
     // CLD  (clear direction flag = forward copy)
     c.cld();
     // REP MOVSD  (32-bit copy)
-    c.emit(0xF3).emit(0x66).emit(0xA5); // REP MOVSD
+    c.emit(0x67).emit(0xF3).emit(0x66).emit(0xA5); // REP MOVSD (with address-size override)
     c.jmp_far(0x0000, 0x7C00);
 
     // ── Normal boot path ────────────────────────────────────────────
