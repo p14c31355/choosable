@@ -617,7 +617,7 @@ fn get_ntfs_file_info(ctx: &FsCtx, mft_rec: u32) -> Option<(u64, u64)> {
                 }
                 let run_off = u16::from_le_bytes([attrs[off + 0x20], attrs[off + 0x21]]) as usize;
                 let file_size = u64::from_le_bytes(attrs[off + 0x30..off + 0x38].try_into().unwrap());
-                if run_off > 0 && off + run_off + 1 < attrs.len() {
+                if run_off > 0 && run_off < alen && off + run_off < attrs.len() {
                     let run_bytes = &attrs[off + run_off..off + alen];
                     let mut lcn: u64 = 0;
                     if run_bytes.len() > 0 {
