@@ -1405,7 +1405,6 @@ pub fn list_choosable(disk_path: &str) -> Result<()> {
 fn check_choosable_secure_boot(disk_path: &str, part2_start_byte: u64) -> bool {
     let mut file = match std::fs::OpenOptions::new()
         .read(true)
-        .write(true)
         .open(disk_path)
     {
         Ok(f) => f,

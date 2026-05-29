@@ -338,7 +338,6 @@ impl<R: Read + Seek> Seek for PartitionSlice<R> {
 fn read_choosable_version(disk_path: &str, part2_start_byte: u64) -> Result<Option<String>> {
     let mut file = std::fs::OpenOptions::new()
         .read(true)
-        .write(true)
         .open(disk_path)?;
 
     file.seek(SeekFrom::Start(part2_start_byte))?;
