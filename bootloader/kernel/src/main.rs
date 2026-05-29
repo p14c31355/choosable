@@ -605,6 +605,9 @@ fn get_ntfs_file_info(ctx: &FsCtx, mft_rec: u32) -> Option<(u64, u64)> {
         if atype == 0xFFFFFFFF || atype == 0 {
             break;
         }
+        if off + 8 > attrs.len() {
+            break;
+        }
         let alen = u32::from_le_bytes([attrs[off + 4], attrs[off + 5], attrs[off + 6], attrs[off + 7]]) as usize;
         if alen < 8 || off + alen > attrs.len() {
             break;
