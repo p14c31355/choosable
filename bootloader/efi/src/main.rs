@@ -564,6 +564,12 @@ fn boot_iso(
         }
     }
 
+    // Copy boot image to standard BIOS boot address 0x7C00
+    let bios_dest = 0x7C00 as *mut u8;
+    unsafe {
+        core::ptr::copy_nonoverlapping(dest, bios_dest, boot_sector_count as usize * 512);
+    }
+
     let cookie_ptr = 0x7B00usize as *mut u32;
     unsafe { *cookie_ptr = 0x544F4F42u32 };
 
@@ -675,6 +681,9 @@ fn find_disk_handle(
         } != EFI_SUCCESS
             || bio.is_null()
         {
+            continue;
+        }
+        if unsafe { (*bio).media }.is_null() {
             continue;
         }
         let media = unsafe { &*((*bio).media) };
@@ -924,12 +933,12 @@ struct LoadedImageProtocol {
     device_handle: *mut core::ffi::c_void,
 }
 #[derive(Clone, Copy)]
-#[derive(Clone, Copy)]
 #[repr(u32)]
 enum ResetType {
     ResetCold = 0,
     ResetWarm = 1,
 }
+#[derive(Clone, Copy)]
 #[repr(u32)]
 enum LocateSearchType {
     ByProtocol = 2,
