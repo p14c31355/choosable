@@ -221,6 +221,9 @@ fn read_partitions() -> ([Partition; 4], usize) {
                     let max = (512 / sz as usize).min(n as usize).min(128);
                     for i in 0..max {
                         let eoff = i * sz as usize;
+                        if eoff + 48 > 512 {
+                            break;
+                        }
                         if sec[eoff..eoff + 16] == basic_data {
                             let start_lba = u64::from_le_bytes(sec[eoff + 32..eoff + 40].try_into().unwrap());
                             let end_lba = u64::from_le_bytes(sec[eoff + 40..eoff + 48].try_into().unwrap());
@@ -609,6 +612,9 @@ fn get_ntfs_file_info(ctx: &FsCtx, mft_rec: u32) -> Option<(u64, u64)> {
         if atype == 0x80 {
             let is_nonresident = attrs[off + 8] != 0;
             if is_nonresident {
+                if alen < 56 {
+                    break;
+                }
                 let run_off = u16::from_le_bytes([attrs[off + 0x20], attrs[off + 0x21]]) as usize;
                 let file_size = u64::from_le_bytes(attrs[off + 0x30..off + 0x38].try_into().unwrap());
                 if run_off > 0 && off + run_off + 1 < attrs.len() {
@@ -699,6 +705,7 @@ fn scan_ntfs_dir(ctx: &FsCtx, files: &mut [DirEntry], file_count: &mut usize) {
                             if ent_len < 8 || ent_len > entries.len() {
                                 break;
                             }
+                            let flags = entries[12];
                             let fn_off = 0x10usize;
                             if fn_off + 66 <= entries.len() && (flags & 0x02) == 0 {
                                 let name_len = entries[fn_off + 64] as usize;

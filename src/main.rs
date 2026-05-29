@@ -17,15 +17,18 @@ fn main() -> Result<()> {
     if args.len() <= 1 {
         // Ensure XDG_RUNTIME_DIR for Wayland under sudo
         if std::env::var("XDG_RUNTIME_DIR").is_err() {
-            if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
-                if let Some(uid) = status
-                    .lines()
-                    .find(|l| l.starts_with("Uid:"))
-                    .and_then(|l| l.split_whitespace().nth(1))
-                {
-                    unsafe {
-                        std::env::set_var("XDG_RUNTIME_DIR", format!("/run/user/{}", uid));
-                    }
+            let uid = std::env::var("SUDO_UID").ok().or_else(|| {
+                std::fs::read_to_string("/proc/self/status").ok().and_then(|status| {
+                    status
+                        .lines()
+                        .find(|l| l.starts_with("Uid:"))
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .map(|s| s.to_string())
+                })
+            });
+            if let Some(uid) = uid {
+                unsafe {
+                    std::env::set_var("XDG_RUNTIME_DIR", format!("/run/user/{}", uid));
                 }
             }
         }

@@ -351,7 +351,7 @@ fn scan_exfat_dir(
                         if entries[noff] != 0xC1 {
                             break;
                         }
-                        let to_copy = (name_len - name_pos).min(15);
+                        let to_copy = name_len.saturating_sub(name_pos).min(15).min(256 - name_pos);
                         if to_copy == 0 {
                             break;
                         }
@@ -738,21 +738,19 @@ fn parse_ntfs_index_entries(
             break;
         }
         let flags = entries[12];
-        let fn_len = entries[0x10] as usize;
-        let fn_off = 0x52usize; // $FILE_NAME attribute starts at offset 0x52 from index entry start
+        let fn_off = 0x10usize; // $FILE_NAME attribute starts at offset 0x10 from index entry start
 
-        if fn_off + 0x42 <= entries.len()
+        if fn_off + 66 <= entries.len()
             && (flags & 0x02) == 0 // not a subdirectory (we only care about files)
         {
-            // Parse $FILE_NAME: offset 0 = MFT ref (8 bytes), 0x40 = flags, 0x42 = name_len, 0x44 = name
-            let name_len = entries[fn_off + 0x41] as usize;
-            if name_len > 0 && name_len <= 255 && fn_off + 0x42 + name_len * 2 <= entries.len() {
+            let name_len = entries[fn_off + 64] as usize;
+            if name_len > 0 && name_len <= 255 && fn_off + 66 + name_len * 2 <= entries.len() {
                 let mut name_buf = [0u8; 256];
                 let mut np = 0;
                 for j in 0..name_len {
-                    if fn_off + 0x42 + j * 2 + 1 < entries.len() {
-                        let lo = entries[fn_off + 0x42 + j * 2];
-                        let _hi = entries[fn_off + 0x42 + j * 2 + 1];
+                    if fn_off + 66 + j * 2 + 1 < entries.len() {
+                        let lo = entries[fn_off + 66 + j * 2];
+                        let _hi = entries[fn_off + 66 + j * 2 + 1];
                         if lo < 0x80 && lo != 0 && np < 255 {
                             name_buf[np] = lo;
                             np += 1;
@@ -840,6 +838,9 @@ fn parse_ntfs_data_attr(ctx: &FsCtx, attrs: &[u8], _rem: usize) -> Option<(u64, 
             // $DATA attribute
             let is_nonresident = attrs[off + 8] != 0;
             if is_nonresident {
+                if alen < 56 {
+                    break;
+                }
                 // Parse data runs
                 let run_off = u16::from_le_bytes([attrs[off + 0x20], attrs[off + 0x21]]) as usize;
                 let file_size = u64::from_le_bytes(attrs[off + 0x30..off + 0x38].try_into().unwrap());
