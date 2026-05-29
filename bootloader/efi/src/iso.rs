@@ -16,7 +16,7 @@ use crate::fs::{IsoEntry, FsCtx};
 use crate::output::{die, format_u64_buf, halt_or_reboot, print_raw};
 use crate::protocol::{
     AllocateType, BlockIoProtocol, BootServices, LoadedImageProtocol, MemoryType, SystemTable,
-    DevicePathProtocol, EFI_SUCCESS, LOADED_IMAGE_PROTOCOL_GUID,
+    DevicePathProtocol, VirtualBlockIo, EFI_SUCCESS, LOADED_IMAGE_PROTOCOL_GUID, BLOCK_IO_PROTOCOL_GUID,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -303,7 +303,6 @@ fn build_iso_device_path(
 fn uefi_chainload_iso(
     st: &mut SystemTable,
     image_handle: *mut c_void,
-    disk_handle: *mut c_void,
     part1_lba: u64,
     files: &[IsoEntry; 64],
     idx: usize,
@@ -312,6 +311,7 @@ fn uefi_chainload_iso(
     mid: u32,
 ) {
     let iso_lba = files[idx].file_start_lba;
+    let iso_size = files[idx].file_size;
 
     let bs = unsafe { &mut *st.boot_services };
 
@@ -319,6 +319,18 @@ fn uefi_chainload_iso(
     unsafe {
         (bs.set_watchdog_timer)(0, 0x10000, 0, core::ptr::null());
     }
+
+    // ── Create virtual CD-ROM from the ISO file ──────────────────────
+    let cdrom_handle = crate::virtual_blockio::create_virtual_cdrom(
+        bs, iso_lba, bio_ptr, mid, iso_size,
+    );
+    let device_handle = match cdrom_handle {
+        Some(h) => h,
+        None => {
+            print_raw(st, b"ERROR: Failed to create virtual CD-ROM.\r\n\0");
+            return;
+        }
+    };
 
     let (efi_lba, efi_size) = match find_efi_boot(st, bio_ref, bio_ptr, mid, iso_lba) {
         Some(v) => v,
@@ -337,10 +349,10 @@ fn uefi_chainload_iso(
         }
     };
 
-    print_raw(st, b"Loading EFI image...\r\n\0");
-
     // Build a proper DevicePath so the child image can find its files
     let device_path = build_iso_device_path(bs, part1_lba);
+
+    print_raw(st, b"Loading EFI image...\r\n\0");
 
     // LoadImage
     let mut child_handle: *mut c_void = core::ptr::null_mut();
@@ -367,7 +379,8 @@ fn uefi_chainload_iso(
         };
         if lip_status == EFI_SUCCESS && !lip.is_null() {
             unsafe {
-                (*lip).device_handle = disk_handle;
+                // Point DeviceHandle to the virtual CD-ROM (not USB disk)
+                (*lip).device_handle = device_handle;
                 // FilePath was already set by LoadImage via the DevicePath parameter,
                 // but LoadImage may overwrite it — ensure it stays.
                 if (*lip).file_path.is_null() {
@@ -414,7 +427,7 @@ pub fn boot_iso(
     mid: u32,
 ) {
     print_raw(st, b"\r\nBooting ISO (UEFI chainload)...\r\n\0");
-    uefi_chainload_iso(st, image_handle, disk_handle, part1_lba, files, idx, bio_ref, bio_ptr, mid);
+    uefi_chainload_iso(st, image_handle, part1_lba, files, idx, bio_ref, bio_ptr, mid);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

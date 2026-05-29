@@ -65,7 +65,12 @@ pub struct BootServices {
     pub close_event: *mut c_void,       // 0x070
     pub check_event: *mut c_void,       // 0x078
     // ── 0x080–0x098 ──
-    pub install_protocol_interface: *mut c_void,       // 0x080
+    pub install_protocol_interface: unsafe extern "efiapi" fn(  // 0x080
+        *mut *mut c_void,          // Handle
+        *const Guid,               // Protocol GUID
+        usize,                     // InterfaceType (0 = EFI_NATIVE_INTERFACE)
+        *mut c_void,               // Interface
+    ) -> usize,
     pub reinstall_protocol_interface: *mut c_void,     // 0x088
     pub uninstall_protocol_interface: *mut c_void,     // 0x090
     pub handle_protocol: unsafe extern "efiapi" fn(    // 0x098
@@ -273,6 +278,19 @@ pub const LOADED_IMAGE_PROTOCOL_GUID: Guid = Guid {
     d3: 0x11d2,
     d4: [0x8E, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B],
 };
+
+/// Virtual Block I/O context — wraps ISO file data for CD-ROM emulation.
+#[repr(C)]
+pub struct VirtualBlockIo {
+    pub protocol: BlockIoProtocol,
+    pub media: BlockIoMedia,
+    /// ISO file start LBA (absolute disk sector)
+    pub iso_lba: u64,
+    /// Underlying real Block I/O protocol pointer
+    pub real_bio_ptr: *mut BlockIoProtocol,
+    /// Underlying media ID
+    pub real_media_id: u32,
+}
 
 pub const BLOCK_IO_PROTOCOL_GUID: Guid = Guid {
     d1: 0x964e5b21,

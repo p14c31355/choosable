@@ -6,6 +6,7 @@ mod fs;
 mod iso;
 mod output;
 mod protocol;
+mod virtual_blockio;
 
 use core::ffi::c_void;
 use core::panic::PanicInfo;
