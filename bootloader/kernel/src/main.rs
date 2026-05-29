@@ -594,7 +594,7 @@ fn show_menu(files: &[DirEntry], count: usize, part_lba: u32, info: &ExfatInfo) 
             }
             Some(b'\n') => continue,
             Some(d) if d.is_ascii_digit() => {
-                let idx = (d - b'1') as usize;
+                let idx = if d == b'0' { 9 } else { (d - b'1') as usize };
                 if idx < count {
                     boot_iso(&files[idx], part_lba, info);
                 }
