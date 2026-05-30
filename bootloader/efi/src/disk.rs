@@ -79,8 +79,9 @@ pub fn find_gpt_data_partition(
     bio_ptr: *mut BlockIoProtocol,
     mid: u32,
 ) -> u64 {
-    let mut hdr_sec: [u8; 512] = [0; 512];
-    if !read_sector(bio_ref, bio_ptr, mid, 1, &mut hdr_sec) {
+    let mut hdr_sec_aligned: [u64; 64] = [0; 64];
+    let hdr_sec: &mut [u8; 512] = unsafe { &mut *(hdr_sec_aligned.as_mut_ptr() as *mut [u8; 512]) };
+    if !read_sector(bio_ref, bio_ptr, mid, 1, hdr_sec) {
         return 0;
     }
     if &hdr_sec[0..8] != b"EFI PART" {

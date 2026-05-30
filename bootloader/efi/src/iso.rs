@@ -66,18 +66,14 @@ fn read_extent(
     }
     let ptr_u8: *mut u8 = ptr as *mut u8;
 
-    let mut offset: usize = 0;
-    for s in 0..sector_count {
-        let mut iso_sec = [0u8; 2048];
-        if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, lba + s, &mut iso_sec) {
-            unsafe { (bs.free_pool)(ptr); }
-            return None;
-        }
-        let to_copy = if offset + 2048 > buf_len { buf_len - offset } else { 2048 };
-        unsafe {
-            core::ptr::copy_nonoverlapping(iso_sec.as_ptr(), ptr_u8.add(offset), to_copy);
-        }
-        offset += to_copy;
+    // Read the entire extent directly into the pool buffer
+    let disk_lba = iso_lba + lba as u64 * 4;
+    let read_status = unsafe {
+        (bio_ref.read_blocks)(bio_ptr, mid, disk_lba, buf_len, ptr)
+    };
+    if read_status != EFI_SUCCESS {
+        unsafe { (bs.free_pool)(ptr); }
+        return None;
     }
     Some((ptr_u8, byte_len.min(buf_len as u32)))
 }

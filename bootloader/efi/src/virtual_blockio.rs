@@ -8,7 +8,6 @@
 
 use core::ffi::c_void;
 
-use crate::disk::read_sector;
 use crate::protocol::{
     BlockIoMedia, BlockIoProtocol, BootServices, MemoryType, VirtualBlockIo,
     EFI_SUCCESS, BLOCK_IO_PROTOCOL_GUID, DEVICE_PATH_PROTOCOL_GUID,
@@ -40,18 +39,18 @@ unsafe extern "efiapi" fn vblock_read(
         let disk_lba = vbio.iso_lba + block_lba * 4;
         let block_offset = b * 2048;
 
-        for i in 0..4 {
-            let mut sec = [0u8; 512];
-            if !read_sector(
-                &*vbio.real_bio_ptr,
+        // Read all 4 sectors (2048 bytes) in a single read_blocks call
+        let status = unsafe {
+            ((*vbio.real_bio_ptr).read_blocks)(
                 vbio.real_bio_ptr,
                 vbio.real_media_id,
-                disk_lba + i as u64,
-                &mut sec,
-            ) {
-                return 0x8000_0000_0000_0002; // EFI_DEVICE_ERROR
-            }
-            dst[block_offset + i * 512..block_offset + (i + 1) * 512].copy_from_slice(&sec);
+                disk_lba,
+                2048,
+                dst.as_mut_ptr().add(block_offset) as *mut c_void,
+            )
+        };
+        if status != EFI_SUCCESS {
+            return 0x8000_0000_0000_0002; // EFI_DEVICE_ERROR
         }
     }
 
