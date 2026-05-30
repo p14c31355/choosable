@@ -250,7 +250,7 @@ fn lookup_in_dir(
                 // skip to next sector
                 break;
             }
-            if offset + record_len > 2048 {
+            if record_len < 34 || offset + record_len > 2048 {
                 break;
             }
             let name_len = scratch[offset + 32] as usize;
