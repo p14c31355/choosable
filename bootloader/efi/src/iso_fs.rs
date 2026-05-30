@@ -715,7 +715,8 @@ unsafe extern "efiapi" fn file_close(this: *mut FileProtocol) -> usize {
 }
 
 /// Delete — not supported (read-only)
-unsafe extern "efiapi" fn file_delete(_this: *mut FileProtocol) -> usize {
+unsafe extern "efiapi" fn file_delete(this: *mut FileProtocol) -> usize {
+    let _ = file_close(this);
     EFI_WRITE_PROTECTED
 }
 
