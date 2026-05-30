@@ -587,6 +587,11 @@ fn recursive_find_cfg_with_loc(
                         extent, size, scratch,
                         entries, entry_count,
                     );
+                    // Re-read parent directory sector: recursive call
+                    // overwrote scratch with subdirectory data.
+                    if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, dir_lba + s, scratch) {
+                        return;
+                    }
                 }
             }
             offset += record_len;
@@ -662,6 +667,11 @@ fn recursive_find_cfg(
                 // Recurse into subdirectories
                 if is_dir && extent != dir_lba {
                     recursive_find_cfg(bio_ref, bio_ptr, mid, iso_lba, extent, size, scratch, candidates, cand_count);
+                    // Re-read parent directory sector: recursive call
+                    // overwrote scratch with subdirectory data.
+                    if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, dir_lba + s, scratch) {
+                        return;
+                    }
                 }
             }
             offset += record_len;
