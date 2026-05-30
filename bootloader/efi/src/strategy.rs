@@ -166,9 +166,9 @@ impl BootStrategy for LiveOSStrategy {
         let name = &ctx.iso_name[..ctx.iso_name_len];
         let lower = |b: u8| b | 0x20;
         // Fedora / RHEL / CentOS
-        name.windows(6).any(|w| lower(w[0]) == b'f' && lower(w[1]) == b'e' && lower(w[2]) == b'd' && lower(w[3]) == b'o' && lower(w[4]) == b'r' && w[5] == b'a')
-            || name.windows(4).any(|w| lower(w[0]) == b'r' && lower(w[1]) == b'h' && lower(w[2]) == b'e' && w[3] == b'l')
-            || name.windows(6).any(|w| lower(w[0]) == b'c' && lower(w[1]) == b'e' && lower(w[2]) == b'n' && lower(w[3]) == b't' && lower(w[4]) == b'o' && w[5] == b's')
+        name.windows(6).any(|w| lower(w[0]) == b'f' && lower(w[1]) == b'e' && lower(w[2]) == b'd' && lower(w[3]) == b'o' && lower(w[4]) == b'r' && lower(w[5]) == b'a')
+            || name.windows(4).any(|w| lower(w[0]) == b'r' && lower(w[1]) == b'h' && lower(w[2]) == b'e' && lower(w[3]) == b'l')
+            || name.windows(6).any(|w| lower(w[0]) == b'c' && lower(w[1]) == b'e' && lower(w[2]) == b'n' && lower(w[3]) == b't' && lower(w[4]) == b'o' && lower(w[5]) == b's')
     }
 
     fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> {
