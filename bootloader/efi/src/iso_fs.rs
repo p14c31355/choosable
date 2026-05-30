@@ -857,7 +857,7 @@ unsafe extern "efiapi" fn file_read_dir(
 
         let name_len = scratch[byte_offset + 32] as usize;
         let name_offset = byte_offset + 33;
-        if name_offset + name_len > 2048 {
+        if 33 + name_len > record_len || name_offset + name_len > 2048 {
             finished = true;
             break;
         }
