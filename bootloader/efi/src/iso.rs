@@ -431,7 +431,7 @@ fn patch_grub_cfg_blockio(
     let mut scratch = [0u8; 2048];
 
     // Collect entries
-    let mut entries: [CfgEntry; 8] = unsafe { core::mem::zeroed() };
+    let mut entries: [CfgEntry; 8] = [CfgEntry::default(); 8];
     let mut entry_count = 0usize;
 
     // Phase 1: Collect from known paths (fast, no recursive scan)
