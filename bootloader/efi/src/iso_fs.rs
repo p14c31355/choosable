@@ -19,7 +19,7 @@ use crate::protocol::{
     EfiFileInfo, EfiTime, Guid, SystemTable,
     EFI_SUCCESS, EFI_NOT_FOUND, EFI_INVALID_PARAMETER,
     EFI_UNSUPPORTED, EFI_BAD_BUFFER_SIZE,
-    EFI_WRITE_PROTECTED, FILE_INFO_GUID,
+    EFI_WRITE_PROTECTED, FILE_INFO_GUID, EFI_OUT_OF_RESOURCES,
 };
 
 use crate::output::print_raw;
