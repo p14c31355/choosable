@@ -55,8 +55,10 @@ fn patch_common(inp: &PatchInput, pre: &[u8]) -> Option<PatchOutput> {
     let name = inp.iso_name;
     let inj_len = pre.len() + name.len();
     let linux_lines = count_linux_lines(inp.original);
-    let header = b"set root=cd0\n";
-    let new_size = header.len() + inp.original.len() + inj_len * linux_lines + 128;
+    // No header prepended — keep output within original size so GRUB
+    // doesn't truncate based on the directory entry's file size.
+    let max_size = inp.original.len() + inj_len * linux_lines + 8;
+    let new_size = max_size + 256; // temporary buffer, trimmed later
 
     let mut patch_ptr: *mut c_void = core::ptr::null_mut();
     let status = unsafe { (bs.allocate_pool)(MemoryType::EfiLoaderData, new_size, &mut patch_ptr) };
@@ -65,8 +67,7 @@ fn patch_common(inp: &PatchInput, pre: &[u8]) -> Option<PatchOutput> {
     }
     let out = unsafe { core::slice::from_raw_parts_mut(patch_ptr as *mut u8, new_size) };
 
-    out[..header.len()].copy_from_slice(header);
-    let mut off = header.len();
+    let off: usize = 0; // no header
 
     // Build injection string
     let mut inj = [0u8; 256];

@@ -206,11 +206,12 @@ fn find_efi_boot(
     )
 }
 
-/// Find grub.cfg within the ISO, read and patch it, then install the
-/// patched version into the VirtualBlockIo so that GRUB sees the modified
-/// configuration regardless of which protocol it uses to read sectors.
+/// Recursively find and patch all `.CFG` files in the ISO, then install
+/// the first successfully patched one into the VirtualBlockIo.
+/// Tries common paths first (/boot/grub/loopback.cfg, etc.), then falls
+/// back to recursive directory traversal.
 fn patch_grub_cfg_blockio(
-    _st: &mut SystemTable,
+    st: &mut SystemTable,
     bs: &mut BootServices,
     vbio: *mut VirtualBlockIo,
     bio_ref: &BlockIoProtocol,
@@ -224,24 +225,85 @@ fn patch_grub_cfg_blockio(
     }
     let vb = unsafe { &mut *vbio };
 
-    // Walk the ISO to find grub.cfg — try both common locations
-    let (cfg_lba, cfg_size) = match find_grub_cfg(bio_ref, bio_ptr, mid, iso_lba) {
-        Some(v) => v,
-        None => return,
-    };
+    let mut pvd = [0u8; 2048];
+    if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, 16, &mut pvd) {
+        return;
+    }
+    if pvd[0] != 1 || &pvd[1..6] != b"CD001" {
+        return;
+    }
+    let root_lba = u32::from_le_bytes(pvd[158..162].try_into().unwrap());
+    let root_size = u32::from_le_bytes(pvd[166..170].try_into().unwrap());
+    let mut scratch = [0u8; 2048];
 
-    // Read the entire grub.cfg extent into a pool buffer
-    let (orig_ptr, orig_len) = match read_extent(bs, bio_ref, bio_ptr, mid, iso_lba, cfg_lba, cfg_size) {
-        Some(v) => v,
-        None => return,
-    };
-    let orig = unsafe { core::slice::from_raw_parts(orig_ptr, orig_len as usize) };
+    // Build a list of candidate .CFG entries: (lba, size)
+    let mut candidates: [Option<(u32, u32)>; 32] = [None; 32];
+    let mut cand_count = 0usize;
 
-    // Build a temporary IsoFsCtx for the strategy
+    // 1. Quick wins: known paths
+    if let Some(boot) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, b"BOOT", &mut scratch) {
+        if let Some(grub) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, boot.0, boot.1, b"GRUB", &mut scratch) {
+            if let Some(c) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, grub.0, grub.1, b"LOOPBACK.CFG", &mut scratch) {
+                candidates[cand_count] = Some(c);
+                cand_count += 1;
+            }
+            if let Some(c) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, grub.0, grub.1, b"GRUB.CFG", &mut scratch) {
+                if cand_count < 32 && {
+                    let mut dup = false;
+                    for j in 0..cand_count {
+                        if let Some((l, _)) = candidates[j] { if l == c.0 { dup = true; break; } }
+                    }
+                    !dup
+                } {
+                    candidates[cand_count] = Some(c);
+                    cand_count += 1;
+                }
+            }
+        }
+    }
+    if let Some(efi) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, b"EFI", &mut scratch) {
+        if let Some(boot2) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, efi.0, efi.1, b"BOOT", &mut scratch) {
+            if let Some(c) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, boot2.0, boot2.1, b"GRUB.CFG", &mut scratch) {
+                if cand_count < 32 && {
+                    let mut dup = false;
+                    for j in 0..cand_count {
+                        if let Some((l, _)) = candidates[j] { if l == c.0 { dup = true; break; } }
+                    }
+                    !dup
+                } {
+                    candidates[cand_count] = Some(c);
+                    cand_count += 1;
+                }
+            }
+        }
+    }
+    if let Some(c) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, b"GRUB.CFG", &mut scratch) {
+        if cand_count < 32 && {
+            let mut dup = false;
+            for j in 0..cand_count {
+                if let Some((l, _)) = candidates[j] { if l == c.0 { dup = true; break; } }
+            }
+            !dup
+        } {
+            candidates[cand_count] = Some(c);
+            cand_count += 1;
+        }
+    }
+
+    // 2. Recursive walk: scan all directories for *.CFG
+    if cand_count == 0 {
+        recursive_find_cfg(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, &mut scratch, &mut candidates, &mut cand_count);
+    }
+
+    if cand_count == 0 {
+        print_raw(st, b"[grub.cfg] No .CFG files found in ISO.\r\n\0");
+        return;
+    }
+
+    // Build IsoFsCtx once
     let mut iso_name_arr = [0u8; 128];
     let nlen = iso_name.len().min(127);
     iso_name_arr[..nlen].copy_from_slice(&iso_name[..nlen]);
-
     let ctx = crate::iso_fs::IsoFsCtx {
         real_bio_ptr: bio_ptr,
         real_media_id: mid,
@@ -255,121 +317,167 @@ fn patch_grub_cfg_blockio(
         iso_name_len: nlen,
     };
 
-    let patch = strategy::patch_grub_cfg(&ctx, orig, bs as *mut BootServices);
+    // Try each candidate until one patches successfully AND fits in original size
+    for i in 0..cand_count {
+        if let Some((cfg_lba, cfg_size)) = candidates[i] {
+            print_raw(st, b"[grub.cfg] Trying candidate LBA=\0");
+            // Quick LBA print
+            let mut buf = [0u8; 16];
+            let mut v = cfg_lba as u64;
+            let mut p = 15;
+            loop {
+                buf[p] = b'0' + (v % 10) as u8;
+                v /= 10;
+                if v == 0 || p == 0 { break; }
+                p -= 1;
+            }
+            print_raw(st, &buf[p..]);
+            print_raw(st, b"...\r\n\0");
 
-    // Free the original buffer
-    unsafe { (bs.free_pool)(orig_ptr as *mut c_void); }
+            let (orig_ptr, orig_len) = match read_extent(bs, bio_ref, bio_ptr, mid, iso_lba, cfg_lba, cfg_size) {
+                Some(v) => v,
+                None => continue,
+            };
+            let orig = unsafe { core::slice::from_raw_parts(orig_ptr, orig_len as usize) };
 
-    let (patched_buf, patched_size) = match patch {
-        Some(p) => (p.buf, p.size),
-        None => return,
-    };
+            let patch = strategy::patch_grub_cfg(&ctx, orig, bs as *mut BootServices);
+            unsafe { (bs.free_pool)(orig_ptr as *mut c_void); }
 
-    // Round up to 2048-byte sector boundary
-    let sector_aligned_size = ((patched_size + 2047) / 2048) * 2048;
+            let (patched_buf, patched_size) = match patch {
+                Some(p) => (p.buf, p.size),
+                None => continue,
+            };
 
-    // Allocate a new pool buffer for the sector-aligned patched content
-    let mut final_ptr: *mut c_void = core::ptr::null_mut();
-    let status = unsafe {
-        (bs.allocate_pool)(MemoryType::EfiLoaderData, sector_aligned_size, &mut final_ptr)
-    };
-    if status != EFI_SUCCESS || final_ptr.is_null() {
-        // Free the strategy output
-        unsafe { (bs.free_pool)(patched_buf as *mut c_void); }
-        return;
+            // Truncate to the original file size so GRUB doesn't cut the data off
+            let effective_size = patched_size.min(orig_len as usize);
+            let sector_aligned = ((effective_size + 2047) / 2048) * 2048;
+            let orig_sectors = ((orig_len as u64 + 2047) / 2048) as u32;
+
+            let mut final_ptr: *mut c_void = core::ptr::null_mut();
+            let status = unsafe {
+                (bs.allocate_pool)(MemoryType::EfiLoaderData, sector_aligned, &mut final_ptr)
+            };
+            if status != EFI_SUCCESS || final_ptr.is_null() {
+                unsafe { (bs.free_pool)(patched_buf as *mut c_void); }
+                continue;
+            }
+
+            let final_buf = unsafe { core::slice::from_raw_parts_mut(final_ptr as *mut u8, sector_aligned) };
+            final_buf[..effective_size].copy_from_slice(unsafe {
+                core::slice::from_raw_parts(patched_buf, effective_size)
+            });
+            for j in effective_size..sector_aligned {
+                final_buf[j] = 0;
+            }
+            unsafe { (bs.free_pool)(patched_buf as *mut c_void); }
+
+            vb.grub_cfg_sector = cfg_lba;
+            vb.grub_cfg_sectors = orig_sectors; // original sector count: GRUB uses extent size
+            vb.patched_grub_cfg = final_ptr as *mut u8;
+
+            print_raw(st, b"[grub.cfg] PATCHED (orig=\0");
+            let mut buf2 = [0u8; 16];
+            let mut v2 = orig_len as u64;
+            let mut p2 = 15;
+            loop {
+                buf2[p2] = b'0' + (v2 % 10) as u8;
+                v2 /= 10;
+                if v2 == 0 || p2 == 0 { break; }
+                p2 -= 1;
+            }
+            print_raw(st, &buf2[p2..]);
+            print_raw(st, b" bytes, patched=\0");
+            let mut buf3 = [0u8; 16];
+            let mut v3 = effective_size as u64;
+            let mut p3 = 15;
+            loop {
+                buf3[p3] = b'0' + (v3 % 10) as u8;
+                v3 /= 10;
+                if v3 == 0 || p3 == 0 { break; }
+                p3 -= 1;
+            }
+            print_raw(st, &buf3[p3..]);
+            print_raw(st, b")\r\n\0");
+            return;
+        }
     }
 
-    let final_buf = unsafe { core::slice::from_raw_parts_mut(final_ptr as *mut u8, sector_aligned_size) };
-    // Copy the patched content
-    final_buf[..patched_size].copy_from_slice(unsafe {
-        core::slice::from_raw_parts(patched_buf, patched_size)
-    });
-    // Zero-fill the remainder (padding)
-    for i in patched_size..sector_aligned_size {
-        final_buf[i] = 0;
-    }
-
-    // Free the strategy output now that we've copied it
-    unsafe { (bs.free_pool)(patched_buf as *mut c_void); }
-
-    // Set the BlockIO-level patch
-    vb.grub_cfg_sector = cfg_lba;
-    vb.grub_cfg_sectors = (sector_aligned_size / 2048) as u32;
-    vb.patched_grub_cfg = final_ptr as *mut u8;
+    print_raw(st, b"[grub.cfg] Failed to patch any candidate.\r\n\0");
 }
 
-/// Find grub.cfg in the ISO: try multiple known paths.
-/// Ubuntu Live ISOs often use /boot/grub/loopback.cfg as the actual menu.
-/// Returns (extent_lba, extent_size) in ISO sectors/bytes.
-fn find_grub_cfg(
+/// Recursively walk ISO9660 directories to find any file ending in `.CFG`.
+fn recursive_find_cfg(
     bio_ref: &BlockIoProtocol,
     bio_ptr: *mut BlockIoProtocol,
     mid: u32,
     iso_lba: u64,
-) -> Option<(u32, u32)> {
-    let mut pvd = [0u8; 2048];
-    if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, 16, &mut pvd) {
-        return None;
-    }
-    if pvd[0] != 1 || &pvd[1..6] != b"CD001" {
-        return None;
-    }
-    let root_lba = u32::from_le_bytes(pvd[158..162].try_into().unwrap());
-    let root_size = u32::from_le_bytes(pvd[166..170].try_into().unwrap());
-    let mut scratch = [0u8; 2048];
+    dir_lba: u32,
+    dir_size: u32,
+    scratch: &mut [u8; 2048],
+    candidates: &mut [Option<(u32, u32)>; 32],
+    cand_count: &mut usize,
+) {
+    let total_sectors = ((dir_size as u64 + 2047) / 2048) as u32;
+    for s in 0..total_sectors {
+        if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, dir_lba + s, scratch) {
+            return;
+        }
+        let mut offset: usize = 0;
+        while offset + 34 <= 2048 && offset < dir_size as usize {
+            let record_len = scratch[offset] as usize;
+            if record_len == 0 {
+                break;
+            }
+            if offset + record_len > 2048 {
+                break;
+            }
+            let name_len = scratch[offset + 32] as usize;
+            let name_offset = offset + 33;
+            if name_offset + name_len > 2048 {
+                break;
+            }
+            let flags = scratch[offset + 25];
+            let is_dir = flags & 0x02 != 0;
+            let extent = u32::from_le_bytes(scratch[offset + 2..offset + 6].try_into().unwrap());
+            let size = u32::from_le_bytes(scratch[offset + 10..offset + 14].try_into().unwrap());
 
-    // Try /boot/grub/loopback.cfg — Ubuntu Live ISO (most common)
-    if let Some(boot_entry) = find_in_dir(
-        bio_ref, bio_ptr, mid, iso_lba,
-        root_lba, root_size, b"BOOT", &mut scratch,
-    ) {
-        if let Some(grub_entry) = find_in_dir(
-            bio_ref, bio_ptr, mid, iso_lba,
-            boot_entry.0, boot_entry.1, b"GRUB", &mut scratch,
-        ) {
-            if let Some(cfg) = find_in_dir(
-                bio_ref, bio_ptr, mid, iso_lba,
-                grub_entry.0, grub_entry.1, b"LOOPBACK.CFG", &mut scratch,
-            ) {
-                return Some(cfg);
+            // Skip "." and ".."
+            let skip = if name_len == 1 && scratch[name_offset] == 0 { true }
+                else if name_len == 1 && scratch[name_offset] == 1 { true }
+                else { false };
+
+            if !skip {
+                // Check if name ends with ".CFG" (case-insensitive, strip ";1")
+                let eff_len = if name_len >= 2 && scratch[name_offset + name_len - 2] == b';' {
+                    name_len - 2
+                } else {
+                    name_len
+                };
+                let has_cfg = eff_len >= 4 && {
+                    let ofs = name_offset + eff_len - 4;
+                    (scratch[ofs] | 0x20) == b'.' && (scratch[ofs+1] | 0x20) == b'c'
+                        && (scratch[ofs+2] | 0x20) == b'f' && (scratch[ofs+3] | 0x20) == b'g'
+                };
+                if has_cfg && !is_dir && *cand_count < 32 {
+                    // Check for duplicates
+                    let mut dup = false;
+                    for j in 0..*cand_count {
+                        if let Some((l, _)) = candidates[j] { if l == extent { dup = true; break; } }
+                    }
+                    if !dup {
+                        candidates[*cand_count] = Some((extent, size));
+                        *cand_count += 1;
+                    }
+                }
+
+                // Recurse into subdirectories
+                if is_dir && extent != dir_lba {
+                    recursive_find_cfg(bio_ref, bio_ptr, mid, iso_lba, extent, size, scratch, candidates, cand_count);
+                }
             }
-            // Also try grub.cfg in the same GRUB dir
-            if let Some(cfg) = find_in_dir(
-                bio_ref, bio_ptr, mid, iso_lba,
-                grub_entry.0, grub_entry.1, b"GRUB.CFG", &mut scratch,
-            ) {
-                return Some(cfg);
-            }
+            offset += record_len;
         }
     }
-
-    // Try /EFI/BOOT/grub.cfg — some distros put it here
-    if let Some(efi_entry) = find_in_dir(
-        bio_ref, bio_ptr, mid, iso_lba,
-        root_lba, root_size, b"EFI", &mut scratch,
-    ) {
-        if let Some(boot_entry2) = find_in_dir(
-            bio_ref, bio_ptr, mid, iso_lba,
-            efi_entry.0, efi_entry.1, b"BOOT", &mut scratch,
-        ) {
-            if let Some(cfg) = find_in_dir(
-                bio_ref, bio_ptr, mid, iso_lba,
-                boot_entry2.0, boot_entry2.1, b"GRUB.CFG", &mut scratch,
-            ) {
-                return Some(cfg);
-            }
-        }
-    }
-
-    // Try /grub.cfg — root directory (fallback)
-    if let Some(cfg) = find_in_dir(
-        bio_ref, bio_ptr, mid, iso_lba,
-        root_lba, root_size, b"GRUB.CFG", &mut scratch,
-    ) {
-        return Some(cfg);
-    }
-
-    None
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
