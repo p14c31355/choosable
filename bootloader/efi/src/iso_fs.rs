@@ -294,7 +294,117 @@ unsafe extern "efiapi" fn sfs_open_volume(
 //  FileProtocol implementations
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Walk the ISO directory tree to resolve a multi-component UCS-2 path.
+/// Returns (extent_lba, extent_size, is_dir) for the final component.
+/// `start_lba` and `start_size` define the starting directory extent.
+fn resolve_path(
+    ctx: &IsoFsCtx,
+    start_lba: u32,
+    start_size: u32,
+    path: &[u16],
+) -> Option<(u32, u32, bool)> {
+    if path.is_empty() || (path.len() == 1 && path[0] == b'\\' as u16) {
+        // Empty path or just "\" → return the starting directory itself
+        return Some((start_lba, start_size, true));
+    }
+
+    // Skip leading backslash(es)
+    let mut pos = 0usize;
+    while pos < path.len() && path[pos] == b'\\' as u16 {
+        pos += 1;
+    }
+    if pos >= path.len() {
+        return Some((start_lba, start_size, true));
+    }
+
+    let mut cur_lba = start_lba;
+    let mut cur_size = start_size;
+
+    // Walk component by component
+    while pos < path.len() {
+        // Find the end of this component
+        let comp_start = pos;
+        while pos < path.len() && path[pos] != b'\\' as u16 {
+            pos += 1;
+        }
+        let component = &path[comp_start..pos];
+
+        // Look up this component in the current directory
+        let (child_lba, child_size, is_dir) =
+            lookup_in_dir(ctx, cur_lba, cur_size, component)?;
+
+        // Skip the backslash after the component
+        if pos < path.len() && path[pos] == b'\\' as u16 {
+            pos += 1;
+        }
+
+        // If there are more components, this must be a directory
+        let has_more = pos < path.len() && {
+            // Check if remaining is non-empty (not just trailing backslash)
+            let rem = &path[pos..];
+            !rem.is_empty() && rem[0] != 0
+        };
+
+        if has_more && !is_dir {
+            return None; // intermediate component must be a directory
+        }
+
+        cur_lba = child_lba;
+        cur_size = child_size;
+
+        if !has_more {
+            return Some((cur_lba, cur_size, is_dir));
+        }
+    }
+
+    Some((cur_lba, cur_size, false))
+}
+
+/// Allocate and initialize a VirtualFile from ISO extent info.
+fn alloc_virtual_file(
+    ctx: &IsoFsCtx,
+    lba: u32,
+    size: u32,
+    is_dir: bool,
+) -> Option<*mut FileProtocol> {
+    let bs = unsafe { &mut *ctx.bs };
+    let mut ptr: *mut c_void = core::ptr::null_mut();
+    let status = unsafe {
+        (bs.allocate_pool)(
+            crate::protocol::MemoryType::EfiLoaderData,
+            core::mem::size_of::<VirtualFile>(),
+            &mut ptr,
+        )
+    };
+    if status != EFI_SUCCESS || ptr.is_null() {
+        return None;
+    }
+
+    let vf = unsafe { &mut *(ptr as *mut VirtualFile) };
+    vf.file = FileProtocol {
+        revision: 0x0001_0000_0000_0001,
+        open: file_open,
+        close: file_close,
+        delete: file_delete,
+        read: if is_dir { file_read_dir } else { file_read_file },
+        write: file_write_ro,
+        get_position: file_get_position,
+        set_position: file_set_position,
+        get_info: file_get_info,
+        set_info: file_set_info_ro,
+        flush: file_flush,
+    };
+    vf.ctx = ctx as *const IsoFsCtx;
+    vf.is_dir = is_dir;
+    vf.extent_lba = lba;
+    vf.extent_size = size;
+    vf.position = 0;
+
+    Some(ptr as *mut FileProtocol)
+}
+
 /// Open a child file or subdirectory within a directory.
+/// Handles multi-component paths (e.g. `\EFI\BOOT\grubx64.efi`).
 unsafe extern "efiapi" fn file_open(
     this: *mut FileProtocol,
     new_handle: *mut *mut FileProtocol,
@@ -308,12 +418,12 @@ unsafe extern "efiapi" fn file_open(
 
     let vf = unsafe { &*(this as *const VirtualFile) };
     if !vf.is_dir {
-        return EFI_UNSUPPORTED; // cannot open child of a regular file
+        return EFI_UNSUPPORTED;
     }
 
     let ctx = unsafe { &*vf.ctx };
 
-    // Convert UCS-2 file name to a slice
+    // Convert UCS-2 file name to a slice (null-terminated)
     let name_slice = unsafe {
         let mut len = 0usize;
         while *file_name.add(len) != 0 {
@@ -325,50 +435,20 @@ unsafe extern "efiapi" fn file_open(
         core::slice::from_raw_parts(file_name, len)
     };
 
-    // Find the named entry in the directory
-    let (child_lba, child_size, is_dir) = match lookup_in_dir(ctx, vf.extent_lba, vf.extent_size, name_slice) {
+    // Resolve multi-component path
+    let (child_lba, child_size, is_dir) = match resolve_path(ctx, vf.extent_lba, vf.extent_size, name_slice) {
         Some(v) => v,
         None => return EFI_NOT_FOUND,
     };
 
-    // Allocate a new VirtualFile
-    let bs = unsafe { &mut *ctx.bs };
-    let mut ptr: *mut c_void = core::ptr::null_mut();
-    let status = unsafe {
-        (bs.allocate_pool)(
-            crate::protocol::MemoryType::EfiLoaderData,
-            core::mem::size_of::<VirtualFile>(),
-            &mut ptr,
-        )
+    // Allocate and initialize the VirtualFile
+    let fp = match alloc_virtual_file(ctx, child_lba, child_size, is_dir) {
+        Some(p) => p,
+        None => return 0x8000_0000_0000_0002, // EFI_OUT_OF_RESOURCES
     };
-    if status != EFI_SUCCESS || ptr.is_null() {
-        return 0x8000_0000_0000_0002;
-    }
 
-    let child = unsafe { &mut *(ptr as *mut VirtualFile) };
-    child.file = FileProtocol {
-        revision: 0x0001_0000_0000_0001,
-        open: file_open,
-        close: file_close,
-        delete: file_delete,
-        read: if is_dir { file_read_dir } else { file_read_file },
-        write: file_write_ro,
-        get_position: file_get_position,
-        set_position: file_set_position,
-        get_info: file_get_info,
-        set_info: file_set_info_ro,
-        flush: file_flush,
-    };
-    child.ctx = ctx;
-    child.is_dir = is_dir;
-    child.extent_lba = child_lba;
-    child.extent_size = child_size;
-    child.position = 0;
-
-    // open_mode handling: EFI_FILE_MODE_READ is standard, other modes unsupported
     let _ = open_mode;
-
-    *new_handle = ptr as *mut FileProtocol;
+    *new_handle = fp;
     EFI_SUCCESS
 }
 
