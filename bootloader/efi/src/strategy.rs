@@ -102,12 +102,18 @@ fn patch_common(inp: &PatchInput, pre: &[u8]) -> Option<PatchOutput> {
                 if line_end > line_start + 4 {
                     let mut search = line_end - 4;
                     while search > line_start {
-                            if out[search] == b'-' && out[search+1] == b'-' && out[search+2] == b'-' {
-                                if search == line_start || out[search-1] == b' ' {
+                        if out[search] == b'-' && out[search+1] == b'-' && out[search+2] == b'-' {
+                            // '---' must be at line start or preceded by a space
+                            if search == line_start || out[search-1] == b' ' {
+                                // Inject before the space (common), or at --- when at line start
+                                if search > line_start && out[search-1] == b' ' {
                                     inject_at = search - 1;
-                                    break;
+                                } else {
+                                    inject_at = search;
                                 }
+                                break;
                             }
+                        }
                         search -= 1;
                     }
                 }
@@ -142,7 +148,7 @@ impl BootStrategy for CasperStrategy {
     }
 
     fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> {
-        patch_common(inp, b" rootdelay=15 iso-scan/filename=/")
+        patch_common(inp, b" rootdelay=5 debug iso-scan/filename=/")
     }
 }
 

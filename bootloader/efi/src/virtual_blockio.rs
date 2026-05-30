@@ -19,6 +19,8 @@ use crate::protocol::{
 /// Translates LBA (in 2048-byte CD sectors) → real disk LBA
 /// (ISO file offset converted to 512-byte disk sectors), then reads
 /// into the caller's buffer.
+/// If a grub.cfg patch is active, sectors that overlap with grub.cfg
+/// are served from the patched buffer instead of the real ISO.
 unsafe extern "efiapi" fn vblock_read(
     this: *mut BlockIoProtocol,
     _media_id: u32,
@@ -37,21 +39,40 @@ unsafe extern "efiapi" fn vblock_read(
 
     for b in 0..num_blocks {
         let block_lba = lba + b as u64;
-        let disk_lba = vbio.iso_lba + block_lba * 4;
         let block_offset = b * 2048;
 
-        // Read all 4 sectors (2048 bytes) in a single read_blocks call
-        let status = unsafe {
-            ((*vbio.real_bio_ptr).read_blocks)(
-                vbio.real_bio_ptr,
-                vbio.real_media_id,
-                disk_lba,
-                2048,
-                dst.as_mut_ptr().add(block_offset) as *mut c_void,
-            )
-        };
-        if status != EFI_SUCCESS {
-            return 0x8000_0000_0000_0002; // EFI_DEVICE_ERROR
+        // Check if this block overlaps with the patched grub.cfg region
+        let grub_start = vbio.grub_cfg_sector as u64;
+        let grub_end = grub_start + vbio.grub_cfg_sectors as u64;
+        if vbio.grub_cfg_sectors > 0
+            && block_lba >= grub_start
+            && block_lba < grub_end
+            && !vbio.patched_grub_cfg.is_null()
+        {
+            let patch_offset = ((block_lba - grub_start) as usize) * 2048;
+            let src = unsafe {
+                core::slice::from_raw_parts(
+                    vbio.patched_grub_cfg.add(patch_offset),
+                    2048,
+                )
+            };
+            dst[block_offset..block_offset + 2048].copy_from_slice(src);
+        } else {
+            let disk_lba = vbio.iso_lba + block_lba * 4;
+
+            // Read all 4 sectors (2048 bytes) in a single read_blocks call
+            let status = unsafe {
+                ((*vbio.real_bio_ptr).read_blocks)(
+                    vbio.real_bio_ptr,
+                    vbio.real_media_id,
+                    disk_lba,
+                    2048,
+                    dst.as_mut_ptr().add(block_offset) as *mut c_void,
+                )
+            };
+            if status != EFI_SUCCESS {
+                return 0x8000_0000_0000_0002; // EFI_DEVICE_ERROR
+            }
         }
     }
 
@@ -60,7 +81,7 @@ unsafe extern "efiapi" fn vblock_read(
 
 /// Create a virtual Block I/O + Device Path handle representing ISO as CD-ROM.
 ///
-/// Returns `(handle, device_path_ptr)`.  Both must NOT be freed.
+/// Returns `(handle, device_path_ptr, vbio_ptr)`.  All three must NOT be freed.
 pub fn create_virtual_cdrom(
     bs: &mut BootServices,
     st: *mut SystemTable,
@@ -69,7 +90,7 @@ pub fn create_virtual_cdrom(
     real_media_id: u32,
     iso_size_bytes: u64,
     iso_name: &[u8],
-) -> Option<(*mut c_void, *mut c_void)> {
+) -> Option<(*mut c_void, *mut c_void, *mut VirtualBlockIo)> {
     // ═════════════════════════════════════════════════════════════
     // 1. Build CD-ROM DevicePath
     // ═════════════════════════════════════════════════════════════
@@ -154,6 +175,9 @@ pub fn create_virtual_cdrom(
     vbio.iso_lba = iso_lba;
     vbio.real_bio_ptr = real_bio_ptr;
     vbio.real_media_id = real_media_id;
+    vbio.grub_cfg_sector = 0;
+    vbio.grub_cfg_sectors = 0;
+    vbio.patched_grub_cfg = core::ptr::null_mut();
 
     // ═════════════════════════════════════════════════════════════
     // 3. Install BlockIO protocol (creates the handle)
@@ -213,5 +237,6 @@ pub fn create_virtual_cdrom(
         }
     }
 
-    Some((new_handle, dp_ptr))
+    let vbio_ptr = vbio as *mut VirtualBlockIo;
+    Some((new_handle, dp_ptr, vbio_ptr))
 }

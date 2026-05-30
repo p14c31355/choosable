@@ -290,6 +290,12 @@ pub struct VirtualBlockIo {
     pub real_bio_ptr: *mut BlockIoProtocol,
     /// Underlying media ID
     pub real_media_id: u32,
+    /// grub.cfg patch: starting ISO 2048-byte sector (0 = no patch)
+    pub grub_cfg_sector: u32,
+    /// grub.cfg patch: number of ISO 2048-byte sectors
+    pub grub_cfg_sectors: u32,
+    /// grub.cfg patch: pool-allocated patched content (grub_cfg_sectors * 2048 bytes)
+    pub patched_grub_cfg: *mut u8,
 }
 
 pub const DEVICE_PATH_PROTOCOL_GUID: Guid = Guid {

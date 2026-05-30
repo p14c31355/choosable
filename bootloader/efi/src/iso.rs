@@ -16,8 +16,10 @@ use crate::fs::{IsoEntry, FsCtx};
 use crate::output::{format_u64_buf, halt_or_reboot, print_raw};
 use crate::protocol::{
     BlockIoProtocol, BootServices, LoadedImageProtocol, MemoryType, SystemTable,
-    DevicePathProtocol, EFI_SUCCESS, LOADED_IMAGE_PROTOCOL_GUID,
+    DevicePathProtocol, VirtualBlockIo, EFI_SUCCESS, LOADED_IMAGE_PROTOCOL_GUID,
 };
+
+use crate::strategy;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  ISO9660 on-disk structures and helpers
@@ -204,6 +206,172 @@ fn find_efi_boot(
     )
 }
 
+/// Find grub.cfg within the ISO, read and patch it, then install the
+/// patched version into the VirtualBlockIo so that GRUB sees the modified
+/// configuration regardless of which protocol it uses to read sectors.
+fn patch_grub_cfg_blockio(
+    _st: &mut SystemTable,
+    bs: &mut BootServices,
+    vbio: *mut VirtualBlockIo,
+    bio_ref: &BlockIoProtocol,
+    bio_ptr: *mut BlockIoProtocol,
+    mid: u32,
+    iso_lba: u64,
+    iso_name: &[u8],
+) {
+    if vbio.is_null() {
+        return;
+    }
+    let vb = unsafe { &mut *vbio };
+
+    // Walk the ISO to find grub.cfg — try both common locations
+    let (cfg_lba, cfg_size) = match find_grub_cfg(bio_ref, bio_ptr, mid, iso_lba) {
+        Some(v) => v,
+        None => return,
+    };
+
+    // Read the entire grub.cfg extent into a pool buffer
+    let (orig_ptr, orig_len) = match read_extent(bs, bio_ref, bio_ptr, mid, iso_lba, cfg_lba, cfg_size) {
+        Some(v) => v,
+        None => return,
+    };
+    let orig = unsafe { core::slice::from_raw_parts(orig_ptr, orig_len as usize) };
+
+    // Build a temporary IsoFsCtx for the strategy
+    let mut iso_name_arr = [0u8; 128];
+    let nlen = iso_name.len().min(127);
+    iso_name_arr[..nlen].copy_from_slice(&iso_name[..nlen]);
+
+    let ctx = crate::iso_fs::IsoFsCtx {
+        real_bio_ptr: bio_ptr,
+        real_media_id: mid,
+        iso_lba,
+        iso_size_bytes: vb.media.bim_lb * 2048,
+        root_lba: 0,
+        root_size: 0,
+        bs: bs as *mut BootServices,
+        st: core::ptr::null_mut(),
+        iso_name: iso_name_arr,
+        iso_name_len: nlen,
+    };
+
+    let patch = strategy::patch_grub_cfg(&ctx, orig, bs as *mut BootServices);
+
+    // Free the original buffer
+    unsafe { (bs.free_pool)(orig_ptr as *mut c_void); }
+
+    let (patched_buf, patched_size) = match patch {
+        Some(p) => (p.buf, p.size),
+        None => return,
+    };
+
+    // Round up to 2048-byte sector boundary
+    let sector_aligned_size = ((patched_size + 2047) / 2048) * 2048;
+
+    // Allocate a new pool buffer for the sector-aligned patched content
+    let mut final_ptr: *mut c_void = core::ptr::null_mut();
+    let status = unsafe {
+        (bs.allocate_pool)(MemoryType::EfiLoaderData, sector_aligned_size, &mut final_ptr)
+    };
+    if status != EFI_SUCCESS || final_ptr.is_null() {
+        // Free the strategy output
+        unsafe { (bs.free_pool)(patched_buf as *mut c_void); }
+        return;
+    }
+
+    let final_buf = unsafe { core::slice::from_raw_parts_mut(final_ptr as *mut u8, sector_aligned_size) };
+    // Copy the patched content
+    final_buf[..patched_size].copy_from_slice(unsafe {
+        core::slice::from_raw_parts(patched_buf, patched_size)
+    });
+    // Zero-fill the remainder (padding)
+    for i in patched_size..sector_aligned_size {
+        final_buf[i] = 0;
+    }
+
+    // Free the strategy output now that we've copied it
+    unsafe { (bs.free_pool)(patched_buf as *mut c_void); }
+
+    // Set the BlockIO-level patch
+    vb.grub_cfg_sector = cfg_lba;
+    vb.grub_cfg_sectors = (sector_aligned_size / 2048) as u32;
+    vb.patched_grub_cfg = final_ptr as *mut u8;
+}
+
+/// Find grub.cfg in the ISO: try multiple known paths.
+/// Ubuntu Live ISOs often use /boot/grub/loopback.cfg as the actual menu.
+/// Returns (extent_lba, extent_size) in ISO sectors/bytes.
+fn find_grub_cfg(
+    bio_ref: &BlockIoProtocol,
+    bio_ptr: *mut BlockIoProtocol,
+    mid: u32,
+    iso_lba: u64,
+) -> Option<(u32, u32)> {
+    let mut pvd = [0u8; 2048];
+    if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, 16, &mut pvd) {
+        return None;
+    }
+    if pvd[0] != 1 || &pvd[1..6] != b"CD001" {
+        return None;
+    }
+    let root_lba = u32::from_le_bytes(pvd[158..162].try_into().unwrap());
+    let root_size = u32::from_le_bytes(pvd[166..170].try_into().unwrap());
+    let mut scratch = [0u8; 2048];
+
+    // Try /boot/grub/loopback.cfg — Ubuntu Live ISO (most common)
+    if let Some(boot_entry) = find_in_dir(
+        bio_ref, bio_ptr, mid, iso_lba,
+        root_lba, root_size, b"BOOT", &mut scratch,
+    ) {
+        if let Some(grub_entry) = find_in_dir(
+            bio_ref, bio_ptr, mid, iso_lba,
+            boot_entry.0, boot_entry.1, b"GRUB", &mut scratch,
+        ) {
+            if let Some(cfg) = find_in_dir(
+                bio_ref, bio_ptr, mid, iso_lba,
+                grub_entry.0, grub_entry.1, b"LOOPBACK.CFG", &mut scratch,
+            ) {
+                return Some(cfg);
+            }
+            // Also try grub.cfg in the same GRUB dir
+            if let Some(cfg) = find_in_dir(
+                bio_ref, bio_ptr, mid, iso_lba,
+                grub_entry.0, grub_entry.1, b"GRUB.CFG", &mut scratch,
+            ) {
+                return Some(cfg);
+            }
+        }
+    }
+
+    // Try /EFI/BOOT/grub.cfg — some distros put it here
+    if let Some(efi_entry) = find_in_dir(
+        bio_ref, bio_ptr, mid, iso_lba,
+        root_lba, root_size, b"EFI", &mut scratch,
+    ) {
+        if let Some(boot_entry2) = find_in_dir(
+            bio_ref, bio_ptr, mid, iso_lba,
+            efi_entry.0, efi_entry.1, b"BOOT", &mut scratch,
+        ) {
+            if let Some(cfg) = find_in_dir(
+                bio_ref, bio_ptr, mid, iso_lba,
+                boot_entry2.0, boot_entry2.1, b"GRUB.CFG", &mut scratch,
+            ) {
+                return Some(cfg);
+            }
+        }
+    }
+
+    // Try /grub.cfg — root directory (fallback)
+    if let Some(cfg) = find_in_dir(
+        bio_ref, bio_ptr, mid, iso_lba,
+        root_lba, root_size, b"GRUB.CFG", &mut scratch,
+    ) {
+        return Some(cfg);
+    }
+
+    None
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  UEFI chainload
 // ═══════════════════════════════════════════════════════════════════════════
@@ -320,13 +488,18 @@ fn uefi_chainload_iso(
     let cdrom_tuple = crate::virtual_blockio::create_virtual_cdrom(
         bs, st as *mut SystemTable, iso_lba, bio_ptr, mid, iso_size, iso_name,
     );
-    let (device_handle, cdrom_dp) = match cdrom_tuple {
-        Some((h, dp)) => (h, dp),
+    let (device_handle, cdrom_dp, vbio_ptr) = match cdrom_tuple {
+        Some((h, dp, vb)) => (h, dp, vb),
         None => {
             print_raw(st, b"ERROR: Failed to create virtual CD-ROM.\r\n\0");
             return;
         }
     };
+
+    // ── Patch grub.cfg at BlockIO level ─────────────────────────
+    // GRUB reads grub.cfg via BlockIO (ISO9660 driver), not SimpleFileSystem.
+    // We need to intercept sector reads so iso-scan/filename= is visible.
+    patch_grub_cfg_blockio(st, bs, vbio_ptr, bio_ref, bio_ptr, mid, iso_lba, iso_name);
 
     let (efi_lba, efi_size) = match find_efi_boot(st, bio_ref, bio_ptr, mid, iso_lba) {
         Some(v) => v,
