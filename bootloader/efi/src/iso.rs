@@ -13,38 +13,15 @@ use core::ffi::c_void;
 
 use crate::disk::read_sector;
 use crate::fs::{IsoEntry, FsCtx};
-use crate::output::{die, format_u64_buf, halt_or_reboot, print_raw};
+use crate::output::{format_u64_buf, halt_or_reboot, print_raw};
 use crate::protocol::{
-    AllocateType, BlockIoProtocol, BootServices, LoadedImageProtocol, MemoryType, SystemTable,
-    DevicePathProtocol, VirtualBlockIo, EFI_SUCCESS, LOADED_IMAGE_PROTOCOL_GUID, BLOCK_IO_PROTOCOL_GUID,
+    BlockIoProtocol, BootServices, LoadedImageProtocol, MemoryType, SystemTable,
+    DevicePathProtocol, EFI_SUCCESS, LOADED_IMAGE_PROTOCOL_GUID,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  ISO9660 on-disk structures
+//  ISO9660 on-disk structures and helpers
 // ═══════════════════════════════════════════════════════════════════════════
-
-/// ISO9660 directory record (variable-length, minimum 34 bytes)
-#[repr(C, packed)]
-struct DirRecordHdr {
-    len: u8,
-    ext_attr_len: u8,
-    extent: [u8; 8],
-    size: [u8; 8],
-    _date: [u8; 7],
-    flags: u8,
-    _unit_size: u8,
-    _gap_size: u8,
-    _vol_seq: [u8; 4],
-    name_len: u8,
-}
-
-fn extent_le(extent: &[u8; 8]) -> u32 {
-    u32::from_le_bytes([extent[0], extent[1], extent[2], extent[3]])
-}
-
-fn size_le(size: &[u8; 8]) -> u32 {
-    u32::from_le_bytes([size[0], size[1], size[2], size[3]])
-}
 
 /// Read one 2048-byte ISO logical sector (4 × 512-byte disk sectors)
 fn read_iso_sector(
@@ -110,6 +87,7 @@ fn read_extent(
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Get root directory record from the Primary Volume Descriptor (sector 16).
+/// Returns (extent_lba, extent_size) in ISO sectors/bytes.
 fn get_root_dir(
     st: &mut SystemTable,
     bio_ref: &BlockIoProtocol,
@@ -126,9 +104,13 @@ fn get_root_dir(
         print_raw(st, b"Invalid ISO PVD signature.\r\n\0");
         return None;
     }
-    // Root directory record at offset 156 in PVD
-    let hdr: &DirRecordHdr = unsafe { &*(pvd[156..].as_ptr() as *const DirRecordHdr) };
-    Some((extent_le(&hdr.extent), size_le(&hdr.size)))
+    // Root directory record at offset 156 in PVD.
+    // Fields (offsets from record start):
+    //   extent LE @ +2 (4 bytes)
+    //   size LE   @ +10 (4 bytes)
+    let root_extent = u32::from_le_bytes(pvd[158..162].try_into().unwrap());
+    let root_size = u32::from_le_bytes(pvd[166..170].try_into().unwrap());
+    Some((root_extent, root_size))
 }
 
 /// Search an ISO9660 directory extent for a child by name (case-insensitive).
@@ -149,14 +131,25 @@ fn find_in_dir(
             return None;
         }
         let mut offset: usize = 0;
-        while offset + core::mem::size_of::<DirRecordHdr>() <= 2048 && offset < dir_size as usize {
-            let hdr: &DirRecordHdr =
-                unsafe { &*(scratch[offset..].as_ptr() as *const DirRecordHdr) };
-            if hdr.len == 0 {
+        // ISO9660 directory record layout (minimum 34 bytes):
+        //   +0  len (1)
+        //   +2  extent LE (4)
+        //   +10 size LE (4)
+        //   +32 name_len (1)
+        //   +33 name (variable)
+        while offset + 34 <= 2048 && offset < dir_size as usize {
+            let record_len = scratch[offset] as usize;
+            if record_len == 0 {
                 break;
             }
-            let name_len = hdr.name_len as usize;
-            let name_offset = offset + core::mem::size_of::<DirRecordHdr>();
+            if offset + record_len > 2048 {
+                break;
+            }
+            let name_len = scratch[offset + 32] as usize;
+            let name_offset = offset + 33;
+            if name_offset + name_len > 2048 {
+                break;
+            }
             // ISO9660 names may have ";1" version suffix — strip it
             let effective_len = if name_len >= 2 && scratch[name_offset + name_len - 2] == b';' {
                 name_len - 2
@@ -174,10 +167,12 @@ fn find_in_dir(
                     }
                 }
                 if matched {
-                    return Some((extent_le(&hdr.extent), size_le(&hdr.size)));
+                    let child_extent = u32::from_le_bytes(scratch[offset + 2..offset + 6].try_into().unwrap());
+                    let child_size = u32::from_le_bytes(scratch[offset + 10..offset + 14].try_into().unwrap());
+                    return Some((child_extent, child_size));
                 }
             }
-            offset += hdr.len as usize;
+            offset += record_len;
         }
     }
     None
@@ -235,7 +230,7 @@ fn build_iso_device_path(
         // PartitionNumber = 1 (bytes 4-7)
         n[4] = 1;
         // n[5..7] = 0
-        // PartitionStart (bytes 8-15, placeholder)
+        // PartitionStart (bytes 8-15)
         // PartitionSize (bytes 16-23, 0 = unknown)
         // PartitionSignature (bytes 24-39, zero)
         // PartitionFormat = 0x02 (GPT) at byte 40
@@ -244,7 +239,7 @@ fn build_iso_device_path(
         n
     };
 
-    // ── File path node (48 bytes = 4 header + 44 UCS-2) ───
+    // ── File path node (UCS-2 string) ────────────────────
     let file_name: [u16; 22] = [
         b'\\' as u16, b'E' as u16, b'F' as u16, b'I' as u16,
         b'\\' as u16, b'B' as u16, b'O' as u16, b'O' as u16, b'T' as u16,
@@ -274,15 +269,15 @@ fn build_iso_device_path(
         let mut off = 0usize;
         dp.copy_from_nonoverlapping(HD_NODE.as_ptr(), HD_NODE.len());
         off += HD_NODE.len();
-        // Patch PartitionStart (bytes 8-15) with actual partition LBA
-        *(dp.add(8) as *mut u64) = part1_lba.to_le();
+        // Patch PartitionStart (bytes 8-15) with actual partition LBA in bytes
+        *(dp.add(8) as *mut u64) = (part1_lba * 512).to_le();
 
         // File path node header
         dp.add(off).write_volatile(0x04u8); // Type: MEDIA_DEVICE_PATH
         off += 1;
         dp.add(off).write_volatile(0x04u8); // SubType: FILE_PATH
         off += 1;
-        let file_bytes = (file_name.len() * 2) as u16; // 44 bytes including null
+        let file_bytes = (file_name.len() * 2) as u16;
         *(dp.add(off) as *mut u16) = (4 + file_bytes).to_le(); // total node length
         off += 2;
         // File path body
@@ -297,9 +292,6 @@ fn build_iso_device_path(
 }
 
 /// Load and start an EFI executable from within an ISO.
-///
-/// This is the **correct** UEFI chainload path.  No real-mode transition,
-/// no BIOS INT 13h dependency.
 fn uefi_chainload_iso(
     st: &mut SystemTable,
     image_handle: *mut c_void,
@@ -367,6 +359,9 @@ fn uefi_chainload_iso(
         )
     };
 
+    // Free source buffer immediately — firmware has copied the image
+    unsafe { (bs.free_pool)(buf_ptr as _); }
+
     // Patch LoadedImageProtocol.DeviceHandle + FilePath
     if status == EFI_SUCCESS {
         let mut lip: *mut LoadedImageProtocol = core::ptr::null_mut();
@@ -381,10 +376,6 @@ fn uefi_chainload_iso(
             unsafe {
                 // Point DeviceHandle to the virtual CD-ROM (not USB disk)
                 (*lip).device_handle = device_handle;
-                // Use CD-ROM DevicePath as FilePath for proper boot device identification
-                // (cdrom_dp is the device path of the CD-ROM itself;
-                //  device_path is the HD+FilePath node for /EFI/BOOT/BOOTX64.EFI.
-                //  Both are valid; we use the file path for LoadedImageProtocol.)
                 (*lip).file_path = device_path;
                 if !cdrom_dp.is_null() {
                     let _ = cdrom_dp; // already installed on the handle
@@ -392,7 +383,6 @@ fn uefi_chainload_iso(
             }
         }
     } else {
-        unsafe { (bs.free_pool)(buf_ptr as _); }
         print_raw(st, b"ERROR: LoadImage failed.\r\n\0");
         return;
     }
@@ -417,11 +407,11 @@ fn uefi_chainload_iso(
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Boot an ISO by chainloading its UEFI bootloader (/EFI/BOOT/BOOTX64.EFI).
-/// Never returns on success; returns on failure so the menu can continue.
+/// Returns on failure so the menu can continue.
 pub fn boot_iso(
     st: &mut SystemTable,
     image_handle: *mut c_void,
-    disk_handle: *mut c_void,
+    _disk_handle: *mut c_void,
     part1_lba: u64,
     files: &[IsoEntry; 64],
     idx: usize,
