@@ -640,7 +640,7 @@ unsafe extern "efiapi" fn file_open(
     // Allocate and initialize the VirtualFile
     let fp = match alloc_virtual_file(ctx, child_lba, child_size, is_dir, is_grub_cfg) {
         Some(p) => p,
-        None => return 0x8000_0000_0000_0002, // EFI_OUT_OF_RESOURCES
+        None => return EFI_OUT_OF_RESOURCES,
     };
 
     // ── If this is grub.cfg, eagerly generate the patch now ───
