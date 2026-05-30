@@ -52,7 +52,8 @@ fn inject_into_linux_lines(
     // Count how many lines we need to patch
     let mut num_lines = 0usize;
     let mut i = 0;
-    while i + 6 <= original.len() {
+    while i + 8 <= original.len() {
+        // need at least 8 bytes ahead to check "linuxefi "
         if &original[i..i+6] == b"linux " || &original[i..i+8] == b"linuxefi" {
             num_lines += 1;
         }
@@ -61,6 +62,15 @@ fn inject_into_linux_lines(
             i += 1;
         }
         if i < original.len() { i += 1; }
+    }
+    // also check if the last 6-7 bytes might be "linux " / "linuxefi"
+    {
+        let mut j = original.len().saturating_sub(7);
+        while j < original.len() {
+            if j + 6 <= original.len() && &original[j..j+6] == b"linux " { num_lines += 1; }
+            if j + 8 <= original.len() && &original[j..j+8] == b"linuxefi" { num_lines += 1; }
+            j += 1;
+        }
     }
     if num_lines == 0 {
         return None; // nothing to patch

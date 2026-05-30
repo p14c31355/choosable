@@ -643,6 +643,62 @@ unsafe extern "efiapi" fn file_open(
         None => return 0x8000_0000_0000_0002, // EFI_OUT_OF_RESOURCES
     };
 
+    // ── If this is grub.cfg, eagerly generate the patch now ───
+    // GRUB calls GetInfo before Read, so patched size must be known early.
+    if is_grub_cfg {
+        let vf_patch = unsafe { &mut *(fp as *mut VirtualFile) };
+        if !vf_patch.patched {
+            // Read original content
+            let orig_size = vf_patch.extent_size as usize;
+            let bs = unsafe { &mut *ctx.bs };
+            let mut tmp_ptr: *mut c_void = core::ptr::null_mut();
+            let tmp_status = unsafe {
+                (bs.allocate_pool)(
+                    crate::protocol::MemoryType::EfiLoaderData,
+                    orig_size,
+                    &mut tmp_ptr,
+                )
+            };
+            if tmp_status != EFI_SUCCESS || tmp_ptr.is_null() {
+                // Continue without patch
+            } else {
+                let tmp_buf = unsafe { core::slice::from_raw_parts_mut(tmp_ptr as *mut u8, orig_size) };
+                let mut total_read = 0usize;
+                while total_read < orig_size {
+                    let rem = (orig_size - total_read).min(2048);
+                    let r = read_extent_data(ctx, child_lba, child_size, total_read as u64,
+                        &mut tmp_buf[total_read..total_read + rem]);
+                    if r == 0 { break; }
+                    total_read += r;
+                }
+
+                let patch = crate::strategy::patch_grub_cfg(ctx, &tmp_buf[..total_read], ctx.bs);
+                if let Some(p) = patch {
+                    vf_patch.patched_buf = p.buf;
+                    vf_patch.patched_size = p.size as u64;
+                    vf_patch.patched = true;
+
+                    if !ctx.st.is_null() {
+                        let st_ref = unsafe { &mut *ctx.st };
+                        print_raw(st_ref, b"[SFS] grub.cfg patched eagerly: ");
+                        let mut nb = [0u8; 16];
+                        let mut nv = p.size as u64;
+                        let mut np = 15usize;
+                        loop {
+                            nb[np] = b'0' + (nv % 10) as u8;
+                            nv /= 10;
+                            if nv == 0 || np == 0 { break; }
+                            np -= 1;
+                        }
+                        print_raw(st_ref, &nb[np..]);
+                        print_raw(st_ref, b" bytes\r\n\0");
+                    }
+                }
+                unsafe { (bs.free_pool)(tmp_ptr); }
+            }
+        }
+    }
+
     let _ = open_mode;
     *new_handle = fp;
     EFI_SUCCESS
@@ -689,67 +745,7 @@ unsafe extern "efiapi" fn file_read_file(
         return EFI_SUCCESS;
     }
 
-    // ── grub.cfg patch: inject iso-scan/filename= into every linux line ──
-    if vf.needs_grub_patch && !vf.patched {
-        // Read the original file contents into a temporary buffer
-        let orig_size = vf.extent_size as usize;
-        let bs = unsafe { &mut *ctx.bs };
-
-        let mut tmp_ptr: *mut c_void = core::ptr::null_mut();
-        let tmp_status = unsafe {
-            (bs.allocate_pool)(
-                crate::protocol::MemoryType::EfiLoaderData,
-                orig_size,
-                &mut tmp_ptr,
-            )
-        };
-        if tmp_status != EFI_SUCCESS || tmp_ptr.is_null() {
-            // Fall through
-        } else {
-            let tmp_buf = unsafe { core::slice::from_raw_parts_mut(tmp_ptr as *mut u8, orig_size) };
-            // Read the full file
-            let mut total_read = 0usize;
-            while total_read < orig_size {
-                let rem = (orig_size - total_read).min(2048);
-                let r = read_extent_data(ctx, vf.extent_lba, vf.extent_size, total_read as u64,
-                    &mut tmp_buf[total_read..total_read + rem]);
-                if r == 0 { break; }
-                total_read += r;
-            }
-
-            // Apply strategy-based patching
-            let patch = crate::strategy::patch_grub_cfg(ctx, &tmp_buf[..total_read], bs);
-            if let Some(p) = patch {
-                vf.patched_buf = p.buf;
-                vf.patched_size = p.size as u64;
-                vf.patched = true;
-
-                if !ctx.st.is_null() {
-                    let st_ref = unsafe { &mut *ctx.st };
-                    print_raw(st_ref, b"[SFS] grub.cfg patched (linux lines injected): ");
-                    let mut nb = [0u8; 16];
-                    let mut nv = p.size as u64;
-                    let mut np = 15usize;
-                    loop {
-                        nb[np] = b'0' + (nv % 10) as u8;
-                        nv /= 10;
-                        if nv == 0 || np == 0 { break; }
-                        np -= 1;
-                    }
-                    print_raw(st_ref, &nb[np..]);
-                    print_raw(st_ref, b" bytes\r\n\0");
-                }
-            } else if !ctx.st.is_null() {
-                let st_ref = unsafe { &mut *ctx.st };
-                print_raw(st_ref, b"[SFS] grub.cfg patch FAILED (allocation error)\r\n\0");
-            }
-
-            // Free temporary buffer
-            unsafe { (bs.free_pool)(tmp_ptr); }
-        }
-    }
-
-    // Serve from patched buffer if available
+    // Serve from patched buffer if available (patched eagerly in file_open)
     if vf.patched && !vf.patched_buf.is_null() {
         let avail = (vf.patched_size - vf.position as u64) as usize;
         let to_copy = size.min(avail);
