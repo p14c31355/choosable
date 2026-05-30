@@ -188,6 +188,46 @@ fn lookup_in_dir(
     let total_sectors = ((dir_size as u64 + 2047) / 2048) as u32;
     let mut scratch = [0u8; 2048];
 
+    // Print the search target once
+    if !ctx.st.is_null() {
+        let st_ref = unsafe { &mut *ctx.st };
+        print_raw(st_ref, b"[SFS]   lookup '");
+        let mut tmp = [0u8; 64];
+        let mut n = 0;
+        for &c in name {
+            if c == 0 || n >= 63 { break; }
+            tmp[n] = if c < 0x80 { c as u8 } else { b'?' };
+            n += 1;
+        }
+        print_raw(st_ref, &tmp[..n]);
+        print_raw(st_ref, b"' in dir LBA=\0");
+        // simple number print
+        let mut lbabuf = [b'0'; 10];
+        let mut val = dir_lba as u64;
+        let mut p = 9usize;
+        loop {
+            lbabuf[p] = b'0' + (val % 10) as u8;
+            val /= 10;
+            if val == 0 { break; }
+            if p == 0 { break; }
+            p -= 1;
+        }
+        print_raw(st_ref, &lbabuf[p..]);
+        print_raw(st_ref, b" size=\0");
+        let mut szbuf = [b'0'; 10];
+        val = dir_size as u64;
+        p = 9usize;
+        loop {
+            szbuf[p] = b'0' + (val % 10) as u8;
+            val /= 10;
+            if val == 0 { break; }
+            if p == 0 { break; }
+            p -= 1;
+        }
+        print_raw(st_ref, &szbuf[p..]);
+        print_raw(st_ref, b"\r\n\0");
+    }
+
     for s in 0..total_sectors {
         if !read_iso_sector(ctx, dir_lba + s, &mut scratch) {
             return None;
@@ -209,6 +249,24 @@ fn lookup_in_dir(
             }
             let iso_name = &scratch[name_offset..name_offset + name_len];
 
+            // Log every entry name
+            if !ctx.st.is_null() {
+                let st_ref = unsafe { &mut *ctx.st };
+                print_raw(st_ref, b"[SFS]     entry '");
+                // Copy iso_name up to name_len, strip ;1 for display
+                let mut ebuf = [0u8; 64];
+                let mut elen = 0;
+                for j in 0..name_len.min(63) {
+                    let b = iso_name[j];
+                    if b == 0 { break; }
+                    ebuf[j] = if b < 0x80 { b } else { b'?' };
+                    elen += 1;
+                }
+                let eff = if elen >= 2 && ebuf[elen - 2] == b';' { elen - 2 } else { elen };
+                print_raw(st_ref, &ebuf[..eff]);
+                print_raw(st_ref, b"'\r\n\0");
+            }
+
             if match_iso_name(iso_name, name_len, name) {
                 // ".." entry (parent dir) has special handling:
                 // Extent of 0 = parent is root (same extent)
@@ -220,6 +278,10 @@ fn lookup_in_dir(
                 );
                 let flags = scratch[offset + 25];
                 let is_dir = flags & 0x02 != 0;
+                if !ctx.st.is_null() {
+                    let st_ref = unsafe { &mut *ctx.st };
+                    print_raw(st_ref, b"[SFS]     -> MATCH\r\n\0");
+                }
                 return Some((child_extent, child_size, is_dir));
             }
             offset += record_len;
