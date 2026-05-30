@@ -185,7 +185,7 @@ pub fn create_virtual_cdrom(
         bim_wc: 0,
         bim_bs: 2048,
         bim_ia: 0,
-        bim_lb: iso_sectors, // original last block (patched file appends beyond this)
+        bim_lb: iso_sectors - 1, // original last block (patched file appends beyond this)
     };
 
     vbio.iso_lba = iso_lba;
