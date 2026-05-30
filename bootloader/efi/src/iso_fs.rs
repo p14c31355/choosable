@@ -248,7 +248,7 @@ fn lookup_in_dir(
             }
             let name_len = scratch[offset + 32] as usize;
             let name_offset = offset + 33;
-            if name_offset + name_len > 2048 {
+            if 33 + name_len > record_len || name_offset + name_len > 2048 {
                 break;
             }
             let iso_name = &scratch[name_offset..name_offset + name_len];
