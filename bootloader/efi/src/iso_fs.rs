@@ -319,6 +319,9 @@ unsafe extern "efiapi" fn sfs_open_volume(
     this: *mut SimpleFileSystemProtocol,
     root: *mut *mut FileProtocol,
 ) -> usize {
+    if root.is_null() {
+        return EFI_INVALID_PARAMETER;
+    }
     let instance = &*(this as *const IsoFsInstance);
     let ctx = &instance.ctx;
 
