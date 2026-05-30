@@ -811,9 +811,10 @@ unsafe extern "efiapi" fn file_set_position(
     position: u64,
 ) -> usize {
     let vf = unsafe { &mut *(this as *mut VirtualFile) };
-    // Clamp to file size
-    if position > vf.extent_size as u64 {
-        vf.position = vf.extent_size as u64;
+    // Use patched size for grub.cfg, otherwise original extent size
+    let max_pos = if vf.patched { vf.patched_size } else { vf.extent_size as u64 };
+    if position > max_pos {
+        vf.position = max_pos;
     } else {
         vf.position = position;
     }
