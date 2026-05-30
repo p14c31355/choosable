@@ -45,6 +45,9 @@ struct IsoFsCtx {
     bs: *mut BootServices,
     /// SystemTable pointer (for debug output)
     st: *mut SystemTable,
+    /// ISO file name on the real USB drive (e.g. "ubuntu-24.04.iso")
+    iso_name: [u8; 128],
+    iso_name_len: usize,
 }
 
 #[repr(C)]
@@ -62,6 +65,14 @@ pub struct VirtualFile {
     extent_lba: u32,   // ISO 2048-byte sector
     extent_size: u32,  // bytes
     position: u64,      // current read offset
+    /// If true, file_read_file will inject iso-scan/filename= into the buffer
+    needs_grub_patch: bool,
+    /// Pool-allocated patched copy of the file (only for grub.cfg)
+    patched_buf: *mut u8,
+    /// Size of the patched buffer
+    patched_size: u64,
+    /// Whether the patch has been applied
+    patched: bool,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -454,6 +465,7 @@ fn alloc_virtual_file(
     lba: u32,
     size: u32,
     is_dir: bool,
+    needs_grub_patch: bool,
 ) -> Option<*mut FileProtocol> {
     let bs = unsafe { &mut *ctx.bs };
     let mut ptr: *mut c_void = core::ptr::null_mut();
@@ -487,6 +499,10 @@ fn alloc_virtual_file(
     vf.extent_lba = lba;
     vf.extent_size = size;
     vf.position = 0;
+    vf.needs_grub_patch = needs_grub_patch;
+    vf.patched_buf = core::ptr::null_mut();
+    vf.patched_size = 0;
+    vf.patched = false;
 
     Some(ptr as *mut FileProtocol)
 }
@@ -593,8 +609,36 @@ unsafe extern "efiapi" fn file_open(
         }
     };
 
+    // Determine if this is grub.cfg (needs iso-scan/filename patch)
+    let is_grub_cfg = if !is_dir && ctx.iso_name_len > 0 && name_slice.len() >= 8 {
+        let n = name_slice.len();
+        let s: [u8; 8] = [
+            name_slice[n - 8] as u8,
+            name_slice[n - 7] as u8,
+            name_slice[n - 6] as u8,
+            name_slice[n - 5] as u8,
+            name_slice[n - 4] as u8,
+            name_slice[n - 3] as u8,
+            name_slice[n - 2] as u8,
+            name_slice[n - 1] as u8,
+        ];
+        // case-insensitive comparison with "grub.cfg"
+        (s[0] | 0x20) == b'g' && (s[1] | 0x20) == b'r' && (s[2] | 0x20) == b'u'
+            && (s[3] | 0x20) == b'b' && s[4] == b'.' && (s[5] | 0x20) == b'c'
+            && (s[6] | 0x20) == b'f' && (s[7] | 0x20) == b'g'
+    } else {
+        false
+    };
+
+    if is_grub_cfg && !ctx.st.is_null() {
+        let st_ref = unsafe { &mut *ctx.st };
+        print_raw(st_ref, b"[SFS]   -> grub.cfg detected, will patch with iso-scan/filename=");
+        print_raw(st_ref, &ctx.iso_name[..ctx.iso_name_len]);
+        print_raw(st_ref, b"\r\n\0");
+    }
+
     // Allocate and initialize the VirtualFile
-    let fp = match alloc_virtual_file(ctx, child_lba, child_size, is_dir) {
+    let fp = match alloc_virtual_file(ctx, child_lba, child_size, is_dir, is_grub_cfg) {
         Some(p) => p,
         None => return 0x8000_0000_0000_0002, // EFI_OUT_OF_RESOURCES
     };
@@ -604,11 +648,16 @@ unsafe extern "efiapi" fn file_open(
     EFI_SUCCESS
 }
 
-/// Close a file handle and free its pool allocation.
+/// Close a file handle and free its pool allocation (and patched buffer if any).
 unsafe extern "efiapi" fn file_close(this: *mut FileProtocol) -> usize {
-    let vf = unsafe { &*(this as *const VirtualFile) };
+    let vf = unsafe { &mut *(this as *mut VirtualFile) };
     let ctx = unsafe { &*vf.ctx };
     let bs = unsafe { &mut *ctx.bs };
+    // Free patched buffer if allocated
+    if !vf.patched_buf.is_null() {
+        unsafe { (bs.free_pool)(vf.patched_buf as *mut c_void) };
+        vf.patched_buf = core::ptr::null_mut();
+    }
     unsafe { (bs.free_pool)(this as *mut c_void) };
     EFI_SUCCESS
 }
@@ -618,7 +667,8 @@ unsafe extern "efiapi" fn file_delete(_this: *mut FileProtocol) -> usize {
     EFI_WRITE_PROTECTED
 }
 
-/// Read from a regular file.
+/// Read from a regular file. For grub.cfg, injects iso-scan/filename= on the
+/// first read so initramfs can find the ISO on the real USB disk.
 unsafe extern "efiapi" fn file_read_file(
     this: *mut FileProtocol,
     buffer_size: *mut usize,
@@ -639,6 +689,106 @@ unsafe extern "efiapi" fn file_read_file(
         return EFI_SUCCESS;
     }
 
+    // ── grub.cfg patch: on first read, load entire file and inject iso-scan ──
+    if vf.needs_grub_patch && !vf.patched {
+        // Read the full original file
+        let orig_size = vf.extent_size as usize;
+        let bs = unsafe { &mut *ctx.bs };
+
+        // Allocate buffer: original + injection text + null terminator
+        let injection: &[u8] = b" echo 'Choosable: iso-scan/filename=/";
+        // We need to build: " echo 'Choosable: iso-scan/filename=/$ISO_NAME'\n"
+        // appended right after "source $prefix/grub.cfg" or at the end of the file
+        let inj_prefix = b" echo 'Choosable: iso-scan/filename=/";
+        let inj_suffix = b"'\nset extra_cmdline='iso-scan/filename=/";
+        let inj_tail = b"'\n";
+
+        let total_inj = inj_prefix.len() + ctx.iso_name_len + inj_suffix.len()
+            + ctx.iso_name_len + inj_tail.len();
+        let new_size = orig_size + total_inj;
+
+        let mut patch_ptr: *mut c_void = core::ptr::null_mut();
+        let status = unsafe {
+            (bs.allocate_pool)(
+                crate::protocol::MemoryType::EfiLoaderData,
+                new_size,
+                &mut patch_ptr,
+            )
+        };
+        if status != EFI_SUCCESS || patch_ptr.is_null() {
+            // Fall through to normal read
+        } else {
+            let patch_buf = unsafe { core::slice::from_raw_parts_mut(patch_ptr as *mut u8, new_size) };
+
+            // Read the original file content
+            let mut read_buf = [0u8; 4096];
+            let mut written = 0usize;
+            let mut pos: u64 = 0;
+            while written < orig_size {
+                let rem = (orig_size - written).min(4096);
+                let r = read_extent_data(ctx, vf.extent_lba, vf.extent_size, pos, &mut read_buf[..rem]);
+                if r == 0 { break; }
+                patch_buf[written..written + r].copy_from_slice(&read_buf[..r]);
+                written += r;
+                pos += r as u64;
+            }
+
+            // Append injection lines at the end
+            let mut off = orig_size;
+            patch_buf[off..off + inj_prefix.len()].copy_from_slice(inj_prefix);
+            off += inj_prefix.len();
+            patch_buf[off..off + ctx.iso_name_len].copy_from_slice(&ctx.iso_name[..ctx.iso_name_len]);
+            off += ctx.iso_name_len;
+            patch_buf[off..off + inj_suffix.len()].copy_from_slice(inj_suffix);
+            off += inj_suffix.len();
+            patch_buf[off..off + ctx.iso_name_len].copy_from_slice(&ctx.iso_name[..ctx.iso_name_len]);
+            off += ctx.iso_name_len;
+            patch_buf[off..off + inj_tail.len()].copy_from_slice(inj_tail);
+
+            vf.patched_buf = patch_ptr as *mut u8;
+            vf.patched_size = new_size as u64;
+            vf.patched = true;
+
+            if !ctx.st.is_null() {
+                let st_ref = unsafe { &mut *ctx.st };
+                print_raw(st_ref, b"[SFS] grub.cfg patched: ");
+                let mut nb = [0u8; 16];
+                let mut nv = new_size as u64;
+                let mut np = 15usize;
+                loop {
+                    nb[np] = b'0' + (nv % 10) as u8;
+                    nv /= 10;
+                    if nv == 0 || np == 0 { break; }
+                    np -= 1;
+                }
+                print_raw(st_ref, &nb[np..]);
+                print_raw(st_ref, b" bytes\r\n\0");
+            }
+        }
+    }
+
+    // Serve from patched buffer if available
+    if vf.patched && !vf.patched_buf.is_null() {
+        let avail = (vf.patched_size - vf.position as u64) as usize;
+        let to_copy = size.min(avail);
+        if to_copy == 0 {
+            unsafe { *buffer_size = 0; }
+            return EFI_SUCCESS;
+        }
+        let src = unsafe {
+            core::slice::from_raw_parts(
+                vf.patched_buf.add(vf.position as usize),
+                to_copy,
+            )
+        };
+        let dst = unsafe { core::slice::from_raw_parts_mut(buffer as *mut u8, to_copy) };
+        dst.copy_from_slice(src);
+        vf.position += to_copy as u64;
+        unsafe { *buffer_size = to_copy; }
+        return EFI_SUCCESS;
+    }
+
+    // Normal read from ISO extent
     let dst = unsafe { core::slice::from_raw_parts_mut(buffer as *mut u8, size) };
     let read = read_extent_data(ctx, vf.extent_lba, vf.extent_size, vf.position, dst);
     vf.position += read as u64;
@@ -730,10 +880,13 @@ unsafe extern "efiapi" fn file_get_info(
     let last_access_time: EfiTime = unsafe { core::mem::zeroed() };
     let modification_time: EfiTime = unsafe { core::mem::zeroed() };
 
+    // Report patched size for grub.cfg
+    let file_size = if vf.patched { vf.patched_size } else { vf.extent_size as u64 };
+
     let info = EfiFileInfo {
         size: required_size as u64,
-        file_size: vf.extent_size as u64,
-        physical_size: vf.extent_size as u64,
+        file_size,
+        physical_size: file_size,
         create_time,
         last_access_time,
         modification_time,
@@ -788,6 +941,7 @@ pub fn create_iso_fs(
     real_media_id: u32,
     iso_lba: u64,
     iso_size_bytes: u64,
+    iso_name: &[u8],
 ) -> *mut IsoFsInstance {
     // ── Allocate IsoFsInstance ──────────────────────────────────────
     let mut ptr: *mut c_void = core::ptr::null_mut();
@@ -804,6 +958,11 @@ pub fn create_iso_fs(
 
     let instance = unsafe { &mut *(ptr as *mut IsoFsInstance) };
 
+    // ── Copy ISO file name ────────────────────────────────────────
+    let name_len = iso_name.len().min(127);
+    let mut name_arr = [0u8; 128];
+    name_arr[..name_len].copy_from_slice(&iso_name[..name_len]);
+
     // ── Fill context ────────────────────────────────────────────────
     instance.ctx = IsoFsCtx {
         real_bio_ptr,
@@ -814,6 +973,8 @@ pub fn create_iso_fs(
         root_size: 0,
         bs: bs as *mut BootServices,
         st,
+        iso_name: name_arr,
+        iso_name_len: name_len,
     };
 
     // ── Parse ISO9660 PVD ──────────────────────────────────────────
