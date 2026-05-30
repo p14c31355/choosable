@@ -503,7 +503,7 @@ fn recursive_find_cfg_with_loc(
                 };
                 let has_cfg = eff_len >= 4 && {
                     let ofs = name_offset + eff_len - 4;
-                    (scratch[ofs] | 0x20) == b'.' && (scratch[ofs+1] | 0x20) == b'c'
+                    scratch[ofs] == b'.' && (scratch[ofs+1] | 0x20) == b'c'
                         && (scratch[ofs+2] | 0x20) == b'f' && (scratch[ofs+3] | 0x20) == b'g'
                 };
                 if has_cfg && !is_dir && *entry_count < 32 {
