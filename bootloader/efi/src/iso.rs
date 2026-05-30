@@ -612,7 +612,7 @@ fn recursive_find_cfg(
             return;
         }
         let mut offset: usize = 0;
-        while offset + 34 <= 2048 && offset < dir_size as usize {
+        while offset + 34 <= 2048 && offset < (dir_size as usize).saturating_sub(s as usize * 2048) {
             let record_len = scratch[offset] as usize;
             if record_len == 0 {
                 break;
