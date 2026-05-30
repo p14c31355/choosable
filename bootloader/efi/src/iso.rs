@@ -146,7 +146,7 @@ fn find_in_dir_with_loc(
             return None;
         }
         let mut offset: usize = 0;
-        while offset + 34 <= 2048 && offset < dir_size as usize {
+        while offset + 34 <= 2048 && offset < (dir_size as usize).saturating_sub(s as usize * 2048) {
             let record_len = scratch[offset] as usize;
             if record_len == 0 { break; }
             if offset + record_len > 2048 { break; }
