@@ -828,7 +828,7 @@ unsafe extern "efiapi" fn file_get_info(
     buffer_size: *mut usize,
     buffer: *mut c_void,
 ) -> usize {
-    if information_type.is_null() || buffer_size.is_null() || buffer.is_null() {
+    if information_type.is_null() || buffer_size.is_null() {
         return EFI_INVALID_PARAMETER;
     }
 
@@ -852,6 +852,11 @@ unsafe extern "efiapi" fn file_get_info(
     if buf_sz < required_size {
         unsafe { *buffer_size = required_size; }
         return EFI_BAD_BUFFER_SIZE;
+    }
+
+    // Allow NULL buffer for size-query pattern (standard UEFI convention)
+    if buffer.is_null() {
+        return EFI_SUCCESS;
     }
 
     // Zero-fill EfiTime (not Copy, so create three zeroed instances)

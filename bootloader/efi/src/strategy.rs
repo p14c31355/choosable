@@ -24,6 +24,26 @@ pub trait BootStrategy: Sync {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  Helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Count the number of `linux `/`linuxefi ` lines in the input.
+fn count_linux_lines(data: &[u8]) -> usize {
+    let mut count = 0usize;
+    let mut pos = 0usize;
+    while pos < data.len() {
+        let start = pos;
+        while pos < data.len() && data[pos] != b'\n' { pos += 1; }
+        let line = &data[start..pos];
+        if line.starts_with(b"linux ") || line.starts_with(b"linuxefi ") {
+            count += 1;
+        }
+        if pos < data.len() { pos += 1; }
+    }
+    if count == 0 { 1 } else { count }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  CasperStrategy — Ubuntu / Mint / Pop!_OS / Debian-live
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -40,9 +60,12 @@ impl BootStrategy for CasperStrategy {
         let pre = b" rootdelay=15 iso-scan/filename=/";
         let inj_len = pre.len() + name.len();
 
+        // Count actual linux/linuxefi lines for exact allocation
+        let linux_lines = count_linux_lines(inp.original);
+
         // Header to fix "variable root isn't set": "set root=cd0\n"
         let header = b"set root=cd0\n";
-        let new_size = header.len() + inp.original.len() + inj_len * 4 + 128;
+        let new_size = header.len() + inp.original.len() + inj_len * linux_lines + 128;
 
         let mut patch_ptr: *mut c_void = core::ptr::null_mut();
         let status = unsafe { (bs.allocate_pool)(MemoryType::EfiLoaderData, new_size, &mut patch_ptr) };
@@ -134,8 +157,10 @@ impl BootStrategy for LiveOSStrategy {
         let pre = b" rd.live.image rootdelay=15 iso-scan/filename=/";
         let inj_len = pre.len() + name.len();
 
+        let linux_lines = count_linux_lines(inp.original);
+
         let header = b"set root=cd0\n";
-        let new_size = header.len() + inp.original.len() + inj_len * 4 + 128;
+        let new_size = header.len() + inp.original.len() + inj_len * linux_lines + 128;
 
         let mut patch_ptr: *mut c_void = core::ptr::null_mut();
         let status = unsafe { (bs.allocate_pool)(MemoryType::EfiLoaderData, new_size, &mut patch_ptr) };
