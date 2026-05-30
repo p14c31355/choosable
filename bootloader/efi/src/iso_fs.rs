@@ -873,6 +873,10 @@ unsafe extern "efiapi" fn file_read_dir(
         let raw_size = core::mem::size_of::<EfiFileInfo>() + (ucs2_name_len + 1) * 2;
         let required_size = (raw_size + 7) & !7;
         if dst_off + required_size > buf_sz {
+            if dst_off == 0 {
+                unsafe { *buffer_size = required_size; }
+                return crate::protocol::EFI_BUFFER_TOO_SMALL;
+            }
             // Not enough space — return what we have
             break;
         }
