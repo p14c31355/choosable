@@ -290,6 +290,24 @@ pub struct VirtualBlockIo {
     pub real_bio_ptr: *mut BlockIoProtocol,
     /// Underlying media ID
     pub real_media_id: u32,
+    /// ── grub.cfg content patch (placed at end of virtual CD-ROM) ───
+    /// New file start sector (ISO 2048-byte) — appended after original ISO
+    pub patched_file_sector: u32,
+    /// Number of 2048-byte sectors for patched grub.cfg content
+    pub patched_file_sectors: u32,
+    /// Pool-allocated patched grub.cfg data
+    pub patched_file_buf: *mut u8,
+    /// ── Directory entry overwrite ──────────────────────────────────
+    /// ISO sector number containing the directory entry for grub.cfg
+    pub dir_entry_sector: u32,
+    /// Byte offset within that sector where the entry's extent LBA lives
+    pub dir_entry_offset: u32,
+    /// New Extent LBA (points to patched_file_sector)
+    pub dir_entry_new_extent: u32,
+    /// New Data Length (patched file size in bytes)
+    pub dir_entry_new_size: u32,
+    /// Whether directory entry patching is active
+    pub dir_entry_patched: bool,
 }
 
 pub const DEVICE_PATH_PROTOCOL_GUID: Guid = Guid {
