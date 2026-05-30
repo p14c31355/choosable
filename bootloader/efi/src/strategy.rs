@@ -124,10 +124,9 @@ fn patch_common(inp: &PatchInput, pre: &[u8]) -> Option<PatchOutput> {
         }
     }
 
-    // Truncate to original file size.  The injection sits early in the
-    // line (right after the kernel path), so only the tail arguments
-    // (file=, quiet, splash, maybe-ubiquity, ---) get clipped.
-    let final_len = dst.min(orig_len);
+    // No truncation needed — with directory entry redirect, the patched
+    // file can be any size (the extent LBA and Data Length are rewritten).
+    let final_len = dst;
     Some(PatchOutput { buf: patch_ptr as *mut u8, size: final_len })
 }
 

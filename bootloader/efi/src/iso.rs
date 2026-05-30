@@ -275,6 +275,7 @@ fn find_efi_boot(
 }
 
 /// Find, patch grub.cfg, and install it via directory entry redirect:
+///   - Recursively find all .CFG files, try each one that contains a linux line
 ///   - Place patched content at end of virtual CD-ROM (beyond LastBlock)
 ///   - Intercept directory sector reads to point the entry at the new location
 fn patch_grub_cfg_blockio(
@@ -297,118 +298,31 @@ fn patch_grub_cfg_blockio(
     let root_size = u32::from_le_bytes(pvd[166..170].try_into().unwrap());
     let mut scratch = [0u8; 2048];
 
-    // Search /boot/grub/LOOPBACK.CFG, /boot/grub/GRUB.CFG, /EFI/BOOT/GRUB.CFG, /GRUB.CFG
-    // with full directory entry location info.
-    let candidates: [Option<&[u8]>; 4] = [
-        Some(b"LOOPBACK.CFG"),
-        Some(b"GRUB.CFG"),
-        Some(b"GRUB.CFG"), // for /EFI/BOOT path
-        Some(b"GRUB.CFG"), // for root path
-    ];
+    // Recursively collect all .CFG entries with their directory entry locations
+    let mut entries: [(u32, u32, u32, u32); 32] = [(0,0,0,0); 32]; // ext_lba, ext_size, dir_sector, dir_offset
+    let mut entry_count = 0usize;
 
-    // (dir_lba, dir_size, name) -> find_in_dir_with_loc
-    let mut best: Option<(u32, u32, u32, u32)> = None; // extent_lba, extent_size, dir_sector, dir_offset
+    // Scan root directory for .CFG files and subdirectories, then recurse
+    recursive_find_cfg_with_loc(
+        bio_ref, bio_ptr, mid, iso_lba,
+        root_lba, root_size,
+        &mut scratch,
+        &mut entries, &mut entry_count,
+    );
 
-    // Path 1: /boot/grub/*
-    if let Some(boot) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, b"BOOT", &mut scratch) {
-        if let Some(grub) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, boot.0, boot.1, b"GRUB", &mut scratch) {
-            let names: [&[u8]; 2] = [b"LOOPBACK.CFG", b"GRUB.CFG"];
-            for name in &names {
-                if best.is_none() {
-                    best = find_in_dir_with_loc(bio_ref, bio_ptr, mid, iso_lba, grub.0, grub.1, name, &mut scratch);
-                }
-            }
-        }
-    }
-    // Path 2: /EFI/BOOT/grub.cfg
-    if best.is_none() {
-        if let Some(efi) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, b"EFI", &mut scratch) {
-            if let Some(boot2) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, efi.0, efi.1, b"BOOT", &mut scratch) {
-                best = find_in_dir_with_loc(bio_ref, bio_ptr, mid, iso_lba, boot2.0, boot2.1, b"GRUB.CFG", &mut scratch);
-            }
-        }
-    }
-    // Path 3: /grub.cfg
-    if best.is_none() {
-        best = find_in_dir_with_loc(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, b"GRUB.CFG", &mut scratch);
-    }
-    // Path 4: recursive *.CFG
-    if best.is_none() {
-        let mut candidates_arr: [Option<(u32, u32)>; 32] = [None; 32];
-        let mut cand_count = 0usize;
-        recursive_find_cfg(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, &mut scratch, &mut candidates_arr, &mut cand_count);
-        if cand_count > 0 {
-            // Use first candidate, find its directory entry
-            if let Some((ext_lba, ext_size)) = candidates_arr[0] {
-                // We need the dir entry location; walk the parent dir tree to find it
-                let mut found = false;
-                // Re-scan root directory
-                for s in 0..((root_size as u64 + 2047) / 2048) as u32 {
-                    if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, root_lba + s, &mut scratch) { break; }
-                    let mut off = 0;
-                    while off + 34 <= 2048 {
-                        let rlen = scratch[off] as usize;
-                        if rlen == 0 { break; }
-                        if off + rlen > 2048 { break; }
-                        let flags = scratch[off + 25];
-                        let is_dir = flags & 0x02 != 0;
-                        let entry_ext = u32::from_le_bytes(scratch[off + 2..off + 6].try_into().unwrap());
-                        let entry_sz = u32::from_le_bytes(scratch[off + 10..off + 14].try_into().unwrap());
-                        if is_dir {
-                            // Look inside this subdir
-                            let mut sub_scratch = [0u8; 2048];
-                            if let Some(sub_loc) = find_in_dir_with_loc(bio_ref, bio_ptr, mid, iso_lba, entry_ext, entry_sz, b"GRUB.CFG", &mut sub_scratch) {
-                                if sub_loc.0 == ext_lba {
-                                    best = Some(sub_loc);
-                                    found = true;
-                                    break;
-                                }
-                            }
-                            if let Some(sub_loc) = find_in_dir_with_loc(bio_ref, bio_ptr, mid, iso_lba, entry_ext, entry_sz, b"LOOPBACK.CFG", &mut sub_scratch) {
-                                if sub_loc.0 == ext_lba {
-                                    best = Some(sub_loc);
-                                    found = true;
-                                    break;
-                                }
-                            }
-                            // Try the .CFG match by extent directly
-                            if entry_ext == ext_lba {
-                                // This IS the file entry in root
-                                best = Some((entry_ext, entry_sz, root_lba + s, off as u32));
-                                found = true;
-                                break;
-                            }
-                        } else {
-                            if entry_ext == ext_lba {
-                                best = Some((entry_ext, entry_sz, root_lba + s, off as u32));
-                                found = true;
-                                break;
-                            }
-                        }
-                        off += rlen;
-                    }
-                    if found { break; }
-                }
-            }
-        }
+    if entry_count == 0 {
+        print_raw(st, b"[grub.cfg] No .CFG files found in ISO.\r\n\0");
+        return;
     }
 
-    let (cfg_extent, cfg_orig_size, dir_sector, dir_offset) = match best {
-        Some(v) => v,
-        None => {
-            print_raw(st, b"[grub.cfg] No .CFG file with dir entry found.\r\n\0");
-            return;
-        }
-    };
+    print_raw(st, b"[grub.cfg] Found \0");
+    let mut nbuf = [0u8; 16];
+    let mut nv = entry_count as u64; let mut np = 15;
+    loop { nbuf[np] = b'0' + (nv % 10) as u8; nv /= 10; if nv == 0 || np == 0 { break; } np -= 1; }
+    print_raw(st, &nbuf[np..]);
+    print_raw(st, b" .CFG entries. Searching for linux line...\r\n\0");
 
-    // Read original grub.cfg
-    let (orig_ptr, orig_len) = match read_extent(bs, bio_ref, bio_ptr, mid, iso_lba, cfg_extent, cfg_orig_size) {
-        Some(v) => v,
-        None => return,
-    };
-    let orig = unsafe { core::slice::from_raw_parts(orig_ptr, orig_len as usize) };
-
-    // Build IsoFsCtx
+    // Build IsoFsCtx once (needed for strategy)
     let mut iso_name_arr = [0u8; 128];
     let nlen = iso_name.len().min(127);
     iso_name_arr[..nlen].copy_from_slice(&iso_name[..nlen]);
@@ -424,61 +338,167 @@ fn patch_grub_cfg_blockio(
         iso_name_len: nlen,
     };
 
-    // Patch
-    let patch = strategy::patch_grub_cfg(&ctx, orig, bs as *mut BootServices);
-    unsafe { (bs.free_pool)(orig_ptr as *mut c_void); }
-    let (patched_buf, patched_size) = match patch {
-        Some(p) => (p.buf, p.size),
-        None => return,
-    };
+    // Try each candidate until we find one with a linux line and patch it
+    for i in 0..entry_count {
+        let (ext_lba, ext_size, dir_sector, dir_offset) = entries[i];
 
-    // Allocate 2048-byte-aligned buffer for patched content
-    let sector_aligned_patch = ((patched_size + 2047) / 2048) * 2048;
-    let mut patch_block_ptr: *mut c_void = core::ptr::null_mut();
-    let s = unsafe { (bs.allocate_pool)(MemoryType::EfiLoaderData, sector_aligned_patch, &mut patch_block_ptr) };
-    if s != EFI_SUCCESS || patch_block_ptr.is_null() {
+        if ext_size == 0 { continue; }
+
+        let (orig_ptr, orig_len) = match read_extent(bs, bio_ref, bio_ptr, mid, iso_lba, ext_lba, ext_size) {
+            Some(v) => v,
+            None => continue,
+        };
+        let orig = unsafe { core::slice::from_raw_parts(orig_ptr, orig_len as usize) };
+
+        // Check for linux/linuxefi line
+        let has_linux = orig.windows(6).any(|w| w == b"linux ") ||
+            orig.windows(8).any(|w| w == b"linuxefi");
+
+        if !has_linux {
+            unsafe { (bs.free_pool)(orig_ptr as *mut c_void); }
+            continue;
+        }
+
+        print_raw(st, b"[grub.cfg] Linux line found in entry #\0");
+        let mut nbuf = [0u8; 16];
+        let mut nv = i as u64; let mut np = 15;
+        loop { nbuf[np] = b'0' + (nv % 10) as u8; nv /= 10; if nv == 0 || np == 0 { break; } np -= 1; }
+        print_raw(st, &nbuf[np..]);
+        print_raw(st, b", size=\0");
+        let mut nv2 = orig_len as u64; let mut np2 = 15;
+        loop { nbuf[np2] = b'0' + (nv2 % 10) as u8; nv2 /= 10; if nv2 == 0 || np2 == 0 { break; } np2 -= 1; }
+        print_raw(st, &nbuf[np2..]);
+        print_raw(st, b". Patching...\r\n\0");
+
+        let patch = strategy::patch_grub_cfg(&ctx, orig, bs as *mut BootServices);
+        unsafe { (bs.free_pool)(orig_ptr as *mut c_void); }
+
+        let (patched_buf, patched_size) = match patch {
+            Some(p) => (p.buf, p.size),
+            None => continue,
+        };
+
+        let sector_aligned_patch = ((patched_size + 2047) / 2048) * 2048;
+        let mut patch_block_ptr: *mut c_void = core::ptr::null_mut();
+        let s = unsafe { (bs.allocate_pool)(MemoryType::EfiLoaderData, sector_aligned_patch, &mut patch_block_ptr) };
+        if s != EFI_SUCCESS || patch_block_ptr.is_null() {
+            unsafe { (bs.free_pool)(patched_buf as *mut c_void); }
+            return;
+        }
+        let patch_dst = unsafe { core::slice::from_raw_parts_mut(patch_block_ptr as *mut u8, sector_aligned_patch) };
+        patch_dst[..patched_size].copy_from_slice(unsafe { core::slice::from_raw_parts(patched_buf, patched_size) });
+        for j in patched_size..sector_aligned_patch { patch_dst[j] = 0; }
         unsafe { (bs.free_pool)(patched_buf as *mut c_void); }
+
+        // Place at end of virtual CD-ROM
+        let orig_end_sector = vb.media.bim_lb + 1;
+        vb.patched_file_sector = orig_end_sector as u32;
+        vb.patched_file_sectors = (sector_aligned_patch / 2048) as u32;
+        vb.patched_file_buf = patch_block_ptr as *mut u8;
+
+        vb.dir_entry_sector = dir_sector;
+        vb.dir_entry_offset = dir_offset;
+        vb.dir_entry_new_extent = vb.patched_file_sector;
+        vb.dir_entry_new_size = patched_size as u32;
+        vb.dir_entry_patched = true;
+
+        vb.media.bim_lb = orig_end_sector + vb.patched_file_sectors as u64 - 1;
+
+        print_raw(st, b"[grub.cfg] REDIRECTED: orig_size=\0");
+        let mut nbuf = [0u8; 16];
+        let mut nv = orig_len as u64; let mut np = 15;
+        loop { nbuf[np] = b'0' + (nv % 10) as u8; nv /= 10; if nv == 0 || np == 0 { break; } np -= 1; }
+        print_raw(st, &nbuf[np..]);
+        print_raw(st, b" -> new_size=\0");
+        let mut nv2 = patched_size as u64; let mut np2 = 15;
+        loop { nbuf[np2] = b'0' + (nv2 % 10) as u8; nv2 /= 10; if nv2 == 0 || np2 == 0 { break; } np2 -= 1; }
+        print_raw(st, &nbuf[np2..]);
+        print_raw(st, b" at sector=\0");
+        let mut nv3 = vb.patched_file_sector as u64; let mut np3 = 15;
+        loop { nbuf[np3] = b'0' + (nv3 % 10) as u8; nv3 /= 10; if nv3 == 0 || np3 == 0 { break; } np3 -= 1; }
+        print_raw(st, &nbuf[np3..]);
+        print_raw(st, b", dir_sector=\0");
+        let mut nv4 = dir_sector as u64; let mut np4 = 15;
+        loop { nbuf[np4] = b'0' + (nv4 % 10) as u8; nv4 /= 10; if nv4 == 0 || np4 == 0 { break; } np4 -= 1; }
+        print_raw(st, &nbuf[np4..]);
+        print_raw(st, b"\r\n\0");
+        unsafe { (bs.stall)(5_000_000); }
         return;
     }
-    let patch_dst = unsafe { core::slice::from_raw_parts_mut(patch_block_ptr as *mut u8, sector_aligned_patch) };
-    patch_dst[..patched_size].copy_from_slice(unsafe { core::slice::from_raw_parts(patched_buf, patched_size) });
-    for j in patched_size..sector_aligned_patch { patch_dst[j] = 0; }
-    unsafe { (bs.free_pool)(patched_buf as *mut c_void); }
 
-    // Place patched content at the end of the virtual CD-ROM
-    let orig_end_sector = vb.media.bim_lb + 1; // first sector after original ISO
-    vb.patched_file_sector = orig_end_sector as u32;
-    vb.patched_file_sectors = (sector_aligned_patch / 2048) as u32;
-    vb.patched_file_buf = patch_block_ptr as *mut u8;
+    print_raw(st, b"[grub.cfg] No .CFG with linux line found.\r\n\0");
+    unsafe { (bs.stall)(5_000_000); }
+}
 
-    // Set directory entry redirect
-    vb.dir_entry_sector = dir_sector;
-    vb.dir_entry_offset = dir_offset;
-    vb.dir_entry_new_extent = vb.patched_file_sector;
-    vb.dir_entry_new_size = patched_size as u32;
-    vb.dir_entry_patched = true;
+/// Recursively walk ISO9660 directories collecting ALL .CFG file entries
+/// with their full location info (extent_lba, extent_size, dir_sector, dir_offset).
+fn recursive_find_cfg_with_loc(
+    bio_ref: &BlockIoProtocol,
+    bio_ptr: *mut BlockIoProtocol,
+    mid: u32,
+    iso_lba: u64,
+    dir_lba: u32,
+    dir_size: u32,
+    scratch: &mut [u8; 2048],
+    entries: &mut [(u32, u32, u32, u32); 32],
+    entry_count: &mut usize,
+) {
+    if *entry_count >= 32 { return; }
+    let total_sectors = ((dir_size as u64 + 2047) / 2048) as u32;
+    for s in 0..total_sectors {
+        if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, dir_lba + s, scratch) { return; }
+        let mut offset: usize = 0;
+        while offset + 34 <= 2048 {
+            let record_len = scratch[offset] as usize;
+            if record_len == 0 { break; }
+            if offset + record_len > 2048 { break; }
+            let name_len = scratch[offset + 32] as usize;
+            let name_offset = offset + 33;
+            if name_offset + name_len > 2048 { break; }
+            let flags = scratch[offset + 25];
+            let is_dir = flags & 0x02 != 0;
+            let extent = u32::from_le_bytes(scratch[offset + 2..offset + 6].try_into().unwrap());
+            let size = u32::from_le_bytes(scratch[offset + 10..offset + 14].try_into().unwrap());
 
-    // Update LastBlock so GRUB can access the appended sectors
-    vb.media.bim_lb = orig_end_sector + vb.patched_file_sectors as u64 - 1;
+            let skip = if name_len == 1 && scratch[name_offset] == 0 { true }
+                else if name_len == 1 && scratch[name_offset] == 1 { true }
+                else { false };
 
-    print_raw(st, b"[grub.cfg] REDIRECTED: orig_size=\0");
-    let mut nbuf = [0u8; 16];
-    let mut nv = orig_len as u64; let mut np = 15;
-    loop { nbuf[np] = b'0' + (nv % 10) as u8; nv /= 10; if nv == 0 || np == 0 { break; } np -= 1; }
-    print_raw(st, &nbuf[np..]);
-    print_raw(st, b" -> new_size=\0");
-    let mut nv2 = patched_size as u64; let mut np2 = 15;
-    loop { nbuf[np2] = b'0' + (nv2 % 10) as u8; nv2 /= 10; if nv2 == 0 || np2 == 0 { break; } np2 -= 1; }
-    print_raw(st, &nbuf[np2..]);
-    print_raw(st, b" at sector=\0");
-    let mut nv3 = vb.patched_file_sector as u64; let mut np3 = 15;
-    loop { nbuf[np3] = b'0' + (nv3 % 10) as u8; nv3 /= 10; if nv3 == 0 || np3 == 0 { break; } np3 -= 1; }
-    print_raw(st, &nbuf[np3..]);
-    print_raw(st, b", dir_sector=\0");
-    let mut nv4 = dir_sector as u64; let mut np4 = 15;
-    loop { nbuf[np4] = b'0' + (nv4 % 10) as u8; nv4 /= 10; if nv4 == 0 || np4 == 0 { break; } np4 -= 1; }
-    print_raw(st, &nbuf[np4..]);
-    print_raw(st, b"\r\n\0");
+            if !skip {
+                let eff_len = if name_len >= 2 && scratch[name_offset + name_len - 2] == b';' {
+                    name_len - 2
+                } else {
+                    name_len
+                };
+                let has_cfg = eff_len >= 4 && {
+                    let ofs = name_offset + eff_len - 4;
+                    (scratch[ofs] | 0x20) == b'.' && (scratch[ofs+1] | 0x20) == b'c'
+                        && (scratch[ofs+2] | 0x20) == b'f' && (scratch[ofs+3] | 0x20) == b'g'
+                };
+                if has_cfg && !is_dir && *entry_count < 32 {
+                    let dir_sector = dir_lba + s;
+                    let dir_offset = offset as u32;
+                    // Check duplicates
+                    let mut dup = false;
+                    for i in 0..*entry_count {
+                        if entries[i].0 == extent { dup = true; break; }
+                    }
+                    if !dup {
+                        entries[*entry_count] = (extent, size, dir_sector, dir_offset);
+                        *entry_count += 1;
+                    }
+                }
+                if is_dir && extent != dir_lba && *entry_count < 32 {
+                    recursive_find_cfg_with_loc(
+                        bio_ref, bio_ptr, mid, iso_lba,
+                        extent, size, scratch,
+                        entries, entry_count,
+                    );
+                }
+            }
+            offset += record_len;
+        }
+    }
 }
 
 /// Recursively walk ISO9660 directories to find any file ending in `.CFG`.
