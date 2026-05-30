@@ -60,12 +60,15 @@ unsafe extern "efiapi" fn vblock_read(
             if status != EFI_SUCCESS {
                 return EFI_DEVICE_ERROR;
             }
-            // Overwrite the Extent LBA (offset +2) and Data Length (offset +10)
+            // Overwrite the Extent LBA (offset +2 LE, +6 BE) and Data Length (offset +10 LE, +14 BE)
+            // ISO9660 uses double-endian: both LE and BE must match for strict parsers.
             let entry = &mut dst[block_offset..block_offset + 2048];
             let off = vbio.dir_entry_offset as usize;
-            if off + 14 <= 2048 {
+            if off + 18 <= 2048 {
                 entry[off + 2..off + 6].copy_from_slice(&vbio.dir_entry_new_extent.to_le_bytes());
+                entry[off + 6..off + 10].copy_from_slice(&vbio.dir_entry_new_extent.to_be_bytes());
                 entry[off + 10..off + 14].copy_from_slice(&vbio.dir_entry_new_size.to_le_bytes());
+                entry[off + 14..off + 18].copy_from_slice(&vbio.dir_entry_new_size.to_be_bytes());
             }
         }
         // Case 2: Patched file sector — served from appended data
@@ -254,6 +257,13 @@ pub fn create_virtual_cdrom(
         }
     }
 
+    // Verify SFS is installed to prevent Use-After-Free if install failed
+    let mut sfs_proto: *mut c_void = core::ptr::null_mut();
+    let sfs_installed = !iso_fs_instance.is_null() && unsafe {
+        (bs.handle_protocol)(new_handle, &SIMPLE_FILE_SYSTEM_PROTOCOL_GUID, &mut sfs_proto) == EFI_SUCCESS
+    };
+    let final_sfs = if sfs_installed { iso_fs_instance } else { core::ptr::null_mut() };
+
     let vbio_ptr = vbio as *mut VirtualBlockIo;
-    Some((new_handle, dp_ptr, vbio_ptr, iso_fs_instance))
+    Some((new_handle, dp_ptr, vbio_ptr, final_sfs))
 }
