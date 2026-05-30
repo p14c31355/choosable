@@ -689,23 +689,18 @@ unsafe extern "efiapi" fn file_read_file(
         return EFI_SUCCESS;
     }
 
-    // ── grub.cfg patch: on first read, load entire file and inject iso-scan ──
+    // ── grub.cfg patch: prepend a `linux` wrapper function that injects ──
+    //  iso-scan/filename= into every kernel command line automatically.
     if vf.needs_grub_patch && !vf.patched {
-        // Read the full original file
         let orig_size = vf.extent_size as usize;
         let bs = unsafe { &mut *ctx.bs };
 
-        // Allocate buffer: original + injection text + null terminator
-        let injection: &[u8] = b" echo 'Choosable: iso-scan/filename=/";
-        // We need to build: " echo 'Choosable: iso-scan/filename=/$ISO_NAME'\n"
-        // appended right after "source $prefix/grub.cfg" or at the end of the file
-        let inj_prefix = b" echo 'Choosable: iso-scan/filename=/";
-        let inj_suffix = b"'\nset extra_cmdline='iso-scan/filename=/";
-        let inj_tail = b"'\n";
-
-        let total_inj = inj_prefix.len() + ctx.iso_name_len + inj_suffix.len()
-            + ctx.iso_name_len + inj_tail.len();
-        let new_size = orig_size + total_inj;
+        // Build the injection prefix:
+        //   function linux { command linux "$@" iso-scan/filename=/UBUNTU.ISO; }\n
+        let inj_part1 = b"function linux { command linux \"$@\" iso-scan/filename=/";
+        let inj_part2 = b"; }\n";
+        let prefix_len = inj_part1.len() + ctx.iso_name_len + inj_part2.len();
+        let new_size = prefix_len + orig_size;
 
         let mut patch_ptr: *mut c_void = core::ptr::null_mut();
         let status = unsafe {
@@ -720,7 +715,16 @@ unsafe extern "efiapi" fn file_read_file(
         } else {
             let patch_buf = unsafe { core::slice::from_raw_parts_mut(patch_ptr as *mut u8, new_size) };
 
-            // Read the original file content
+            // Write prefix (linux function wrapper) at the beginning
+            let mut off = 0usize;
+            patch_buf[off..off + inj_part1.len()].copy_from_slice(inj_part1);
+            off += inj_part1.len();
+            patch_buf[off..off + ctx.iso_name_len].copy_from_slice(&ctx.iso_name[..ctx.iso_name_len]);
+            off += ctx.iso_name_len;
+            patch_buf[off..off + inj_part2.len()].copy_from_slice(inj_part2);
+            off += inj_part2.len();
+
+            // Read the original file content after the prefix
             let mut read_buf = [0u8; 4096];
             let mut written = 0usize;
             let mut pos: u64 = 0;
@@ -728,22 +732,10 @@ unsafe extern "efiapi" fn file_read_file(
                 let rem = (orig_size - written).min(4096);
                 let r = read_extent_data(ctx, vf.extent_lba, vf.extent_size, pos, &mut read_buf[..rem]);
                 if r == 0 { break; }
-                patch_buf[written..written + r].copy_from_slice(&read_buf[..r]);
+                patch_buf[off + written..off + written + r].copy_from_slice(&read_buf[..r]);
                 written += r;
                 pos += r as u64;
             }
-
-            // Append injection lines at the end
-            let mut off = orig_size;
-            patch_buf[off..off + inj_prefix.len()].copy_from_slice(inj_prefix);
-            off += inj_prefix.len();
-            patch_buf[off..off + ctx.iso_name_len].copy_from_slice(&ctx.iso_name[..ctx.iso_name_len]);
-            off += ctx.iso_name_len;
-            patch_buf[off..off + inj_suffix.len()].copy_from_slice(inj_suffix);
-            off += inj_suffix.len();
-            patch_buf[off..off + ctx.iso_name_len].copy_from_slice(&ctx.iso_name[..ctx.iso_name_len]);
-            off += ctx.iso_name_len;
-            patch_buf[off..off + inj_tail.len()].copy_from_slice(inj_tail);
 
             vf.patched_buf = patch_ptr as *mut u8;
             vf.patched_size = new_size as u64;
@@ -751,7 +743,7 @@ unsafe extern "efiapi" fn file_read_file(
 
             if !ctx.st.is_null() {
                 let st_ref = unsafe { &mut *ctx.st };
-                print_raw(st_ref, b"[SFS] grub.cfg patched: ");
+                print_raw(st_ref, b"[SFS] grub.cfg patched (prepended linux wrapper): ");
                 let mut nb = [0u8; 16];
                 let mut nv = new_size as u64;
                 let mut np = 15usize;
