@@ -373,7 +373,7 @@ pub struct EfiFileInfo {
     // followed by: FileName (UCS-2 null-terminated)
 }
 
-#[repr(C, packed)]
+#[repr(C)]
 pub struct EfiTime {
     pub year: u16,
     pub month: u8,
