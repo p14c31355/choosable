@@ -299,6 +299,104 @@ pub const DEVICE_PATH_PROTOCOL_GUID: Guid = Guid {
     d4: [0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
 };
 
+/// ── EFI_SIMPLE_FILE_SYSTEM_PROTOCOL ───────────────────────────────────
+
+pub const SIMPLE_FILE_SYSTEM_PROTOCOL_GUID: Guid = Guid {
+    d1: 0x0964e5b22,
+    d2: 0x6459,
+    d3: 0x11d2,
+    d4: [0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
+};
+
+pub const FILE_INFO_GUID: Guid = Guid {
+    d1: 0x09576e92,
+    d2: 0x6d3f,
+    d3: 0x11d2,
+    d4: [0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
+};
+
+#[repr(C)]
+pub struct SimpleFileSystemProtocol {
+    pub revision: u64,
+    pub open_volume:
+        unsafe extern "efiapi" fn(*mut SimpleFileSystemProtocol, *mut *mut FileProtocol) -> usize,
+}
+
+#[repr(C)]
+pub struct FileProtocol {
+    pub revision: u64,
+    pub open: unsafe extern "efiapi" fn(
+        *mut FileProtocol,
+        *mut *mut FileProtocol,
+        *const u16, // FileName (UCS-2)
+        u64,         // OpenMode
+        u64,         // Attributes
+    ) -> usize,
+    pub close: unsafe extern "efiapi" fn(*mut FileProtocol) -> usize,
+    pub delete: unsafe extern "efiapi" fn(*mut FileProtocol) -> usize,
+    pub read: unsafe extern "efiapi" fn(
+        *mut FileProtocol,
+        *mut usize,  // BufferSize
+        *mut c_void, // Buffer
+    ) -> usize,
+    pub write: unsafe extern "efiapi" fn(
+        *mut FileProtocol,
+        *mut usize,
+        *mut c_void,
+    ) -> usize,
+    pub get_position: unsafe extern "efiapi" fn(*mut FileProtocol, *mut u64) -> usize,
+    pub set_position: unsafe extern "efiapi" fn(*mut FileProtocol, u64) -> usize,
+    pub get_info: unsafe extern "efiapi" fn(
+        *mut FileProtocol,
+        *const Guid,  // InformationType
+        *mut usize,   // BufferSize
+        *mut c_void,  // Buffer
+    ) -> usize,
+    pub set_info: unsafe extern "efiapi" fn(
+        *mut FileProtocol,
+        *const Guid,
+        usize,
+        *mut c_void,
+    ) -> usize,
+    pub flush: unsafe extern "efiapi" fn(*mut FileProtocol) -> usize,
+}
+
+#[repr(C, packed)]
+pub struct EfiFileInfo {
+    pub size: u64,
+    pub file_size: u64,
+    pub physical_size: u64,
+    pub create_time: EfiTime,
+    pub last_access_time: EfiTime,
+    pub modification_time: EfiTime,
+    pub attribute: u64,
+    // followed by: FileName (UCS-2 null-terminated)
+}
+
+#[repr(C, packed)]
+pub struct EfiTime {
+    pub year: u16,
+    pub month: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub minute: u8,
+    pub second: u8,
+    pub _pad1: u8,
+    pub nanosecond: u32,
+    pub timezone: i16,
+    pub daylight: u8,
+    pub _pad2: u8,
+}
+
+/// Additional EFI_STATUS codes used by file protocols
+pub const EFI_NOT_FOUND: usize            = 0x80000000_0000000Eusize;
+pub const EFI_INVALID_PARAMETER: usize    = 0x80000000_00000002usize;
+pub const EFI_UNSUPPORTED: usize          = 0x80000000_00000003usize;
+pub const EFI_BAD_BUFFER_SIZE: usize      = 0x80000000_00000004usize;
+pub const EFI_DEVICE_ERROR: usize         = 0x80000000_00000007usize;
+pub const EFI_NO_MEDIA: usize             = 0x80000000_00000014usize;
+pub const EFI_WRITE_PROTECTED: usize      = 0x80000000_00000011usize;
+
 pub const BLOCK_IO_PROTOCOL_GUID: Guid = Guid {
     d1: 0x964e5b21,
     d2: 0x6459,

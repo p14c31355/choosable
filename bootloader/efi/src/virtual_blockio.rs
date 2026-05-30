@@ -11,6 +11,7 @@ use core::ffi::c_void;
 use crate::protocol::{
     BlockIoMedia, BlockIoProtocol, BootServices, MemoryType, VirtualBlockIo,
     EFI_SUCCESS, BLOCK_IO_PROTOCOL_GUID, DEVICE_PATH_PROTOCOL_GUID,
+    SIMPLE_FILE_SYSTEM_PROTOCOL_GUID,
 };
 
 /// ReadBlocks implementation for the virtual CD-ROM.
@@ -187,6 +188,27 @@ pub fn create_virtual_cdrom(
         // Non-fatal — BlockIO is installed, but device path failed.
         // Free dp_ptr since it wasn't claimed by the handle.
         unsafe { (bs.free_pool)(dp_ptr); }
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // 5. Install ISO9660 SimpleFileSystem protocol on the same handle
+    // ═════════════════════════════════════════════════════════════
+    let iso_fs_instance = crate::iso_fs::create_iso_fs(
+        bs, real_bio_ptr, real_media_id, iso_lba, iso_size_bytes,
+    );
+    if !iso_fs_instance.is_null() {
+        let sfs_status = unsafe {
+            (bs.install_protocol_interface)(
+                &mut new_handle,
+                &SIMPLE_FILE_SYSTEM_PROTOCOL_GUID,
+                0,
+                iso_fs_instance as *mut c_void,
+            )
+        };
+        if sfs_status != EFI_SUCCESS {
+            // Free the ISO FS instance if installation failed
+            unsafe { (bs.free_pool)(iso_fs_instance as *mut c_void); }
+        }
     }
 
     Some((new_handle, dp_ptr))

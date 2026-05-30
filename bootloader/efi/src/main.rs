@@ -4,6 +4,7 @@
 mod disk;
 mod fs;
 mod iso;
+mod iso_fs;
 mod output;
 mod protocol;
 mod virtual_blockio;
