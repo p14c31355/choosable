@@ -912,6 +912,13 @@ unsafe extern "efiapi" fn file_read_dir(
         dst[dst_off + 1] = 0;
         dst_off += 2;
 
+        // Pad to 8-byte alignment
+        let padding = required_size - raw_size;
+        for _ in 0..padding {
+            dst[dst_off] = 0;
+            dst_off += 1;
+        }
+
         // Advance to next record
         byte_offset += record_len;
         vf.position = ((sector_idx as u64) << 16) | (byte_offset as u64);
