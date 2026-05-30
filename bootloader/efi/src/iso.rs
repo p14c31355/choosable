@@ -275,7 +275,7 @@ fn try_patch_candidate(
         real_bio_ptr: bio_ptr,
         real_media_id: mid,
         iso_lba,
-        iso_size_bytes: vb.media.bim_lb * 2048,
+        iso_size_bytes: (vb.media.bim_lb + 1) * 2048,
         root_lba: 0, root_size: 0,
         bs: bs as *mut BootServices,
         st: core::ptr::null_mut(),
