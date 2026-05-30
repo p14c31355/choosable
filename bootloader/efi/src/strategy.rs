@@ -149,7 +149,7 @@ impl BootStrategy for CasperStrategy {
     }
 
     fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> {
-        patch_common(inp, b" rootdelay=5 debug iso-scan/filename=/")
+        patch_common(inp, b" rootdelay=5 iso-scan/filename=/")
     }
 }
 
