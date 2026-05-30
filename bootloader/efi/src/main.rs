@@ -7,6 +7,7 @@ mod iso;
 mod iso_fs;
 mod output;
 mod protocol;
+mod strategy;
 mod virtual_blockio;
 
 use core::ffi::c_void;

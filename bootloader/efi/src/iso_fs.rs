@@ -28,26 +28,26 @@ use crate::output::print_raw;
 //  Shared context (one per volume)
 // ═══════════════════════════════════════════════════════════════════════════
 
-struct IsoFsCtx {
+pub struct IsoFsCtx {
     /// Pointer to real Block I/O for reading the ISO file from disk
-    real_bio_ptr: *mut BlockIoProtocol,
+    pub real_bio_ptr: *mut BlockIoProtocol,
     /// Real media ID
-    real_media_id: u32,
+    pub real_media_id: u32,
     /// ISO file start LBA in 512-byte disk sectors
-    iso_lba: u64,
+    pub iso_lba: u64,
     /// ISO file total size in bytes
-    iso_size_bytes: u64,
+    pub iso_size_bytes: u64,
     /// ISO9660 root directory extent LBA (in ISO 2048-byte sectors)
-    root_lba: u32,
+    pub root_lba: u32,
     /// ISO9660 root directory extent size in bytes
-    root_size: u32,
+    pub root_size: u32,
     /// BootServices pointer (for pool allocation)
-    bs: *mut BootServices,
+    pub bs: *mut BootServices,
     /// SystemTable pointer (for debug output)
-    st: *mut SystemTable,
+    pub st: *mut SystemTable,
     /// ISO file name on the real USB drive (e.g. "ubuntu-24.04.iso")
-    iso_name: [u8; 128],
-    iso_name_len: usize,
+    pub iso_name: [u8; 128],
+    pub iso_name_len: usize,
 }
 
 #[repr(C)]
@@ -689,73 +689,63 @@ unsafe extern "efiapi" fn file_read_file(
         return EFI_SUCCESS;
     }
 
-    // ── grub.cfg patch: prepend a `linux` wrapper function that injects ──
-    //  iso-scan/filename= into every kernel command line automatically.
+    // ── grub.cfg patch: inject iso-scan/filename= into every linux line ──
     if vf.needs_grub_patch && !vf.patched {
+        // Read the original file contents into a temporary buffer
         let orig_size = vf.extent_size as usize;
         let bs = unsafe { &mut *ctx.bs };
 
-        // Build the injection prefix:
-        //   function linux { command linux "$@" iso-scan/filename=/UBUNTU.ISO; }\n
-        let inj_part1 = b"function linux { command linux \"$@\" iso-scan/filename=/";
-        let inj_part2 = b"; }\n";
-        let prefix_len = inj_part1.len() + ctx.iso_name_len + inj_part2.len();
-        let new_size = prefix_len + orig_size;
-
-        let mut patch_ptr: *mut c_void = core::ptr::null_mut();
-        let status = unsafe {
+        let mut tmp_ptr: *mut c_void = core::ptr::null_mut();
+        let tmp_status = unsafe {
             (bs.allocate_pool)(
                 crate::protocol::MemoryType::EfiLoaderData,
-                new_size,
-                &mut patch_ptr,
+                orig_size,
+                &mut tmp_ptr,
             )
         };
-        if status != EFI_SUCCESS || patch_ptr.is_null() {
-            // Fall through to normal read
+        if tmp_status != EFI_SUCCESS || tmp_ptr.is_null() {
+            // Fall through
         } else {
-            let patch_buf = unsafe { core::slice::from_raw_parts_mut(patch_ptr as *mut u8, new_size) };
-
-            // Write prefix (linux function wrapper) at the beginning
-            let mut off = 0usize;
-            patch_buf[off..off + inj_part1.len()].copy_from_slice(inj_part1);
-            off += inj_part1.len();
-            patch_buf[off..off + ctx.iso_name_len].copy_from_slice(&ctx.iso_name[..ctx.iso_name_len]);
-            off += ctx.iso_name_len;
-            patch_buf[off..off + inj_part2.len()].copy_from_slice(inj_part2);
-            off += inj_part2.len();
-
-            // Read the original file content after the prefix
-            let mut read_buf = [0u8; 4096];
-            let mut written = 0usize;
-            let mut pos: u64 = 0;
-            while written < orig_size {
-                let rem = (orig_size - written).min(4096);
-                let r = read_extent_data(ctx, vf.extent_lba, vf.extent_size, pos, &mut read_buf[..rem]);
+            let tmp_buf = unsafe { core::slice::from_raw_parts_mut(tmp_ptr as *mut u8, orig_size) };
+            // Read the full file
+            let mut total_read = 0usize;
+            while total_read < orig_size {
+                let rem = (orig_size - total_read).min(2048);
+                let r = read_extent_data(ctx, vf.extent_lba, vf.extent_size, total_read as u64,
+                    &mut tmp_buf[total_read..total_read + rem]);
                 if r == 0 { break; }
-                patch_buf[off + written..off + written + r].copy_from_slice(&read_buf[..r]);
-                written += r;
-                pos += r as u64;
+                total_read += r;
             }
 
-            vf.patched_buf = patch_ptr as *mut u8;
-            vf.patched_size = new_size as u64;
-            vf.patched = true;
+            // Apply strategy-based patching
+            let patch = crate::strategy::patch_grub_cfg(ctx, &tmp_buf[..total_read], bs);
+            if let Some(p) = patch {
+                vf.patched_buf = p.buf;
+                vf.patched_size = p.size as u64;
+                vf.patched = true;
 
-            if !ctx.st.is_null() {
-                let st_ref = unsafe { &mut *ctx.st };
-                print_raw(st_ref, b"[SFS] grub.cfg patched (prepended linux wrapper): ");
-                let mut nb = [0u8; 16];
-                let mut nv = new_size as u64;
-                let mut np = 15usize;
-                loop {
-                    nb[np] = b'0' + (nv % 10) as u8;
-                    nv /= 10;
-                    if nv == 0 || np == 0 { break; }
-                    np -= 1;
+                if !ctx.st.is_null() {
+                    let st_ref = unsafe { &mut *ctx.st };
+                    print_raw(st_ref, b"[SFS] grub.cfg patched (linux lines injected): ");
+                    let mut nb = [0u8; 16];
+                    let mut nv = p.size as u64;
+                    let mut np = 15usize;
+                    loop {
+                        nb[np] = b'0' + (nv % 10) as u8;
+                        nv /= 10;
+                        if nv == 0 || np == 0 { break; }
+                        np -= 1;
+                    }
+                    print_raw(st_ref, &nb[np..]);
+                    print_raw(st_ref, b" bytes\r\n\0");
                 }
-                print_raw(st_ref, &nb[np..]);
-                print_raw(st_ref, b" bytes\r\n\0");
+            } else if !ctx.st.is_null() {
+                let st_ref = unsafe { &mut *ctx.st };
+                print_raw(st_ref, b"[SFS] grub.cfg patch FAILED (allocation error)\r\n\0");
             }
+
+            // Free temporary buffer
+            unsafe { (bs.free_pool)(tmp_ptr); }
         }
     }
 
