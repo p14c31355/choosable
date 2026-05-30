@@ -208,30 +208,27 @@ fn find_efi_boot(
 //  UEFI chainload
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Build a minimal DevicePath for the ISO's EFI executable:
-///   HD(partition1) / File("\\EFI\\BOOT\\BOOTX64.EFI")
+/// Build a DevicePath for the ISO's EFI executable:
+///   CDROM(0) / File("\\EFI\\BOOT\\BOOTX64.EFI")
+///
+/// Uses a CD-ROM Media Device Path node so that UEFI (and the chainloaded
+/// shim/GRUB) recognize this as a CD-ROM device and route file access
+/// through the SimpleFileSystem protocol installed on the virtual CD-ROM handle.
 /// Returns a pool-allocated pointer, or null on failure.
 fn build_iso_device_path(
     bs: &mut BootServices,
-    part1_lba: u64,
+    iso_size_bytes: u64,
 ) -> *mut c_void {
-    // ── Hard Drive media device path node (42 bytes) ──────
-    const HD_NODE: [u8; 42] = {
-        let mut n = [0u8; 42];
+    // ── CD-ROM Media Device Path node (24 bytes) ─────────
+    const CDROM_NODE: [u8; 24] = {
+        let mut n = [0u8; 24];
         n[0] = 0x04; // Type: MEDIA_DEVICE_PATH
-        n[1] = 0x01; // SubType: HARD_DRIVE
-        // Length (2 bytes LE) = 42 → 0x002A
-        n[2] = 0x2A;
+        n[1] = 0x02; // SubType: CDROM
+        n[2] = 24u8; // Length = 24 (little-endian)
         n[3] = 0x00;
-        // PartitionNumber = 1 (bytes 4-7)
-        n[4] = 1;
-        // n[5..7] = 0
-        // PartitionStart (bytes 8-15)
-        // PartitionSize (bytes 16-23, 0 = unknown)
-        // PartitionSignature (bytes 24-39, zero)
-        // PartitionFormat = 0x02 (GPT) at byte 40
-        n[40] = 0x02;
-        // SignatureType = 0x00 (None) at byte 41
+        // BootEntry (4 bytes at offset 4) = 0
+        // PartitionStart (8 bytes at offset 8) = 0 (start of virtual CD)
+        // PartitionSize (8 bytes at offset 16) = ISO size in 2048-byte sectors
         n
     };
 
@@ -248,8 +245,9 @@ fn build_iso_device_path(
     // ── End device path node (4 bytes) ────────────────────
     const END_NODE: [u8; 4] = [0x7F, 0xFF, 0x04, 0x00];
 
-    let total = HD_NODE.len() + 4 + file_name.len() * 2 + END_NODE.len();
-    // = 42 + 4 + 44 + 4 = 94
+    // CD-ROM node (24) + FilePath header (4) + UCS-2 string (44 bytes) + End (4) = 76
+    let file_body_bytes = file_name.len() * 2;
+    let total = CDROM_NODE.len() + 4 + file_body_bytes + END_NODE.len();
 
     let mut ptr: *mut c_void = core::ptr::null_mut();
     let status = unsafe {
@@ -261,24 +259,31 @@ fn build_iso_device_path(
     let dp = ptr as *mut u8;
 
     unsafe {
-        // HD node
+        // CD-ROM node
         let mut off = 0usize;
-        dp.copy_from_nonoverlapping(HD_NODE.as_ptr(), HD_NODE.len());
-        off += HD_NODE.len();
-        // Patch PartitionStart (bytes 8-15) with actual partition LBA
-        *(dp.add(8) as *mut u64) = part1_lba.to_le();
+        dp.copy_from_nonoverlapping(CDROM_NODE.as_ptr(), CDROM_NODE.len());
+        off += CDROM_NODE.len();
+        // Patch PartitionStart = 0 (virtual CD starts at LBA 0)
+        // Patch PartitionSize = ISO size in 2048-byte sectors
+        // (offsets 8 and 16 within the CD-ROM node)
+        *(dp.add(8) as *mut u64) = 0u64.to_le();
+        *(dp.add(16) as *mut u64) = (iso_size_bytes / 2048).to_le();
 
         // File path node header
         dp.add(off).write_volatile(0x04u8); // Type: MEDIA_DEVICE_PATH
         off += 1;
         dp.add(off).write_volatile(0x04u8); // SubType: FILE_PATH
         off += 1;
-        let file_bytes = (file_name.len() * 2) as u16;
-        *(dp.add(off) as *mut u16) = (4 + file_bytes).to_le(); // total node length
+        let file_node_len = (4 + file_body_bytes) as u16;
+        *(dp.add(off) as *mut u16) = file_node_len.to_le();
         off += 2;
         // File path body
-        core::ptr::copy_nonoverlapping(file_name.as_ptr() as *const u8, dp.add(off), file_name.len() * 2);
-        off += file_name.len() * 2;
+        core::ptr::copy_nonoverlapping(
+            file_name.as_ptr() as *const u8,
+            dp.add(off),
+            file_body_bytes,
+        );
+        off += file_body_bytes;
 
         // End node
         dp.add(off).copy_from_nonoverlapping(END_NODE.as_ptr(), END_NODE.len());
@@ -308,9 +313,12 @@ fn uefi_chainload_iso(
         (bs.set_watchdog_timer)(0, 0x10000, 0, core::ptr::null());
     }
 
+    // ── ISO file name (for grub.cfg iso-scan/filename injection)
+    let iso_name = &files[idx].name[..files[idx].name_len.min(files[idx].name.len())];
+
     // ── Create virtual CD-ROM from the ISO file ──────────────────────
     let cdrom_tuple = crate::virtual_blockio::create_virtual_cdrom(
-        bs, iso_lba, bio_ptr, mid, iso_size,
+        bs, st as *mut SystemTable, iso_lba, bio_ptr, mid, iso_size, iso_name,
     );
     let (device_handle, cdrom_dp) = match cdrom_tuple {
         Some((h, dp)) => (h, dp),
@@ -338,7 +346,7 @@ fn uefi_chainload_iso(
     };
 
     // Build a proper DevicePath so the child image can find its files
-    let device_path = build_iso_device_path(bs, part1_lba);
+    let device_path = build_iso_device_path(bs, iso_size);
 
     print_raw(st, b"Loading EFI image...\r\n\0");
 
