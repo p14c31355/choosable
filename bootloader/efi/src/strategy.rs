@@ -83,7 +83,7 @@ impl BootStrategy for CasperStrategy {
                 let line_slice = &out[line_start..line_end];
                 if line_slice.starts_with(b"linux ") || line_slice.starts_with(b"linuxefi ") {
                     // Find injection point: before "---" if present, else at end
-                    let mut inject_at = dst - 1; // default: before final char (\n or last byte)
+                    let mut inject_at = if ch == b'\n' { dst - 1 } else { dst }; // default: before final char (\n or last byte)
                     // Walk backward to find "---" preceded by space or BOL
                     if line_end > line_start + 4 {
                         let mut search = line_end - 4;
