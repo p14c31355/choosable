@@ -361,7 +361,7 @@ pub struct FileProtocol {
     pub flush: unsafe extern "efiapi" fn(*mut FileProtocol) -> usize,
 }
 
-#[repr(C, packed)]
+#[repr(C)]
 pub struct EfiFileInfo {
     pub size: u64,
     pub file_size: u64,
