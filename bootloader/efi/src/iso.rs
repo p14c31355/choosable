@@ -315,7 +315,7 @@ fn uefi_chainload_iso(
 
     // ── Create virtual CD-ROM from the ISO file ──────────────────────
     let cdrom_tuple = crate::virtual_blockio::create_virtual_cdrom(
-        bs, iso_lba, bio_ptr, mid, iso_size,
+        bs, st as *mut SystemTable, iso_lba, bio_ptr, mid, iso_size,
     );
     let (device_handle, cdrom_dp) = match cdrom_tuple {
         Some((h, dp)) => (h, dp),

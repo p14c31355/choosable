@@ -9,7 +9,7 @@
 use core::ffi::c_void;
 
 use crate::protocol::{
-    BlockIoMedia, BlockIoProtocol, BootServices, MemoryType, VirtualBlockIo,
+    BlockIoMedia, BlockIoProtocol, BootServices, MemoryType, SystemTable, VirtualBlockIo,
     EFI_SUCCESS, BLOCK_IO_PROTOCOL_GUID, DEVICE_PATH_PROTOCOL_GUID,
     SIMPLE_FILE_SYSTEM_PROTOCOL_GUID,
 };
@@ -63,6 +63,7 @@ unsafe extern "efiapi" fn vblock_read(
 /// Returns `(handle, device_path_ptr)`.  Both must NOT be freed.
 pub fn create_virtual_cdrom(
     bs: &mut BootServices,
+    st: *mut SystemTable,
     iso_lba: u64,
     real_bio_ptr: *mut BlockIoProtocol,
     real_media_id: u32,
@@ -194,7 +195,7 @@ pub fn create_virtual_cdrom(
     // 5. Install ISO9660 SimpleFileSystem protocol on the same handle
     // ═════════════════════════════════════════════════════════════
     let iso_fs_instance = crate::iso_fs::create_iso_fs(
-        bs, real_bio_ptr, real_media_id, iso_lba, iso_size_bytes,
+        bs, st, real_bio_ptr, real_media_id, iso_lba, iso_size_bytes,
     );
     if !iso_fs_instance.is_null() {
         let sfs_status = unsafe {

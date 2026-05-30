@@ -16,11 +16,13 @@ use core::ffi::c_void;
 
 use crate::protocol::{
     BlockIoProtocol, BootServices, FileProtocol, SimpleFileSystemProtocol,
-    EfiFileInfo, EfiTime, Guid,
+    EfiFileInfo, EfiTime, Guid, SystemTable,
     EFI_SUCCESS, EFI_NOT_FOUND, EFI_INVALID_PARAMETER,
     EFI_UNSUPPORTED, EFI_BAD_BUFFER_SIZE,
     EFI_WRITE_PROTECTED, FILE_INFO_GUID,
 };
+
+use crate::output::print_raw;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Shared context (one per volume)
@@ -41,6 +43,8 @@ struct IsoFsCtx {
     root_size: u32,
     /// BootServices pointer (for pool allocation)
     bs: *mut BootServices,
+    /// SystemTable pointer (for debug output)
+    st: *mut SystemTable,
 }
 
 #[repr(C)]
@@ -252,6 +256,12 @@ unsafe extern "efiapi" fn sfs_open_volume(
     let instance = &*(this as *const IsoFsInstance);
     let ctx = &instance.ctx;
 
+    // Debug: log that SFS open_volume was called
+    if !ctx.st.is_null() {
+        let st_ref = unsafe { &mut *ctx.st };
+        print_raw(st_ref, b"[SFS] open_volume called\r\n\0");
+    }
+
     // Allocate a VirtualFile for the root directory
     let bs = unsafe { &mut *ctx.bs };
     let mut ptr: *mut c_void = core::ptr::null_mut();
@@ -308,8 +318,24 @@ fn resolve_path(
         return Some((start_lba, start_size, true));
     }
 
-    // Skip leading backslash(es)
+    // Strip DevicePath text prefix like "CDROM(0x0)\" or "HD(1,GPT,...)\"
+    // UEFI applications may pass the full DevicePath text as a file path.
+    // The device text ends with ")", followed by "\" and the filesystem path.
     let mut pos = 0usize;
+    let mut last_paren_backslash: Option<usize> = None;
+    let mut i = 0;
+    while i + 1 < path.len() {
+        if path[i] == b')' as u16 && path[i + 1] == b'\\' as u16 {
+            last_paren_backslash = Some(i + 1); // position of the backslash after )
+        }
+        i += 1;
+    }
+    if let Some(start) = last_paren_backslash {
+        // Start from the backslash after the device prefix
+        pos = start;
+    }
+
+    // Skip leading backslash(es)
     while pos < path.len() && path[pos] == b'\\' as u16 {
         pos += 1;
     }
@@ -423,6 +449,30 @@ unsafe extern "efiapi" fn file_open(
 
     let ctx = unsafe { &*vf.ctx };
 
+    // Debug: log the OPEN request
+    if !ctx.st.is_null() {
+        let st_ref = unsafe { &mut *ctx.st };
+        print_raw(st_ref, b"[SFS] OPEN: \0");
+        // Print up to first 64 UCS-2 chars as ASCII
+        let mut name_buf = [0u8; 128];
+        let mut name_pos = 0usize;
+        let p = file_name;
+        while name_pos < 127 {
+            let ch = unsafe { *p.add(name_pos) };
+            if ch == 0 {
+                break;
+            }
+            name_buf[name_pos] = if ch < 0x80 { ch as u8 } else { b'?' };
+            name_pos += 1;
+        }
+        name_buf[name_pos] = b'\0';
+        if name_pos > 0 {
+            let msg_slice: &[u8] = &name_buf[..name_pos];
+            print_raw(st_ref, msg_slice);
+        }
+        print_raw(st_ref, b"\r\n\0");
+    }
+
     // Convert UCS-2 file name to a slice (null-terminated)
     let name_slice = unsafe {
         let mut len = 0usize;
@@ -436,9 +486,49 @@ unsafe extern "efiapi" fn file_open(
     };
 
     // Resolve multi-component path
-    let (child_lba, child_size, is_dir) = match resolve_path(ctx, vf.extent_lba, vf.extent_size, name_slice) {
-        Some(v) => v,
-        None => return EFI_NOT_FOUND,
+    let resolved = resolve_path(ctx, vf.extent_lba, vf.extent_size, name_slice);
+    let (child_lba, child_size, is_dir) = match resolved {
+        Some(v) => {
+            let (lba, sz, dir) = v;
+            if !ctx.st.is_null() {
+                let st_ref = unsafe { &mut *ctx.st };
+                print_raw(st_ref, b"[SFS]   -> OK (LBA=\0");
+                let mut lbabuf = [b'0'; 16];
+                let mut lba_val = lba as u64;
+                let mut pos = 15usize;
+                loop {
+                    lbabuf[pos] = b'0' + (lba_val % 10) as u8;
+                    lba_val /= 10;
+                    if lba_val == 0 || pos == 0 {
+                        break;
+                    }
+                    pos -= 1;
+                }
+                print_raw(st_ref, &lbabuf[pos..]);
+                print_raw(st_ref, b", size=\0");
+                let mut szbuf = [b'0'; 16];
+                let mut sz_val = sz as u64;
+                pos = 15usize;
+                loop {
+                    szbuf[pos] = b'0' + (sz_val % 10) as u8;
+                    sz_val /= 10;
+                    if sz_val == 0 || pos == 0 {
+                        break;
+                    }
+                    pos -= 1;
+                }
+                print_raw(st_ref, &szbuf[pos..]);
+                print_raw(st_ref, b")\r\n\0");
+            }
+            (lba, sz, dir)
+        }
+        None => {
+            if !ctx.st.is_null() {
+                let st_ref = unsafe { &mut *ctx.st };
+                print_raw(st_ref, b"[SFS]   -> NOT FOUND\r\n\0");
+            }
+            return EFI_NOT_FOUND;
+        }
     };
 
     // Allocate and initialize the VirtualFile
@@ -631,6 +721,7 @@ unsafe extern "efiapi" fn file_flush(_this: *mut FileProtocol) -> usize {
 /// pointer. Returns null on failure.
 pub fn create_iso_fs(
     bs: &mut BootServices,
+    st: *mut SystemTable,
     real_bio_ptr: *mut BlockIoProtocol,
     real_media_id: u32,
     iso_lba: u64,
@@ -660,6 +751,7 @@ pub fn create_iso_fs(
         root_lba: 0,
         root_size: 0,
         bs: bs as *mut BootServices,
+        st,
     };
 
     // ── Parse ISO9660 PVD ──────────────────────────────────────────
