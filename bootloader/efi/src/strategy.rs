@@ -102,12 +102,12 @@ fn patch_common(inp: &PatchInput, pre: &[u8]) -> Option<PatchOutput> {
                 if line_end > line_start + 4 {
                     let mut search = line_end - 4;
                     while search > line_start {
-                        if out[search] == b'-' && out[search+1] == b'-' && out[search+2] == b'-' {
-                            if search == line_start || out[search-1] == b' ' {
-                                inject_at = search;
-                                break;
+                            if out[search] == b'-' && out[search+1] == b'-' && out[search+2] == b'-' {
+                                if search == line_start || out[search-1] == b' ' {
+                                    inject_at = search - 1;
+                                    break;
+                                }
                             }
-                        }
                         search -= 1;
                     }
                 }
