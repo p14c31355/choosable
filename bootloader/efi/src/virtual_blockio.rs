@@ -57,6 +57,7 @@ unsafe extern "efiapi" fn vblock_read(
                 )
             };
             dst[block_offset..block_offset + 2048].copy_from_slice(src);
+            let _ = grub_end; // suppress unused warning
         } else {
             let disk_lba = vbio.iso_lba + block_lba * 4;
 

@@ -300,6 +300,22 @@ fn patch_grub_cfg_blockio(
         return;
     }
 
+    // Debug: print candidate count
+    {
+        print_raw(st, b"[grub.cfg] Found \0");
+        let mut nbuf = [0u8; 16];
+        let mut nv = cand_count as u64;
+        let mut np = 15;
+        loop {
+            nbuf[np] = b'0' + (nv % 10) as u8;
+            nv /= 10;
+            if nv == 0 || np == 0 { break; }
+            np -= 1;
+        }
+        print_raw(st, &nbuf[np..]);
+        print_raw(st, b" candidates.\r\n\0");
+    }
+
     // Build IsoFsCtx once
     let mut iso_name_arr = [0u8; 128];
     let nlen = iso_name.len().min(127);
@@ -386,9 +402,9 @@ fn patch_grub_cfg_blockio(
                 p2 -= 1;
             }
             print_raw(st, &buf2[p2..]);
-            print_raw(st, b" bytes, patched=\0");
+            print_raw(st, b", raw_patch=\0");
             let mut buf3 = [0u8; 16];
-            let mut v3 = effective_size as u64;
+            let mut v3 = patched_size as u64;
             let mut p3 = 15;
             loop {
                 buf3[p3] = b'0' + (v3 % 10) as u8;
@@ -397,7 +413,29 @@ fn patch_grub_cfg_blockio(
                 p3 -= 1;
             }
             print_raw(st, &buf3[p3..]);
-            print_raw(st, b")\r\n\0");
+            print_raw(st, b", effective=\0");
+            let mut buf4 = [0u8; 16];
+            let mut v4 = effective_size as u64;
+            let mut p4 = 15;
+            loop {
+                buf4[p4] = b'0' + (v4 % 10) as u8;
+                v4 /= 10;
+                if v4 == 0 || p4 == 0 { break; }
+                p4 -= 1;
+            }
+            print_raw(st, &buf4[p4..]);
+            // Preview from final_buf (not patched_buf which may be freed)
+            if effective_size > 0 {
+                print_raw(st, b", preview: \0");
+                let preview = if effective_size > 80 { 80 } else { effective_size };
+                let mut pb = [0u8; 80];
+                for k in 0..preview {
+                    let byte = final_buf[k];
+                    pb[k] = if byte >= 0x20 && byte < 0x7F { byte } else { b'.' };
+                }
+                print_raw(st, &pb[..preview]);
+            }
+            print_raw(st, b"\r\n\0");
             return;
         }
     }

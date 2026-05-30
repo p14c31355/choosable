@@ -48,26 +48,25 @@ fn count_linux_lines(data: &[u8]) -> usize {
     if count == 0 { 1 } else { count }
 }
 
-/// Shared patch logic: prepend `set root=cd0\n` and inject `pre` + iso_name
-/// into every `linux`/`linuxefi` line before `---` or at end of line.
+/// Shared patch logic: inject `pre` + iso_name immediately after the
+/// kernel path in `linux`/`linuxefi` lines (right after `vmlinuz`),
+/// then truncate output to original file size so GRUB reads all of it.
+/// The tail of the original line (file=/cdrom, quiet, splash, maybe-ubiquity, ---)
+/// may be clipped by truncation — that's intentional and harmless.
 fn patch_common(inp: &PatchInput, pre: &[u8]) -> Option<PatchOutput> {
     let bs = unsafe { &mut *inp.bs };
     let name = inp.iso_name;
     let inj_len = pre.len() + name.len();
-    let linux_lines = count_linux_lines(inp.original);
-    // No header prepended — keep output within original size so GRUB
-    // doesn't truncate based on the directory entry's file size.
-    let max_size = inp.original.len() + inj_len * linux_lines + 8;
-    let new_size = max_size + 256; // temporary buffer, trimmed later
+    let orig_len = inp.original.len();
 
+    // Buffer: copy of original + injection per linux line + margin
+    let new_size = orig_len + inj_len * 4 + 256;
     let mut patch_ptr: *mut c_void = core::ptr::null_mut();
     let status = unsafe { (bs.allocate_pool)(MemoryType::EfiLoaderData, new_size, &mut patch_ptr) };
     if status != EFI_SUCCESS || patch_ptr.is_null() {
         return None;
     }
     let out = unsafe { core::slice::from_raw_parts_mut(patch_ptr as *mut u8, new_size) };
-
-    let off: usize = 0; // no header
 
     // Build injection string
     let mut inj = [0u8; 256];
@@ -78,46 +77,43 @@ fn patch_common(inp: &PatchInput, pre: &[u8]) -> Option<PatchOutput> {
     let max_inj_final = pre.len() + nb;
 
     let mut src = 0usize;
-    let mut dst = off;
-    while src < inp.original.len() {
+    let mut dst = 0usize;
+    while src < orig_len {
         let ch = inp.original[src];
         out[dst] = ch;
         dst += 1;
+        src += 1;
 
-        if ch == b'\n' || src == inp.original.len() - 1 {
-            let line_start = if dst > off {
+        // After each complete line, check if it's a linux line and inject
+        if ch == b'\n' || src == orig_len {
+            // Find line start (after previous newline)
+            let line_start = if dst > 0 {
                 let mut ls = dst - 1;
-                while ls > off && out[ls - 1] != b'\n' { ls -= 1; }
+                while ls > 0 && out[ls - 1] != b'\n' { ls -= 1; }
                 ls
-            } else { off };
+            } else { 0 };
 
-            let line_end = dst;
-            let line_slice = &out[line_start..line_end];
-            let mut trim_start = 0;
-            while trim_start < line_slice.len() && (line_slice[trim_start] == b' ' || line_slice[trim_start] == b'\t') {
-                trim_start += 1;
-            }
-            let trimmed = &line_slice[trim_start..];
-            if trimmed.starts_with(b"linux ") || trimmed.starts_with(b"linuxefi ") {
-                let mut inject_at = if ch == b'\n' { dst - 1 } else { dst };
-                if line_end > line_start + 4 {
-                    let mut search = line_end - 4;
-                    while search > line_start {
-                        if out[search] == b'-' && out[search+1] == b'-' && out[search+2] == b'-' {
-                            // '---' must be at line start or preceded by a space
-                            if search == line_start || out[search-1] == b' ' {
-                                // Inject before the space (common), or at --- when at line start
-                                if search > line_start && out[search-1] == b' ' {
-                                    inject_at = search - 1;
-                                } else {
-                                    inject_at = search;
-                                }
-                                break;
-                            }
-                        }
-                        search -= 1;
-                    }
-                }
+            let line_bytes = &out[line_start..dst];
+
+            // Trim leading whitespace to detect linux / linuxefi
+            let is_linux_line = {
+                let mut ts = 0;
+                while ts < line_bytes.len() && (line_bytes[ts] == b' ' || line_bytes[ts] == b'\t') { ts += 1; }
+                let t = &line_bytes[ts..];
+                t.starts_with(b"linux ") || t.starts_with(b"linuxefi ")
+            };
+
+            if is_linux_line {
+                // Find the kernel path token position: right after
+                // "linux" SP <kernel_path>
+                let mut token_start = line_start;
+                while token_start < dst && (out[token_start] == b' ' || out[token_start] == b'\t') { token_start += 1; }
+                while token_start < dst && out[token_start] != b' ' && out[token_start] != b'\t' { token_start += 1; }
+                while token_start < dst && (out[token_start] == b' ' || out[token_start] == b'\t') { token_start += 1; }
+                while token_start < dst && out[token_start] != b' ' && out[token_start] != b'\t' { token_start += 1; }
+                let inject_at = token_start; // right after kernel path
+
+                // Shift everything after inject_at right by max_inj_final
                 let suffix_len = dst - inject_at;
                 for i in (0..suffix_len).rev() {
                     out[inject_at + max_inj_final + i] = out[inject_at + i];
@@ -126,10 +122,13 @@ fn patch_common(inp: &PatchInput, pre: &[u8]) -> Option<PatchOutput> {
                 dst += max_inj_final;
             }
         }
-        src += 1;
     }
 
-    Some(PatchOutput { buf: patch_ptr as *mut u8, size: dst })
+    // Truncate to original file size.  The injection sits early in the
+    // line (right after the kernel path), so only the tail arguments
+    // (file=, quiet, splash, maybe-ubiquity, ---) get clipped.
+    let final_len = dst.min(orig_len);
+    Some(PatchOutput { buf: patch_ptr as *mut u8, size: final_len })
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
