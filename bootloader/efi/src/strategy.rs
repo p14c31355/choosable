@@ -35,7 +35,12 @@ fn count_linux_lines(data: &[u8]) -> usize {
         let start = pos;
         while pos < data.len() && data[pos] != b'\n' { pos += 1; }
         let line = &data[start..pos];
-        if line.starts_with(b"linux ") || line.starts_with(b"linuxefi ") {
+        let mut trim_start = 0;
+        while trim_start < line.len() && (line[trim_start] == b' ' || line[trim_start] == b'\t') {
+            trim_start += 1;
+        }
+        let trimmed = &line[trim_start..];
+        if trimmed.starts_with(b"linux ") || trimmed.starts_with(b"linuxefi ") {
             count += 1;
         }
         if pos < data.len() { pos += 1; }
