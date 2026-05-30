@@ -346,7 +346,7 @@ unsafe extern "efiapi" fn sfs_open_volume(
         )
     };
     if status != EFI_SUCCESS || ptr.is_null() {
-        return 0x8000_0000_0000_0002; // EFI_OUT_OF_RESOURCES
+        return EFI_OUT_OF_RESOURCES;
     }
 
     let vf = unsafe { &mut *(ptr as *mut VirtualFile) };
