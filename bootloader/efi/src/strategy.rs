@@ -108,9 +108,9 @@ fn patch_common(inp: &PatchInput, pre: &[u8]) -> Option<PatchOutput> {
                 // "linux" SP <kernel_path>
                 let mut token_start = line_start;
                 while token_start < dst && (out[token_start] == b' ' || out[token_start] == b'\t') { token_start += 1; }
-                while token_start < dst && out[token_start] != b' ' && out[token_start] != b'\t' { token_start += 1; }
+                while token_start < dst && out[token_start] != b' ' && out[token_start] != b'\t' && out[token_start] != b'\n' && out[token_start] != b'\r' { token_start += 1; }
                 while token_start < dst && (out[token_start] == b' ' || out[token_start] == b'\t') { token_start += 1; }
-                while token_start < dst && out[token_start] != b' ' && out[token_start] != b'\t' { token_start += 1; }
+                while token_start < dst && out[token_start] != b' ' && out[token_start] != b'\t' && out[token_start] != b'\n' && out[token_start] != b'\r' { token_start += 1; }
                 let inject_at = token_start; // right after kernel path
 
                 // Shift everything after inject_at right by max_inj_final

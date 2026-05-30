@@ -275,6 +275,7 @@ fn find_efi_boot(
 }
 
 /// .CFG candidate entry with path metadata.
+#[derive(Copy, Clone)]
 struct CfgEntry {
     ext_lba: u32, ext_size: u32, dir_sector: u32, dir_offset: u32,
     path: [u8; 64], path_len: usize,
@@ -323,7 +324,8 @@ fn try_patch_candidate(
     let orig = unsafe { core::slice::from_raw_parts(orig_ptr, orig_len as usize) };
 
     // Check for linux/linuxefi line
-    let has_linux = (orig.len() >= 6 && orig.windows(6).any(|w| w == b"linux ")) ||\n        (orig.len() >= 8 && orig.windows(8).any(|w| w == b"linuxefi"));
+    let has_linux = (orig.len() >= 6 && orig.windows(6).any(|w| w == b"linux "))
+        || (orig.len() >= 8 && orig.windows(8).any(|w| w == b"linuxefi"));
 
     if !has_linux {
         unsafe { (bs.free_pool)(orig_ptr as *mut c_void); }
@@ -431,7 +433,7 @@ fn patch_grub_cfg_blockio(
     let mut scratch = [0u8; 2048];
 
     // Collect entries
-    let mut entries: [CfgEntry; 8] = [CfgEntry::default(); 8];
+    let mut entries: [CfgEntry; 8] = unsafe { core::mem::zeroed() };
     let mut entry_count = 0usize;
 
     // Phase 1: Collect from known paths (fast, no recursive scan)

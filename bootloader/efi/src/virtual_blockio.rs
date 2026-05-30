@@ -19,8 +19,8 @@ use core::ffi::c_void;
 use crate::iso_fs::IsoFsInstance;
 use crate::protocol::{
     BlockIoMedia, BlockIoProtocol, BootServices, MemoryType, SystemTable, VirtualBlockIo,
-    EFI_SUCCESS, BLOCK_IO_PROTOCOL_GUID, DEVICE_PATH_PROTOCOL_GUID,
-    SIMPLE_FILE_SYSTEM_PROTOCOL_GUID,
+    EFI_SUCCESS, EFI_BAD_BUFFER_SIZE, EFI_DEVICE_ERROR, BLOCK_IO_PROTOCOL_GUID,
+    DEVICE_PATH_PROTOCOL_GUID, SIMPLE_FILE_SYSTEM_PROTOCOL_GUID,
 };
 
 /// ReadBlocks implementation for the virtual CD-ROM.
@@ -34,7 +34,7 @@ unsafe extern "efiapi" fn vblock_read(
     let vbio = &*(this as *const VirtualBlockIo);
 
     if buffer_size % 2048 != 0 {
-        return 0x8000_0000_0000_0004; // EFI_BAD_BUFFER_SIZE
+        return EFI_BAD_BUFFER_SIZE;
     }
 
     let num_blocks = buffer_size / 2048;
@@ -58,7 +58,7 @@ unsafe extern "efiapi" fn vblock_read(
                 )
             };
             if status != EFI_SUCCESS {
-                return 0x8000_0000_0000_0002;
+                return EFI_DEVICE_ERROR;
             }
             // Overwrite the Extent LBA (offset +2) and Data Length (offset +10)
             let entry = &mut dst[block_offset..block_offset + 2048];
@@ -96,7 +96,7 @@ unsafe extern "efiapi" fn vblock_read(
                 )
             };
             if status != EFI_SUCCESS {
-                return 0x8000_0000_0000_0002;
+                return EFI_DEVICE_ERROR;
             }
         }
     }
