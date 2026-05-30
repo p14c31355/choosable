@@ -55,7 +55,15 @@ fn count_linux_lines(data: &[u8]) -> usize {
 pub struct CasperStrategy;
 
 impl BootStrategy for CasperStrategy {
-    fn detect(&self, _ctx: &IsoFsCtx) -> bool { true }
+    fn detect(&self, ctx: &IsoFsCtx) -> bool {
+        let name = &ctx.iso_name[..ctx.iso_name_len];
+        let lower = |b: u8| b | 0x20;
+        // Ubuntu / Mint / Pop!_OS / Debian-live
+        name.windows(6).any(|w| lower(w[0]) == b'u' && lower(w[1]) == b'b' && lower(w[2]) == b'u' && lower(w[3]) == b'n' && lower(w[4]) == b't' && w[5] == b'u')
+            || name.windows(4).any(|w| lower(w[0]) == b'm' && lower(w[1]) == b'i' && lower(w[2]) == b'n' && w[3] == b't')
+            || name.windows(6).any(|w| lower(w[0]) == b'd' && lower(w[1]) == b'e' && lower(w[2]) == b'b' && lower(w[3]) == b'i' && lower(w[4]) == b'a' && w[5] == b'n')
+            || name.windows(3).any(|w| lower(w[0]) == b'p' && lower(w[1]) == b'o' && w[2] == b'p')
+    }
 
     fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> {
         let bs = unsafe { &mut *inp.bs };
@@ -154,7 +162,14 @@ unsafe impl Sync for CasperStrategy {}
 pub struct LiveOSStrategy;
 
 impl BootStrategy for LiveOSStrategy {
-    fn detect(&self, _ctx: &IsoFsCtx) -> bool { true }
+    fn detect(&self, ctx: &IsoFsCtx) -> bool {
+        let name = &ctx.iso_name[..ctx.iso_name_len];
+        let lower = |b: u8| b | 0x20;
+        // Fedora / RHEL / CentOS
+        name.windows(6).any(|w| lower(w[0]) == b'f' && lower(w[1]) == b'e' && lower(w[2]) == b'd' && lower(w[3]) == b'o' && lower(w[4]) == b'r' && w[5] == b'a')
+            || name.windows(4).any(|w| lower(w[0]) == b'r' && lower(w[1]) == b'h' && lower(w[2]) == b'e' && w[3] == b'l')
+            || name.windows(6).any(|w| lower(w[0]) == b'c' && lower(w[1]) == b'e' && lower(w[2]) == b'n' && lower(w[3]) == b't' && lower(w[4]) == b'o' && w[5] == b's')
+    }
 
     fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> {
         let bs = unsafe { &mut *inp.bs };

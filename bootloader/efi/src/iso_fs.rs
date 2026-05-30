@@ -18,7 +18,7 @@ use crate::protocol::{
     BlockIoProtocol, BootServices, FileProtocol, SimpleFileSystemProtocol,
     EfiFileInfo, EfiTime, Guid, SystemTable,
     EFI_SUCCESS, EFI_NOT_FOUND, EFI_INVALID_PARAMETER,
-    EFI_UNSUPPORTED, EFI_BAD_BUFFER_SIZE,
+    EFI_UNSUPPORTED, EFI_BAD_BUFFER_SIZE, EFI_DEVICE_ERROR,
     EFI_WRITE_PROTECTED, FILE_INFO_GUID, EFI_OUT_OF_RESOURCES,
 };
 
@@ -767,13 +767,164 @@ unsafe extern "efiapi" fn file_read_file(
     EFI_SUCCESS
 }
 
-/// Read from a directory — not supported (return error).
+/// Read directory entries as EFI_FILE_INFO structures.
 unsafe extern "efiapi" fn file_read_dir(
-    _this: *mut FileProtocol,
-    _buffer_size: *mut usize,
-    _buffer: *mut c_void,
+    this: *mut FileProtocol,
+    buffer_size: *mut usize,
+    buffer: *mut c_void,
 ) -> usize {
-    EFI_UNSUPPORTED
+    if buffer_size.is_null() || buffer.is_null() {
+        return EFI_INVALID_PARAMETER;
+    }
+
+    let vf = unsafe { &mut *(this as *mut VirtualFile) };
+    if !vf.is_dir {
+        return EFI_UNSUPPORTED;
+    }
+
+    let ctx = unsafe { &*vf.ctx };
+    let buf_sz = unsafe { *buffer_size };
+    let dst = unsafe { core::slice::from_raw_parts_mut(buffer as *mut u8, buf_sz) };
+
+    // We use `position` to track which ISO sector we're on (high 32 bits = sector offset within dir, low 32 bits = byte offset within sector)
+    let dir_size = vf.extent_size;
+    let total_sectors = ((dir_size as u64 + 2047) / 2048) as u32;
+
+    let mut scratch = [0u8; 2048];
+    let mut dst_off = 0usize;
+    let mut finished = false;
+
+    // The position tracks: (sector_index << 16) | byte_offset_within_sector
+    let mut sector_idx = (vf.position >> 16) as u32;
+    let mut byte_offset = (vf.position & 0xFFFF) as usize;
+
+    if sector_idx >= total_sectors {
+        // End of directory
+        unsafe { *buffer_size = 0; }
+        return EFI_SUCCESS;
+    }
+
+    // Read the current sector
+    if !read_iso_sector(ctx, vf.extent_lba + sector_idx, &mut scratch) {
+        return EFI_DEVICE_ERROR;
+    }
+
+    while !finished && dst_off + core::mem::size_of::<EfiFileInfo>() + 2 <= buf_sz {
+        // If we've exhausted this sector, move to next
+        if byte_offset + 34 > 2048 || (byte_offset > 0 && scratch[byte_offset] == 0) {
+            sector_idx += 1;
+            byte_offset = 0;
+            if sector_idx >= total_sectors {
+                finished = true;
+                break;
+            }
+            if !read_iso_sector(ctx, vf.extent_lba + sector_idx, &mut scratch) {
+                // Save position before returning error
+                vf.position = ((sector_idx as u64) << 16) | (byte_offset as u64);
+                return EFI_DEVICE_ERROR;
+            }
+            // If first byte of new sector is 0, directory ends
+            if scratch[0] == 0 {
+                finished = true;
+                break;
+            }
+        }
+
+        let record_len = scratch[byte_offset] as usize;
+        if record_len == 0 {
+            // Skip to next sector
+            sector_idx += 1;
+            byte_offset = 0;
+            if sector_idx >= total_sectors {
+                finished = true;
+                break;
+            }
+            if !read_iso_sector(ctx, vf.extent_lba + sector_idx, &mut scratch) {
+                vf.position = ((sector_idx as u64) << 16) | (byte_offset as u64);
+                return EFI_DEVICE_ERROR;
+            }
+            continue;
+        }
+
+        if byte_offset + record_len > 2048 {
+            finished = true;
+            break;
+        }
+
+        let name_len = scratch[byte_offset + 32] as usize;
+        let name_offset = byte_offset + 33;
+        if name_offset + name_len > 2048 {
+            finished = true;
+            break;
+        }
+
+        // Build ISO name (ASCII, strip ;1 suffix)
+        let iso_name = &scratch[name_offset..name_offset + name_len];
+        let ef_len = iso_name_effective_len(iso_name, name_len);
+
+        // Get file info
+        let child_extent = u32::from_le_bytes(scratch[byte_offset + 2..byte_offset + 6].try_into().unwrap());
+        let child_size = u32::from_le_bytes(scratch[byte_offset + 10..byte_offset + 14].try_into().unwrap());
+        let flags = scratch[byte_offset + 25];
+        let is_dir = flags & 0x02 != 0;
+
+        // Convert ISO name to UCS-2 for EFI_FILE_INFO
+        let ucs2_name_len = ef_len; // number of UCS-2 characters (excluding null terminator)
+        let required_size = core::mem::size_of::<EfiFileInfo>() + (ucs2_name_len + 1) * 2;
+        // (ucs2_name_len + 1) for null terminator, * 2 for u16 size
+
+        if dst_off + required_size > buf_sz {
+            // Not enough space — return what we have
+            break;
+        }
+
+        let ct: EfiTime = unsafe { core::mem::zeroed() };
+        let lat: EfiTime = unsafe { core::mem::zeroed() };
+        let mt: EfiTime = unsafe { core::mem::zeroed() };
+        let info = EfiFileInfo {
+            size: required_size as u64,
+            file_size: child_size as u64,
+            physical_size: child_size as u64,
+            create_time: ct,
+            last_access_time: lat,
+            modification_time: mt,
+            attribute: if is_dir { 1 } else { 0 }, // EFI_FILE_DIRECTORY = 1
+        };
+
+        // Copy EfiFileInfo header
+        let info_bytes = unsafe {
+            core::slice::from_raw_parts(
+                &info as *const EfiFileInfo as *const u8,
+                core::mem::size_of::<EfiFileInfo>(),
+            )
+        };
+        dst[dst_off..dst_off + info_bytes.len()].copy_from_slice(info_bytes);
+        dst_off += info_bytes.len();
+
+        // Write UCS-2 filename
+        for j in 0..ef_len {
+            let ch = iso_name[j] as u16;
+            dst[dst_off] = ch as u8;
+            dst[dst_off + 1] = (ch >> 8) as u8;
+            dst_off += 2;
+        }
+        // Null terminator
+        dst[dst_off] = 0;
+        dst[dst_off + 1] = 0;
+        dst_off += 2;
+
+        // Advance to next record
+        byte_offset += record_len;
+        vf.position = ((sector_idx as u64) << 16) | (byte_offset as u64);
+    }
+
+    if finished {
+        // Mark position beyond end so next call returns 0
+        vf.position = ((total_sectors as u64) << 16) | 0x10000;
+    }
+
+    unsafe { *buffer_size = dst_off; }
+    EFI_SUCCESS
 }
 
 /// Write — read-only media
