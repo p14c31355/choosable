@@ -259,10 +259,8 @@ fn try_patch_candidate(
     let orig = unsafe { core::slice::from_raw_parts(orig_ptr, orig_len as usize) };
 
     // Check for linux/linuxefi line
-        let has_linux = (orig.len() >= 6 && orig.windows(6).any(|w| w == b"linux "))
-        || (orig.len() >= 9 && orig.windows(9).any(|w| w == b"linuxefi "))
-        || (orig.len() >= 7 && orig.windows(7).any(|w| w == b"linux\\t"))
-        || (orig.len() >= 9 && orig.windows(9).any(|w| w == b"linuxefi\\t"));
+        let has_linux = (orig.len() >= 6 && orig.windows(6).any(|w| w == b"linux " || w == b"linux\t"))
+        || (orig.len() >= 9 && orig.windows(9).any(|w| w == b"linuxefi " || w == b"linuxefi\t"));
     if !has_linux {
         unsafe { (bs.free_pool)(orig_ptr as *mut c_void); }
         return false;
