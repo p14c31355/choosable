@@ -844,7 +844,7 @@ unsafe extern "efiapi" fn file_get_info(
     let buf_sz = unsafe { *buffer_size };
     if buf_sz < required_size {
         unsafe { *buffer_size = required_size; }
-        return EFI_BAD_BUFFER_SIZE;
+        return crate::protocol::EFI_BUFFER_TOO_SMALL;
     }
 
     // Allow NULL buffer for size-query pattern (standard UEFI convention)
