@@ -541,7 +541,7 @@ fn recursive_find_cfg_with_loc(
     for s in 0..total_sectors {
         if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, dir_lba + s, scratch) { return; }
         let mut offset: usize = 0;
-        while offset + 34 <= 2048 {
+        while offset + 34 <= 2048 && offset < (dir_size as usize).saturating_sub(s as usize * 2048) {
             let record_len = scratch[offset] as usize;
             if record_len == 0 { break; }
             if offset + record_len > 2048 { break; }
