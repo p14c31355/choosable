@@ -185,8 +185,9 @@ pub fn create_virtual_cdrom(
         )
     };
     if dp_status2 != EFI_SUCCESS {
-        // Non-fatal — BlockIO is installed, just no device path
-        // Keep dp_ptr allocated (can't free it after installing on handle)
+        // Non-fatal — BlockIO is installed, but device path failed.
+        // Free dp_ptr since it wasn't claimed by the handle.
+        unsafe { (bs.free_pool)(dp_ptr); }
     }
 
     Some((new_handle, dp_ptr))

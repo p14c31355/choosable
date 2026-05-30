@@ -56,31 +56,39 @@ pub fn read_partitions() -> ([Partition; 4], usize) {
                     0x26, 0x99, 0xC7,
                 ];
                 let mut sec = [0u8; 512];
-                if ata_read_sector(entries_lba, &mut sec) {
-                    let max = (512 / sz as usize).min(n as usize).min(128);
-                    for i in 0..max {
-                        let eoff = i * sz as usize;
-                        if eoff + 48 > 512 {
+                let mut current_lba: u64 = 0;
+                let mut loaded = false;
+                for i in 0..n.min(128) {
+                    let eoff = i as usize * sz as usize;
+                    let lba = entries_lba + (eoff / 512) as u64;
+                    let boff = eoff % 512;
+                    if boff + 48 > 512 {
+                        continue;
+                    }
+                    if !loaded || lba != current_lba {
+                        if !ata_read_sector(lba, &mut sec) {
                             break;
                         }
-                        if sec[eoff..eoff + 16] == basic_data {
-                            let start_lba = u64::from_le_bytes(
-                                sec[eoff + 32..eoff + 40].try_into().unwrap(),
-                            );
-                            let end_lba = u64::from_le_bytes(
-                                sec[eoff + 40..eoff + 48].try_into().unwrap(),
-                            );
-                            let sectors = (end_lba + 1).saturating_sub(start_lba);
-                            if sectors > 0 {
-                                parts[count] = Partition {
-                                    start_lba: start_lba as u32,
-                                    sector_count: sectors as u32,
-                                    fs_type: 0x07,
-                                };
-                                count += 1;
-                            }
-                            break;
+                        current_lba = lba;
+                        loaded = true;
+                    }
+                    if sec[boff..boff + 16] == basic_data {
+                        let start_lba = u64::from_le_bytes(
+                            sec[boff + 32..boff + 40].try_into().unwrap(),
+                        );
+                        let end_lba = u64::from_le_bytes(
+                            sec[boff + 40..boff + 48].try_into().unwrap(),
+                        );
+                        let sectors = (end_lba + 1).saturating_sub(start_lba);
+                        if sectors > 0 {
+                            parts[count] = Partition {
+                                start_lba: start_lba as u32,
+                                sector_count: sectors as u32,
+                                fs_type: 0x07,
+                            };
+                            count += 1;
                         }
+                        break;
                     }
                 }
             }
