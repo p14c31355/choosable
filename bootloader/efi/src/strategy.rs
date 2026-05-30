@@ -59,10 +59,10 @@ impl BootStrategy for CasperStrategy {
         let name = &ctx.iso_name[..ctx.iso_name_len];
         let lower = |b: u8| b | 0x20;
         // Ubuntu / Mint / Pop!_OS / Debian-live
-        name.windows(6).any(|w| lower(w[0]) == b'u' && lower(w[1]) == b'b' && lower(w[2]) == b'u' && lower(w[3]) == b'n' && lower(w[4]) == b't' && w[5] == b'u')
-            || name.windows(4).any(|w| lower(w[0]) == b'm' && lower(w[1]) == b'i' && lower(w[2]) == b'n' && w[3] == b't')
-            || name.windows(6).any(|w| lower(w[0]) == b'd' && lower(w[1]) == b'e' && lower(w[2]) == b'b' && lower(w[3]) == b'i' && lower(w[4]) == b'a' && w[5] == b'n')
-            || name.windows(3).any(|w| lower(w[0]) == b'p' && lower(w[1]) == b'o' && w[2] == b'p')
+        name.windows(6).any(|w| lower(w[0]) == b'u' && lower(w[1]) == b'b' && lower(w[2]) == b'u' && lower(w[3]) == b'n' && lower(w[4]) == b't' && lower(w[5]) == b'u')
+            || name.windows(4).any(|w| lower(w[0]) == b'm' && lower(w[1]) == b'i' && lower(w[2]) == b'n' && lower(w[3]) == b't')
+            || name.windows(6).any(|w| lower(w[0]) == b'd' && lower(w[1]) == b'e' && lower(w[2]) == b'b' && lower(w[3]) == b'i' && lower(w[4]) == b'a' && lower(w[5]) == b'n')
+            || name.windows(3).any(|w| lower(w[0]) == b'p' && lower(w[1]) == b'o' && lower(w[2]) == b'p')
     }
 
     fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> {
