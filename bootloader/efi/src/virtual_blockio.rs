@@ -16,6 +16,7 @@
 
 use core::ffi::c_void;
 
+use crate::iso_fs::IsoFsInstance;
 use crate::protocol::{
     BlockIoMedia, BlockIoProtocol, BootServices, MemoryType, SystemTable, VirtualBlockIo,
     EFI_SUCCESS, BLOCK_IO_PROTOCOL_GUID, DEVICE_PATH_PROTOCOL_GUID,
@@ -105,7 +106,7 @@ unsafe extern "efiapi" fn vblock_read(
 
 /// Create a virtual Block I/O + Device Path handle representing ISO as CD-ROM.
 ///
-/// Returns `(handle, device_path_ptr, vbio_ptr)`.  All three must NOT be freed.
+/// Returns `(handle, device_path_ptr, vbio_ptr, sfs_instance)`.  All must NOT be freed.
 pub fn create_virtual_cdrom(
     bs: &mut BootServices,
     st: *mut SystemTable,
@@ -114,7 +115,7 @@ pub fn create_virtual_cdrom(
     real_media_id: u32,
     iso_size_bytes: u64,
     iso_name: &[u8],
-) -> Option<(*mut c_void, *mut c_void, *mut VirtualBlockIo)> {
+) -> Option<(*mut c_void, *mut c_void, *mut VirtualBlockIo, *mut IsoFsInstance)> {
     // ═════════════════════════════════════════════════════════════
     // 1. Build CD-ROM DevicePath
     // ═════════════════════════════════════════════════════════════
@@ -254,5 +255,5 @@ pub fn create_virtual_cdrom(
     }
 
     let vbio_ptr = vbio as *mut VirtualBlockIo;
-    Some((new_handle, dp_ptr, vbio_ptr))
+    Some((new_handle, dp_ptr, vbio_ptr, iso_fs_instance))
 }

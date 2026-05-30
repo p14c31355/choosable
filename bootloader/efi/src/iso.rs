@@ -308,6 +308,7 @@ fn try_patch_candidate(
     st: &mut SystemTable,
     bs: &mut BootServices,
     vb: &mut VirtualBlockIo,
+    sfs_instance: *mut crate::iso_fs::IsoFsInstance,
     bio_ref: &BlockIoProtocol,
     bio_ptr: *mut BlockIoProtocol,
     mid: u32,
@@ -343,6 +344,9 @@ fn try_patch_candidate(
         bs: bs as *mut BootServices,
         st: core::ptr::null_mut(),
         iso_name: iso_name_arr, iso_name_len: nlen,
+        old_extent: 0, old_size: 0,
+        new_extent: 0, new_size: 0,
+        redirect_active: false,
     };
 
     let patch = strategy::patch_grub_cfg(&ctx, orig, bs as *mut BootServices);
@@ -376,6 +380,16 @@ fn try_patch_candidate(
     vb.dir_entry_patched = true;
     vb.media.bim_lb = orig_end_sector + vb.patched_file_sectors as u64 - 1;
 
+    // Also set SFS redirect so SimpleFileSystem sees the patched file
+    if !sfs_instance.is_null() {
+        let sfs = unsafe { &mut *sfs_instance };
+        sfs.ctx.old_extent = ext_lba;
+        sfs.ctx.old_size = ext_size;
+        sfs.ctx.new_extent = vb.patched_file_sector;
+        sfs.ctx.new_size = patched_size as u32;
+        sfs.ctx.redirect_active = true;
+    }
+
     print_raw(st, b"[grub.cfg] PATCHED OK: orig=\0");
     let mut nbuf = [0u8; 16];
     let mut nv = orig_len as u64; let mut np = 15;
@@ -400,6 +414,7 @@ fn patch_grub_cfg_blockio(
     st: &mut SystemTable,
     bs: &mut BootServices,
     vbio: *mut VirtualBlockIo,
+    sfs_instance: *mut crate::iso_fs::IsoFsInstance,
     bio_ref: &BlockIoProtocol,
     bio_ptr: *mut BlockIoProtocol,
     mid: u32,
@@ -498,7 +513,7 @@ fn patch_grub_cfg_blockio(
         print_raw(st, &path[..path_len]);
         print_raw(st, b"...\r\n\0");
 
-        if try_patch_candidate(st, bs, vb, bio_ref, bio_ptr, mid, iso_lba, iso_name,
+        if try_patch_candidate(st, bs, vb, sfs_instance, bio_ref, bio_ptr, mid, iso_lba, iso_name,
             ext_lba, ext_size, dir_sector, dir_offset) {
             return;
         }
@@ -769,18 +784,16 @@ fn uefi_chainload_iso(
     let cdrom_tuple = crate::virtual_blockio::create_virtual_cdrom(
         bs, st as *mut SystemTable, iso_lba, bio_ptr, mid, iso_size, iso_name,
     );
-    let (device_handle, cdrom_dp, vbio_ptr) = match cdrom_tuple {
-        Some((h, dp, vb)) => (h, dp, vb),
+    let (device_handle, cdrom_dp, vbio_ptr, sfs_instance) = match cdrom_tuple {
+        Some((h, dp, vb, sfs)) => (h, dp, vb, sfs),
         None => {
             print_raw(st, b"ERROR: Failed to create virtual CD-ROM.\r\n\0");
             return;
         }
     };
 
-    // ── Patch grub.cfg at BlockIO level ─────────────────────────
-    // GRUB reads grub.cfg via BlockIO (ISO9660 driver), not SimpleFileSystem.
-    // We need to intercept sector reads so iso-scan/filename= is visible.
-    patch_grub_cfg_blockio(st, bs, vbio_ptr, bio_ref, bio_ptr, mid, iso_lba, iso_name);
+    // ── Patch grub.cfg at BlockIO+SFS level ────────────────────
+    patch_grub_cfg_blockio(st, bs, vbio_ptr, sfs_instance, bio_ref, bio_ptr, mid, iso_lba, iso_name);
 
     let (efi_lba, efi_size) = match find_efi_boot(st, bio_ref, bio_ptr, mid, iso_lba) {
         Some(v) => v,
