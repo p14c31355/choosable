@@ -472,13 +472,10 @@ pub fn show_menu(
         }
         let ch = if k.uc >= 0x20 && k.uc < 0x7F {
             k.uc as u8
+        } else if k.uc == 0x0D || k.uc == 0x0A {
+            b'\n'
         } else {
-            match k.sc {
-                0x1C => b'\n',
-                0x13 => b'r',
-                0x1F => b'R',
-                _ => 0x00,
-            }
+            0x00
         };
         if (b'1'..=b'9').contains(&ch) {
             let idx = (ch - b'1') as usize;
