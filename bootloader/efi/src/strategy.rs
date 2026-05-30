@@ -60,7 +60,8 @@ fn patch_common(inp: &PatchInput, pre: &[u8]) -> Option<PatchOutput> {
     let orig_len = inp.original.len();
 
     // Buffer: copy of original + injection per linux line + margin
-    let new_size = orig_len + inj_len * 4 + 256;
+    let linux_lines = count_linux_lines(inp.original);
+    let new_size = orig_len + inj_len * linux_lines + 256;
     let mut patch_ptr: *mut c_void = core::ptr::null_mut();
     let status = unsafe { (bs.allocate_pool)(MemoryType::EfiLoaderData, new_size, &mut patch_ptr) };
     if status != EFI_SUCCESS || patch_ptr.is_null() {
