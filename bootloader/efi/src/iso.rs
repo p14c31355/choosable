@@ -384,6 +384,7 @@ fn uefi_chainload_iso(
         }
     } else {
         print_raw(st, b"ERROR: LoadImage failed.\r\n\0");
+        unsafe { (bs.free_pool)(device_path); }
         return;
     }
 
