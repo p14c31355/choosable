@@ -179,71 +179,6 @@ fn find_in_dir_with_loc(
     None
 }
 
-/// Search an ISO9660 directory extent for a child by name (case-insensitive).
-/// Returns (child_extent_lba, child_size_in_bytes) or None.
-fn _find_in_dir(
-    bio_ref: &BlockIoProtocol,
-    bio_ptr: *mut BlockIoProtocol,
-    mid: u32,
-    iso_lba: u64,
-    dir_lba: u32,
-    dir_size: u32,
-    name: &[u8],
-    scratch: &mut [u8; 2048],
-) -> Option<(u32, u32)> {
-    let total_sectors = ((dir_size as u64 + 2047) / 2048) as u32;
-    for s in 0..total_sectors {
-        if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, dir_lba + s, scratch) {
-            return None;
-        }
-        let mut offset: usize = 0;
-        // ISO9660 directory record layout (minimum 34 bytes):
-        //   +0  len (1)
-        //   +2  extent LE (4)
-        //   +10 size LE (4)
-        //   +32 name_len (1)
-        //   +33 name (variable)
-        while offset + 34 <= 2048 && offset < dir_size as usize {
-            let record_len = scratch[offset] as usize;
-            if record_len == 0 {
-                break;
-            }
-            if offset + record_len > 2048 {
-                break;
-            }
-            let name_len = scratch[offset + 32] as usize;
-            let name_offset = offset + 33;
-            if name_offset + name_len > 2048 {
-                break;
-            }
-            // ISO9660 names may have ";1" version suffix — strip it
-            let effective_len = if name_len >= 2 && scratch[name_offset + name_len - 2] == b';' {
-                name_len - 2
-            } else {
-                name_len
-            };
-            if effective_len == name.len() {
-                let mut matched = true;
-                for i in 0..name.len() {
-                    let a = scratch[name_offset + i].to_ascii_uppercase();
-                    let b = name[i].to_ascii_uppercase();
-                    if a != b {
-                        matched = false;
-                        break;
-                    }
-                }
-                if matched {
-                    let child_extent = u32::from_le_bytes(scratch[offset + 2..offset + 6].try_into().unwrap());
-                    let child_size = u32::from_le_bytes(scratch[offset + 10..offset + 14].try_into().unwrap());
-                    return Some((child_extent, child_size));
-                }
-            }
-            offset += record_len;
-        }
-    }
-    None
-}
-
 /// Resolve path "/EFI/BOOT/BOOTX64.EFI" within the ISO directory tree.
 fn find_efi_boot(
     st: &mut SystemTable,
@@ -468,6 +403,7 @@ fn patch_grub_cfg_blockio(
         recursive_find_cfg_with_loc(
             bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size,
             &mut scratch, &mut raw_entries, &mut raw_count,
+            0,
         );
         for i in 0..raw_count {
             let (ext_lba, ext_size, dir_sector, dir_offset) = raw_entries[i];
@@ -535,7 +471,9 @@ fn recursive_find_cfg_with_loc(
     scratch: &mut [u8; 2048],
     entries: &mut [(u32, u32, u32, u32); 32],
     entry_count: &mut usize,
+    depth: usize,
 ) {
+    if depth > 16 { return; }
     if *entry_count >= 32 { return; }
     let total_sectors = ((dir_size as u64 + 2047) / 2048) as u32;
     for s in 0..total_sectors {
@@ -588,86 +526,6 @@ fn recursive_find_cfg_with_loc(
                         entries, entry_count,
                         depth + 1,
                     );
-                    // Re-read parent directory sector: recursive call
-                    // overwrote scratch with subdirectory data.
-                    if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, dir_lba + s, scratch) {
-                        return;
-                    }
-                }
-            }
-            offset += record_len;
-        }
-    }
-}
-
-/// Recursively walk ISO9660 directories to find any file ending in `.CFG`.
-fn recursive_find_cfg(
-    bio_ref: &BlockIoProtocol,
-    bio_ptr: *mut BlockIoProtocol,
-    mid: u32,
-    iso_lba: u64,
-    dir_lba: u32,
-    dir_size: u32,
-    scratch: &mut [u8; 2048],
-    candidates: &mut [Option<(u32, u32)>; 32],
-    cand_count: &mut usize,
-) {
-    let total_sectors = ((dir_size as u64 + 2047) / 2048) as u32;
-    for s in 0..total_sectors {
-        if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, dir_lba + s, scratch) {
-            return;
-        }
-        let mut offset: usize = 0;
-        while offset + 34 <= 2048 && offset < (dir_size as usize).saturating_sub(s as usize * 2048) {
-            let record_len = scratch[offset] as usize;
-            if record_len == 0 {
-                break;
-            }
-            if offset + record_len > 2048 {
-                break;
-            }
-            let name_len = scratch[offset + 32] as usize;
-            let name_offset = offset + 33;
-            if name_offset + name_len > 2048 {
-                break;
-            }
-            let flags = scratch[offset + 25];
-            let is_dir = flags & 0x02 != 0;
-            let extent = u32::from_le_bytes(scratch[offset + 2..offset + 6].try_into().unwrap());
-            let size = u32::from_le_bytes(scratch[offset + 10..offset + 14].try_into().unwrap());
-
-            // Skip "." and ".."
-            let skip = if name_len == 1 && scratch[name_offset] == 0 { true }
-                else if name_len == 1 && scratch[name_offset] == 1 { true }
-                else { false };
-
-            if !skip {
-                // Check if name ends with ".CFG" (case-insensitive, strip ";1")
-                let eff_len = if name_len >= 2 && scratch[name_offset + name_len - 2] == b';' {
-                    name_len - 2
-                } else {
-                    name_len
-                };
-                let has_cfg = eff_len >= 4 && {
-                    let ofs = name_offset + eff_len - 4;
-                    (scratch[ofs] | 0x20) == b'.' && (scratch[ofs+1] | 0x20) == b'c'
-                        && (scratch[ofs+2] | 0x20) == b'f' && (scratch[ofs+3] | 0x20) == b'g'
-                };
-                if has_cfg && !is_dir && *cand_count < 32 {
-                    // Check for duplicates
-                    let mut dup = false;
-                    for j in 0..*cand_count {
-                        if let Some((l, _)) = candidates[j] { if l == extent { dup = true; break; } }
-                    }
-                    if !dup {
-                        candidates[*cand_count] = Some((extent, size));
-                        *cand_count += 1;
-                    }
-                }
-
-                // Recurse into subdirectories
-                if is_dir && extent != dir_lba {
-                    recursive_find_cfg(bio_ref, bio_ptr, mid, iso_lba, extent, size, scratch, candidates, cand_count);
                     // Re-read parent directory sector: recursive call
                     // overwrote scratch with subdirectory data.
                     if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, dir_lba + s, scratch) {

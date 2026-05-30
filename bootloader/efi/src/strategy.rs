@@ -101,7 +101,8 @@ fn patch_common(inp: &PatchInput, pre: &[u8]) -> Option<PatchOutput> {
                 let mut ts = 0;
                 while ts < line_bytes.len() && (line_bytes[ts] == b' ' || line_bytes[ts] == b'\t') { ts += 1; }
                 let t = &line_bytes[ts..];
-                t.starts_with(b"linux ") || t.starts_with(b"linuxefi ")
+                (t.starts_with(b"linux ") || t.starts_with(b"linuxefi "))
+                    && !line_bytes.windows(18).any(|w| w == b"iso-scan/filename=")
             };
 
             if is_linux_line {
