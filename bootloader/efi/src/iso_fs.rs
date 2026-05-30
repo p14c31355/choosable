@@ -869,10 +869,9 @@ unsafe extern "efiapi" fn file_read_dir(
         let is_dir = flags & 0x02 != 0;
 
         // Convert ISO name to UCS-2 for EFI_FILE_INFO
-        let ucs2_name_len = ef_len; // number of UCS-2 characters (excluding null terminator)
-        let required_size = core::mem::size_of::<EfiFileInfo>() + (ucs2_name_len + 1) * 2;
-        // (ucs2_name_len + 1) for null terminator, * 2 for u16 size
-
+        let ucs2_name_len = ef_len;
+        let raw_size = core::mem::size_of::<EfiFileInfo>() + (ucs2_name_len + 1) * 2;
+        let required_size = (raw_size + 7) & !7;
         if dst_off + required_size > buf_sz {
             // Not enough space — return what we have
             break;
