@@ -109,16 +109,19 @@ impl BootStrategy for CasperStrategy {
 
                 let line_end = dst;
                 let line_slice = &out[line_start..line_end];
-                if line_slice.starts_with(b"linux ") || line_slice.starts_with(b"linuxefi ") {
+                // Trim leading whitespace — linux/linuxefi lines are often indented
+                let mut trim_start = 0;
+                while trim_start < line_slice.len() && (line_slice[trim_start] == b' ' || line_slice[trim_start] == b'\t') {
+                    trim_start += 1;
+                }
+                let trimmed = &line_slice[trim_start..];
+                if trimmed.starts_with(b"linux ") || trimmed.starts_with(b"linuxefi ") {
                     // Find injection point: before "---" if present, else at end
-                    let mut inject_at = if ch == b'\n' { dst - 1 } else { dst }; // default: before final char (\n or last byte)
-                    // Walk backward to find "---" preceded by space or BOL
+                    let mut inject_at = if ch == b'\n' { dst - 1 } else { dst };
                     if line_end > line_start + 4 {
                         let mut search = line_end - 4;
                         while search > line_start {
                             if out[search] == b'-' && out[search+1] == b'-' && out[search+2] == b'-' {
-                                // "---" at [search..search+3]
-                                // Check it's preceded by space or start of args
                                 if search == line_start || out[search-1] == b' ' {
                                     inject_at = search;
                                     break;
@@ -127,14 +130,11 @@ impl BootStrategy for CasperStrategy {
                             search -= 1;
                         }
                     }
-                    // Save the suffix from inject_at to dst
-                    let suffix_start = inject_at;
-                    let suffix_len = dst - suffix_start;
-                    // Shift suffix right by max_inj_final, then copy injection
+                    let suffix_len = dst - inject_at;
                     for i in (0..suffix_len).rev() {
-                        out[suffix_start + max_inj_final + i] = out[suffix_start + i];
+                        out[inject_at + max_inj_final + i] = out[inject_at + i];
                     }
-                    out[suffix_start..suffix_start + max_inj_final].copy_from_slice(&inj[..max_inj_final]);
+                    out[inject_at..inject_at + max_inj_final].copy_from_slice(&inj[..max_inj_final]);
                     dst += max_inj_final;
                 }
             }
@@ -196,8 +196,13 @@ impl BootStrategy for LiveOSStrategy {
                 } else { off };
                 let line_end = dst;
                 let line_slice = &out[line_start..line_end];
-                if line_slice.starts_with(b"linux ") || line_slice.starts_with(b"linuxefi ") {
-                    // Find injection point: before "---" if present, else at end
+                // Trim leading whitespace — linux/linuxefi lines are often indented
+                let mut trim_start = 0;
+                while trim_start < line_slice.len() && (line_slice[trim_start] == b' ' || line_slice[trim_start] == b'\t') {
+                    trim_start += 1;
+                }
+                let trimmed = &line_slice[trim_start..];
+                if trimmed.starts_with(b"linux ") || trimmed.starts_with(b"linuxefi ") {
                     let mut inject_at = if ch == b'\n' { dst - 1 } else { dst };
                     if line_end > line_start + 4 {
                         let mut search = line_end - 4;

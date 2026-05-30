@@ -87,23 +87,16 @@ fn read_iso_sector(
 ) -> bool {
     let disk_lba = ctx.iso_lba + iso_sector as u64 * 4;
     let bio_ref = unsafe { &*ctx.real_bio_ptr };
-    for i in 0..4usize {
-        let mut sec = [0u8; 512];
-        let status = unsafe {
-            (bio_ref.read_blocks)(
-                ctx.real_bio_ptr,
-                ctx.real_media_id,
-                disk_lba + i as u64,
-                512,
-                sec.as_mut_ptr() as *mut c_void,
-            )
-        };
-        if status != EFI_SUCCESS {
-            return false;
-        }
-        buf[i * 512..(i + 1) * 512].copy_from_slice(&sec);
-    }
-    true
+    let status = unsafe {
+        (bio_ref.read_blocks)(
+            ctx.real_bio_ptr,
+            ctx.real_media_id,
+            disk_lba,
+            2048,
+            buf.as_mut_ptr() as *mut c_void,
+        )
+    };
+    status == EFI_SUCCESS
 }
 
 /// Read raw bytes from an ISO extent into a buffer.
