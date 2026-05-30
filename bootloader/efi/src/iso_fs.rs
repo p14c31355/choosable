@@ -850,7 +850,7 @@ unsafe extern "efiapi" fn file_read_dir(
             continue;
         }
 
-        if byte_offset + record_len > 2048 {
+        if record_len < 34 || byte_offset + record_len > 2048 {
             finished = true;
             break;
         }
