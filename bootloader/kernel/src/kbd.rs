@@ -25,7 +25,6 @@ pub fn scancode_to_ascii(sc: u8) -> Option<u8> {
         0x02..=0x0A => Some(b'1' + (sc - 0x02)),
         0x0B => Some(b'0'),
         0x13 => Some(b'r'),
-        0x1F => Some(b'R'),
         0x1C => Some(b'\n'),
         _ => None,
     }
