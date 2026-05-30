@@ -48,12 +48,23 @@ pub struct IsoFsCtx {
     /// ISO file name on the real USB drive (e.g. "ubuntu-24.04.iso")
     pub iso_name: [u8; 128],
     pub iso_name_len: usize,
+    /// ── Directory entry redirect (set by patch_grub_cfg_blockio) ───
+    /// Original extent LBA of the grub.cfg file (in ISO sectors)
+    pub old_extent: u32,
+    /// Original file size
+    pub old_size: u32,
+    /// New extent LBA (placed at end of virtual CD-ROM)
+    pub new_extent: u32,
+    /// New file size (after patching)
+    pub new_size: u32,
+    /// Whether directory entry redirect is active
+    pub redirect_active: bool,
 }
 
 #[repr(C)]
 pub struct IsoFsInstance {
     pub sfs: SimpleFileSystemProtocol,
-    ctx: IsoFsCtx,
+    pub ctx: IsoFsCtx,
 }
 
 /// Per-open-file (or directory) state
@@ -272,8 +283,6 @@ fn lookup_in_dir(
             }
 
             if match_iso_name(iso_name, name_len, name) {
-                // ".." entry (parent dir) has special handling:
-                // Extent of 0 = parent is root (same extent)
                 let child_extent = u32::from_le_bytes(
                     scratch[offset + 2..offset + 6].try_into().unwrap(),
                 );
@@ -282,11 +291,22 @@ fn lookup_in_dir(
                 );
                 let flags = scratch[offset + 25];
                 let is_dir = flags & 0x02 != 0;
+
+                // Apply directory entry redirect if active and this matches
+                let (final_extent, final_size) = if ctx.redirect_active
+                    && child_extent == ctx.old_extent
+                    && child_size == ctx.old_size
+                {
+                    (ctx.new_extent, ctx.new_size)
+                } else {
+                    (child_extent, child_size)
+                };
+
                 if !ctx.st.is_null() {
                     let st_ref = unsafe { &mut *ctx.st };
                     print_raw(st_ref, b"[SFS]     -> MATCH\r\n\0");
                 }
-                return Some((child_extent, child_size, is_dir));
+                return Some((final_extent, final_size, is_dir));
             }
             offset += record_len;
         }
@@ -1124,6 +1144,11 @@ pub fn create_iso_fs(
         st,
         iso_name: name_arr,
         iso_name_len: name_len,
+        old_extent: 0,
+        old_size: 0,
+        new_extent: 0,
+        new_size: 0,
+        redirect_active: false,
     };
 
     // ── Parse ISO9660 PVD ──────────────────────────────────────────
