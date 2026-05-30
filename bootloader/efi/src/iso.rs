@@ -586,6 +586,7 @@ fn recursive_find_cfg_with_loc(
                         bio_ref, bio_ptr, mid, iso_lba,
                         extent, size, scratch,
                         entries, entry_count,
+                        depth + 1,
                     );
                     // Re-read parent directory sector: recursive call
                     // overwrote scratch with subdirectory data.
