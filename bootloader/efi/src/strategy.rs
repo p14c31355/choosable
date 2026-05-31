@@ -149,7 +149,22 @@ impl BootStrategy for CasperStrategy {
     }
 
     fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> {
-        patch_common(inp, b" rootwait rootdelay=15 iso-scan/filename=")
+        // Strip leading '/' from iso_name — casper expects paths without
+        // a leading slash (e.g. "ubuntu.iso", not "/ubuntu.iso").
+        let trimmed = if inp.iso_name.first() == Some(&b'/') {
+            &inp.iso_name[1..]
+        } else {
+            inp.iso_name
+        };
+        let inp2 = PatchInput {
+            original: inp.original,
+            iso_name: trimmed,
+            bs: inp.bs,
+        };
+        // rootdelay=120: give USB subsystem enough time to enumerate
+        // before casper's iso-scan searches for the ISO file.
+        // break=premount: enter initramfs shell if boot fails (for debugging).
+        patch_common(&inp2, b" boot=casper rootwait rootdelay=120 break=premount iso-scan/filename=")
     }
 }
 
@@ -171,7 +186,7 @@ impl BootStrategy for LiveOSStrategy {
     }
 
     fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> {
-        patch_common(inp, b" rd.live.image rootdelay=15 iso-scan/filename=")
+        patch_common(inp, b" rd.live.image rootdelay=120 iso-scan/filename=")
     }
 }
 

@@ -48,17 +48,6 @@ pub struct IsoFsCtx {
     /// ISO file name on the real USB drive (e.g. "ubuntu-24.04.iso")
     pub iso_name: [u8; 128],
     pub iso_name_len: usize,
-    /// ── Directory entry redirect (set by patch_grub_cfg_blockio) ───
-    /// Original extent LBA of the grub.cfg file (in ISO sectors)
-    pub old_extent: u32,
-    /// Original file size
-    pub old_size: u32,
-    /// New extent LBA (placed at end of virtual CD-ROM)
-    pub new_extent: u32,
-    /// New file size (after patching)
-    pub new_size: u32,
-    /// Whether directory entry redirect is active
-    pub redirect_active: bool,
 }
 
 #[repr(C)]
@@ -292,21 +281,11 @@ fn lookup_in_dir(
                 let flags = scratch[offset + 25];
                 let is_dir = flags & 0x02 != 0;
 
-                // Apply directory entry redirect if active and this matches
-                let (final_extent, final_size) = if ctx.redirect_active
-                    && child_extent == ctx.old_extent
-                    && child_size == ctx.old_size
-                {
-                    (ctx.new_extent, ctx.new_size)
-                } else {
-                    (child_extent, child_size)
-                };
-
                 if !ctx.st.is_null() {
                     let st_ref = unsafe { &mut *ctx.st };
                     print_raw(st_ref, b"[SFS]     -> MATCH\r\n\0");
                 }
-                return Some((final_extent, final_size, is_dir));
+                return Some((child_extent, child_size, is_dir));
             }
             offset += record_len;
         }
@@ -625,43 +604,38 @@ unsafe extern "efiapi" fn file_open(
         }
     };
 
-    // Determine if this is grub.cfg (needs iso-scan/filename patch)
-    let is_grub_cfg = if !is_dir && ctx.iso_name_len > 0 && name_slice.len() >= 8 {
+    // Determine if this is a .cfg file (needs iso-scan/filename patch).
+    // Match any file ending in .cfg (case-insensitive), not just grub.cfg —
+    // Ubuntu 22.04 puts the actual boot entries in loopback.cfg.
+    let is_cfg = if !is_dir && ctx.iso_name_len > 0 && name_slice.len() >= 4 {
         let n = name_slice.len();
-        let s: [u8; 8] = [
-            name_slice[n - 8] as u8,
-            name_slice[n - 7] as u8,
-            name_slice[n - 6] as u8,
-            name_slice[n - 5] as u8,
-            name_slice[n - 4] as u8,
-            name_slice[n - 3] as u8,
-            name_slice[n - 2] as u8,
-            name_slice[n - 1] as u8,
+        let s: [u8; 4] = [
+            (name_slice[n - 4] as u8) | 0x20,
+            (name_slice[n - 3] as u8) | 0x20,
+            (name_slice[n - 2] as u8) | 0x20,
+            (name_slice[n - 1] as u8) | 0x20,
         ];
-        // case-insensitive comparison with "grub.cfg"
-        (s[0] | 0x20) == b'g' && (s[1] | 0x20) == b'r' && (s[2] | 0x20) == b'u'
-            && (s[3] | 0x20) == b'b' && s[4] == b'.' && (s[5] | 0x20) == b'c'
-            && (s[6] | 0x20) == b'f' && (s[7] | 0x20) == b'g'
+        s[0] == b'.' && s[1] == b'c' && s[2] == b'f' && s[3] == b'g'
     } else {
         false
     };
 
-    if is_grub_cfg && !ctx.st.is_null() {
+    if is_cfg && !ctx.st.is_null() {
         let st_ref = unsafe { &mut *ctx.st };
-        print_raw(st_ref, b"[SFS]   -> grub.cfg detected, will patch with iso-scan/filename=");
+        print_raw(st_ref, b"[SFS]   -> .cfg file detected, will attempt patch with iso-scan/filename=");
         print_raw(st_ref, &ctx.iso_name[..ctx.iso_name_len]);
         print_raw(st_ref, b"\r\n\0");
     }
 
     // Allocate and initialize the VirtualFile
-    let fp = match alloc_virtual_file(ctx, child_lba, child_size, is_dir, is_grub_cfg) {
+    let fp = match alloc_virtual_file(ctx, child_lba, child_size, is_dir, is_cfg) {
         Some(p) => p,
         None => return EFI_OUT_OF_RESOURCES,
     };
 
-    // ── If this is grub.cfg, eagerly generate the patch now ───
+    // ── If this is a .cfg file, eagerly generate the patch now ───
     // GRUB calls GetInfo before Read, so patched size must be known early.
-    if is_grub_cfg {
+    if is_cfg {
         let vf_patch = unsafe { &mut *(fp as *mut VirtualFile) };
         if !vf_patch.patched {
             // Read original content
@@ -1144,11 +1118,6 @@ pub fn create_iso_fs(
         st,
         iso_name: name_arr,
         iso_name_len: name_len,
-        old_extent: 0,
-        old_size: 0,
-        new_extent: 0,
-        new_size: 0,
-        redirect_active: false,
     };
 
     // ── Parse ISO9660 PVD ──────────────────────────────────────────

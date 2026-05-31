@@ -244,7 +244,7 @@ fn try_patch_candidate(
     st: &mut SystemTable,
     bs: &mut BootServices,
     vb: &mut VirtualBlockIo,
-    sfs_instance: *mut crate::iso_fs::IsoFsInstance,
+    _sfs_instance: *mut crate::iso_fs::IsoFsInstance,
     bio_ref: &BlockIoProtocol,
     bio_ptr: *mut BlockIoProtocol,
     mid: u32,
@@ -279,9 +279,6 @@ fn try_patch_candidate(
         bs: bs as *mut BootServices,
         st: core::ptr::null_mut(),
         iso_name: iso_name_arr, iso_name_len: nlen,
-        old_extent: 0, old_size: 0,
-        new_extent: 0, new_size: 0,
-        redirect_active: false,
     };
 
     let patch = strategy::patch_grub_cfg(&ctx, orig, bs as *mut BootServices);
@@ -314,16 +311,6 @@ fn try_patch_candidate(
     vb.dir_entry_new_size = patched_size as u32;
     vb.dir_entry_patched = true;
     vb.media.bim_lb = orig_end_sector + vb.patched_file_sectors as u64 - 1;
-
-    // Also set SFS redirect so SimpleFileSystem sees the patched file
-    if !sfs_instance.is_null() {
-        let sfs = unsafe { &mut *sfs_instance };
-        sfs.ctx.old_extent = ext_lba;
-        sfs.ctx.old_size = ext_size;
-        sfs.ctx.new_extent = vb.patched_file_sector;
-        sfs.ctx.new_size = patched_size as u32;
-        sfs.ctx.redirect_active = true;
-    }
 
     print_raw(st, b"[grub.cfg] PATCHED OK: orig=\0");
     let mut nbuf = [0u8; 16];
