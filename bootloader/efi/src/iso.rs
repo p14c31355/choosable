@@ -693,17 +693,18 @@ fn uefi_chainload_iso(
         }
     };
 
-    // ── Prepare premount initrd (squashfs -> reserved pages + cpio) ──
+    // ── Build premount cpio initrd (under 2 KB, no disk I/O) ──
     let premount_bundle = crate::premount::prepare_premount_initrd(
-        bs, bio_ptr, mid, iso_lba, iso_size,
+        bs, iso_lba,
     );
+    if premount_bundle.is_none() {
+        print_raw(st, b"[premount] no squashfs found (or allocation failed), skipping\r\n\0");
+    }
     if !vbio_ptr.is_null() {
         let vb = unsafe { &mut *vbio_ptr };
         if let Some(ref bundle) = premount_bundle {
             vb.premount_cpio_buf = bundle.cpio_buf;
             vb.premount_cpio_size = bundle.cpio_size;
-            vb.premount_squashfs_addr = bundle.squashfs_addr;
-            vb.premount_squashfs_size = bundle.squashfs_size;
 
             // Also inject premount cpio into the IsoFsInstance context so
             // file_open/file_read_file can append it transparently.
@@ -713,20 +714,16 @@ fn uefi_chainload_iso(
                 sfs.ctx.premount_cpio_size = bundle.cpio_size;
             }
 
-            print_raw(st, b"[premount] squashfs at 0x\0");
+            print_raw(st, b"[premount] cpio=\0");
             let mut nbuf = [0u8; 16];
-            let mut nv = bundle.squashfs_addr; let mut np = 15;
+            let mut nv = bundle.cpio_size as u64; let mut np = 15;
             loop { nbuf[np] = b'0' + (nv % 10) as u8; nv /= 10; if nv == 0 || np == 0 { break; } np -= 1; }
             print_raw(st, &nbuf[np..]);
-            print_raw(st, b" size=\0");
-            let mut nv2 = bundle.squashfs_size as u64; let mut np2 = 15;
+            print_raw(st, b" bytes, offset=\0");
+            let mut nv2 = bundle.iso_offset_bytes; let mut np2 = 15;
             loop { nbuf[np2] = b'0' + (nv2 % 10) as u8; nv2 /= 10; if nv2 == 0 || np2 == 0 { break; } np2 -= 1; }
             print_raw(st, &nbuf[np2..]);
-            print_raw(st, b", cpio=\0");
-            let mut nv3 = bundle.cpio_size as u64; let mut np3 = 15;
-            loop { nbuf[np3] = b'0' + (nv3 % 10) as u8; nv3 /= 10; if nv3 == 0 || np3 == 0 { break; } np3 -= 1; }
-            print_raw(st, &nbuf[np3..]);
-            print_raw(st, b" bytes\r\n\0");
+            print_raw(st, b"\r\n\0");
         }
     }
 
