@@ -92,7 +92,6 @@ unsafe extern "efiapi" fn vblock_read(
             }
             let entry = &mut dst[block_offset..block_offset + 2048];
             let off = vbio.premount_entry_offset as usize;
-            let off = vbio.premount_entry_offset as usize;
             if off + 48 <= 2048 {
                 entry[off + 1] = 0; // ext attr
                 // extent LBA LE + BE
