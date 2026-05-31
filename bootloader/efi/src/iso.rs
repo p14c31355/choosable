@@ -695,7 +695,7 @@ fn uefi_chainload_iso(
 
     // ── Build premount cpio initrd (under 2 KB, no disk I/O) ──
     let premount_bundle = crate::premount::prepare_premount_initrd(
-        bs, iso_lba,
+        bs, iso_lba - part1_lba,
     );
     if premount_bundle.is_none() {
         print_raw(st, b"[premount] no squashfs found (or allocation failed), skipping\r\n\0");
