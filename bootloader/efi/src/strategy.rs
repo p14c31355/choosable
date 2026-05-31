@@ -10,9 +10,10 @@
 //  Current strategies:
 //    - CasperStrategy: Ubuntu / Mint / Pop!_OS / Debian-live (casper
 //      initramfs).  Injects "boot=casper rootwait rootdelay=300 debug
-//      iso-scan/filename=$ISO_PATH".
+//      live-media=UUID=$UUID iso-scan/filename=$ISO_PATH".
 //    - LiveOSStrategy: Fedora / RHEL / CentOS (dracut-based).  Injects
-//      "rd.live.image rootdelay=300 iso-scan/filename=$ISO_PATH".
+//      "rd.live.image rootdelay=300 live-media=UUID=$UUID
+//      iso-scan/filename=$ISO_PATH".
 //
 //  IsoLocation integration:
 //    When an IsoLocation is available (via IsoLocator), richer boot
@@ -83,17 +84,54 @@ fn count_linux_lines(data: &[u8]) -> usize {
     }
 }
 
+/// Returns true if the UUID string is empty (all zeros).
+fn uuid_is_empty(uuid: &[u8; 10]) -> bool {
+    uuid[0] == b'0'
+        && uuid[1] == b'0'
+        && uuid[2] == b'0'
+        && uuid[3] == b'0'
+        && uuid[4] == b'-'
+        && uuid[5] == b'0'
+        && uuid[6] == b'0'
+        && uuid[7] == b'0'
+        && uuid[8] == b'0'
+}
+
 /// Shared patch logic: inject `pre` + iso_name immediately after the
 /// kernel path in `linux`/`linuxefi` lines (right after `vmlinuz`).
 ///
-/// When an `IsoLocation` is available, additional parameters
-/// (`findiso=`, `live-media-path=`) are appended to help the initramfs
-/// locate the ISO partition without relying solely on an exhaustive
-/// block-device scan.
+/// `pre` should end with `iso-scan/filename=` (or equivalent), and the
+/// iso_name is appended after it.  When a non-zero `live_media_uuid` is
+/// present, it is injected as ` live-media=UUID=$UUID ` immediately
+/// before `iso-scan/filename=`.
 fn patch_common(inp: &PatchInput, pre: &[u8]) -> Option<PatchOutput> {
     let bs = unsafe { &mut *inp.bs };
     let name = inp.iso_name;
-    let inj_len = pre.len() + name.len();
+
+    // Build the full injection string.
+    // Layout: `pre` + iso_name.
+    // If UUID is non-zero, inject ` live-media=UUID=$UUID ` just before
+    // the `iso-scan/filename=` suffix inside `pre`.
+    //
+    // We re-build `inj` by searching for `iso-scan/filename=` in `pre`
+    // and inserting the UUID before it.
+
+    let iso_scan = b"iso-scan/filename=";
+    let uuid_tag = b"live-media=UUID=";
+
+    // Find where iso-scan/filename= lives inside pre.
+    let scan_pos = pre
+        .windows(iso_scan.len())
+        .position(|w| w == iso_scan);
+
+    // Total injection length: pre + iso_name + optional UUID param.
+    let uuid_extra = if !uuid_is_empty(inp.live_media_uuid) && scan_pos.is_some() {
+        uuid_tag.len() + 9 + 1 // "live-media=UUID=" + "XXXX-XXXX" + " "
+    } else {
+        0
+    };
+
+    let inj_len = pre.len() + name.len() + uuid_extra;
     let orig_len = inp.original.len();
 
     let linux_lines = count_linux_lines(inp.original);
@@ -106,12 +144,43 @@ fn patch_common(inp: &PatchInput, pre: &[u8]) -> Option<PatchOutput> {
     }
     let out = unsafe { core::slice::from_raw_parts_mut(patch_ptr as *mut u8, new_size) };
 
-    let mut inj = [0u8; 256];
-    let max_inj = inj_len.min(255);
-    inj[..pre.len()].copy_from_slice(pre);
-    let nb = name.len().min(max_inj - pre.len());
-    inj[pre.len()..pre.len() + nb].copy_from_slice(&name[..nb]);
-    let max_inj_final = pre.len() + nb;
+    // Build `inj` buffer.
+    let mut inj = [0u8; 320];
+    let mut inj_pos = 0usize;
+
+    if let Some(sp) = scan_pos {
+        // Insert everything before iso-scan/filename=.
+        let before = &pre[..sp];
+        inj[inj_pos..inj_pos + before.len()].copy_from_slice(before);
+        inj_pos += before.len();
+
+        // Insert live-media=UUID=$UUID if UUID is non-zero.
+        if !uuid_is_empty(inp.live_media_uuid) {
+            inj[inj_pos..inj_pos + uuid_tag.len()]
+                .copy_from_slice(uuid_tag);
+            inj_pos += uuid_tag.len();
+            let uuid_src = &inp.live_media_uuid[..9]; // "XXXX-XXXX"
+            inj[inj_pos..inj_pos + 9].copy_from_slice(uuid_src);
+            inj_pos += 9;
+            inj[inj_pos] = b' ';
+            inj_pos += 1;
+        }
+
+        // Insert iso-scan/filename= and the rest of `pre`.
+        let rest = &pre[sp..];
+        inj[inj_pos..inj_pos + rest.len()].copy_from_slice(rest);
+        inj_pos += rest.len();
+    } else {
+        // No iso-scan/filename= marker — just copy pre as-is.
+        inj[inj_pos..inj_pos + pre.len()].copy_from_slice(pre);
+        inj_pos += pre.len();
+    }
+
+    // Append iso_name.
+    let nb = name.len().min(255);
+    inj[inj_pos..inj_pos + nb].copy_from_slice(&name[..nb]);
+    inj_pos += nb;
+    let max_inj_final = inj_pos;
 
     let mut src = 0usize;
     let mut dst = 0usize;
@@ -242,11 +311,9 @@ impl BootStrategy for CasperStrategy {
             inp.iso_name
         };
 
-        // Inject "boot=casper rootwait rootdelay=300 debug iso-scan/filename=$PATH".
-        // GRUB on the Ubuntu ISO may lack the modules needed to search for
-        // the ISO on an exFAT/NTFS USB partition, so we rely entirely on
-        // casper's own block-device scan via iso-scan/filename=.
-        // rootdelay=300 gives slow USB controllers time to enumerate.
+        // live-media=UUID=$UUID is injected inside patch_common before
+        // iso-scan/filename=, so the initramfs can immediately identify
+        // which block device holds the ISO without a blind scan.
         let inp2 = PatchInput {
             original: inp.original,
             iso_name: trimmed,
