@@ -237,8 +237,8 @@ fn find_first_file_in_dir(
 
                 // Skip EFI boot files — needed by the chainloaded shim/GRUB.
                 let is_efi_boot =
-                    &upper[..cl.min(11)] == b"BOOTX64.EFI"
-                    || &upper[..cl.min(11)] == b"BOOTIA32.EFI";
+                    &upper[..cl] == b"BOOTX64.EFI"
+                    || &upper[..cl] == b"BOOTIA32.EFI";
                 if is_efi_boot {
                     offset += record_len;
                     continue;
