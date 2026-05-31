@@ -1,0 +1,18 @@
+# Choosable premount ignore list — ISO9660 root directory entries
+# that must NOT be overwritten for premount cpio injection.
+#
+# One pattern per line.  Empty lines and #-comments are ignored.
+# Trailing * means prefix match (e.g. MD5SUM* matches MD5SUM, MD5SUM.TXT, MD5SUMS).
+# Otherwise the entire name is matched exactly.
+# All matching is case-insensitive.
+#
+# Why these are excluded:
+#   MD5SUM*   — GRUB uses if [ -f /MD5SUM.TXT ] for integrity checks
+#   README*   — boot scripts / GRUB may reference README.DISKDEFINES etc.
+#   UBUNTU*   — referenced by Ubuntu GRUB as /UBUNTU.
+#   AUTORUN.INF — Windows autorun, occasionally checked
+
+MD5SUM*
+README*
+UBUNTU*
+AUTORUN.INF

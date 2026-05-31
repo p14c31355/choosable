@@ -106,6 +106,18 @@ unsafe extern "efiapi" fn vblock_read(
         }
 
         if !read_real_iso_sector(vbio, block_lba, dst, block_offset) { return EFI_DEVICE_ERROR; }
+
+        // Patch PVD Volume Space Size at sector 16 so GRUB's ISO9660
+        // driver accepts extent references that point to appended
+        // premount cpio / patched grub.cfg sectors.
+        if block_lba == 16 {
+            let new_size = (vbio.media.bim_lb + 1) as u32;
+            // ISO9660 PVD bytes 80-83: Volume Space Size (Little-Endian)
+            //                 84-87: Volume Space Size (Big-Endian)
+            let off = block_offset;
+            dst[off + 80..off + 84].copy_from_slice(&new_size.to_le_bytes());
+            dst[off + 84..off + 88].copy_from_slice(&new_size.to_be_bytes());
+        }
     }
 
     EFI_SUCCESS
