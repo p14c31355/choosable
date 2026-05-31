@@ -245,7 +245,7 @@ fn try_patch_candidate(
     st: &mut SystemTable,
     bs: &mut BootServices,
     vb: &mut VirtualBlockIo,
-    _sfs_instance: *mut crate::iso_fs::IsoFsInstance,
+    sfs_instance: *mut crate::iso_fs::IsoFsInstance,
     bio_ref: &BlockIoProtocol,
     bio_ptr: *mut BlockIoProtocol,
     mid: u32,
@@ -260,6 +260,18 @@ fn try_patch_candidate(
         None => return false,
     };
     let orig = unsafe { core::slice::from_raw_parts(orig_ptr, orig_len as usize) };
+
+    // Read premount target name from SFS instance (set earlier by uefi_chainload_iso)
+    let mut premount_target_name = [0u8; 16];
+    let mut premount_target_name_len: usize = 0;
+    if !sfs_instance.is_null() {
+        let sfs = unsafe { &*sfs_instance };
+        premount_target_name_len = sfs.ctx.premount_target_name_len;
+        if premount_target_name_len > 0 && premount_target_name_len <= 16 {
+            premount_target_name[..premount_target_name_len]
+                .copy_from_slice(&sfs.ctx.premount_target_name[..premount_target_name_len]);
+        }
+    }
 
     // Check for linux/linuxefi line
         let has_linux = (orig.len() >= 6 && orig.windows(6).any(|w| w == b"linux " || w == b"linux\t"))
@@ -285,8 +297,8 @@ fn try_patch_candidate(
         live_media_uuid: *live_media_uuid,
         premount_cpio_buf: core::ptr::null_mut(),
         premount_cpio_size: 0,
-        premount_target_name: [0u8; 16],
-        premount_target_name_len: 0,
+        premount_target_name,
+        premount_target_name_len,
     };
 
     let patch = strategy::patch_grub_cfg(&ctx, orig, bs as *mut BootServices, iso_location);

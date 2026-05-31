@@ -82,19 +82,27 @@ fn patch_grub_cfg_impl(inp: &PatchInput, linux_extra: &[u8], premount_target_nam
     let bs = unsafe { &mut *inp.bs };
     let orig = inp.original;
 
+    // If premount target name is empty, no initrd injection is possible:
+    // the premount cpio was not successfully injected into a file.
+    let premount_available = !premount_target_name.is_empty();
+
     // Build " /<target_name>" for initrd line injection.
     let mut initrd_extra_buf = [0u8; 32];
     initrd_extra_buf[0] = b' ';
     initrd_extra_buf[1] = b'/';
     let name_len = premount_target_name.len().min(30);
-    initrd_extra_buf[2..2 + name_len].copy_from_slice(&premount_target_name[..name_len]);
-    let initrd_extra = &initrd_extra_buf[..2 + name_len];
+    if premount_available {
+        initrd_extra_buf[2..2 + name_len].copy_from_slice(&premount_target_name[..name_len]);
+    }
+    let initrd_extra = if premount_available { &initrd_extra_buf[..2 + name_len] } else { &[][..] };
 
     // Build "/<target_name>" for dedup check.
     let mut dedup_buf = [0u8; 32];
     dedup_buf[0] = b'/';
-    dedup_buf[1..1 + name_len].copy_from_slice(&premount_target_name[..name_len]);
-    let dedup_slice = &dedup_buf[..1 + name_len];
+    if premount_available {
+        dedup_buf[1..1 + name_len].copy_from_slice(&premount_target_name[..name_len]);
+    }
+    let dedup_slice = if premount_available { &dedup_buf[..1 + name_len] } else { &[][..] };
 
     // Count matching lines first so the output buffer is large enough for
     // all injections (typical grub.cfg has multiple menu entries).
