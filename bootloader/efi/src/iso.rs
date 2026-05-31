@@ -19,6 +19,7 @@ use crate::protocol::{
     DevicePathProtocol, VirtualBlockIo, EFI_SUCCESS, LOADED_IMAGE_PROTOCOL_GUID,
 };
 
+use crate::locator::{FileBackedIsoLocator, IsoLocator};
 use crate::strategy;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -244,13 +245,15 @@ fn try_patch_candidate(
     st: &mut SystemTable,
     bs: &mut BootServices,
     vb: &mut VirtualBlockIo,
-    sfs_instance: *mut crate::iso_fs::IsoFsInstance,
+    _sfs_instance: *mut crate::iso_fs::IsoFsInstance,
     bio_ref: &BlockIoProtocol,
     bio_ptr: *mut BlockIoProtocol,
     mid: u32,
     iso_lba: u64,
     iso_name: &[u8],
     ext_lba: u32, ext_size: u32, dir_sector: u32, dir_offset: u32,
+    iso_location: Option<&crate::locator::IsoLocation>,
+    live_media_uuid: &[u8; 10],
 ) -> bool {
     let (orig_ptr, orig_len) = match read_extent(bs, bio_ref, bio_ptr, mid, iso_lba, ext_lba, ext_size) {
         Some(v) => v,
@@ -279,12 +282,14 @@ fn try_patch_candidate(
         bs: bs as *mut BootServices,
         st: core::ptr::null_mut(),
         iso_name: iso_name_arr, iso_name_len: nlen,
-        old_extent: 0, old_size: 0,
-        new_extent: 0, new_size: 0,
-        redirect_active: false,
+        live_media_uuid: *live_media_uuid,
+        premount_cpio_buf: core::ptr::null_mut(),
+        premount_cpio_size: 0,
+        premount_target_name: [0u8; 16],
+        premount_target_name_len: 0,
     };
 
-    let patch = strategy::patch_grub_cfg(&ctx, orig, bs as *mut BootServices);
+    let patch = strategy::patch_grub_cfg(&ctx, orig, bs as *mut BootServices, iso_location);
     unsafe { (bs.free_pool)(orig_ptr as *mut c_void); }
 
     let (patched_buf, patched_size) = match patch {
@@ -314,16 +319,6 @@ fn try_patch_candidate(
     vb.dir_entry_new_size = patched_size as u32;
     vb.dir_entry_patched = true;
     vb.media.bim_lb = orig_end_sector + vb.patched_file_sectors as u64 - 1;
-
-    // Also set SFS redirect so SimpleFileSystem sees the patched file
-    if !sfs_instance.is_null() {
-        let sfs = unsafe { &mut *sfs_instance };
-        sfs.ctx.old_extent = ext_lba;
-        sfs.ctx.old_size = ext_size;
-        sfs.ctx.new_extent = vb.patched_file_sector;
-        sfs.ctx.new_size = patched_size as u32;
-        sfs.ctx.redirect_active = true;
-    }
 
     print_raw(st, b"[grub.cfg] PATCHED OK: orig=\0");
     let mut nbuf = [0u8; 16];
@@ -355,6 +350,8 @@ fn patch_grub_cfg_blockio(
     mid: u32,
     iso_lba: u64,
     iso_name: &[u8],
+    live_media_uuid: &[u8; 10],
+    iso_location: Option<&crate::locator::IsoLocation>,
 ) {
     if vbio.is_null() { return; }
     let vb = unsafe { &mut *vbio };
@@ -457,7 +454,7 @@ fn patch_grub_cfg_blockio(
         print_raw(st, b"...\r\n\0");
 
         if try_patch_candidate(st, bs, vb, sfs_instance, bio_ref, bio_ptr, mid, iso_lba, iso_name,
-            ext_lba, ext_size, dir_sector, dir_offset) {
+            ext_lba, ext_size, dir_sector, dir_offset, iso_location, live_media_uuid) {
             return;
         }
     }
@@ -656,9 +653,11 @@ fn uefi_chainload_iso(
     // ── ISO file name (for grub.cfg iso-scan/filename injection)
     let iso_name = &files[idx].name[..files[idx].name_len.min(files[idx].name.len())];
 
+    let live_uuid = [0u8; 10];
+
     // ── Create virtual CD-ROM from the ISO file ──────────────────────
     let cdrom_tuple = crate::virtual_blockio::create_virtual_cdrom(
-        bs, st as *mut SystemTable, iso_lba, bio_ptr, mid, iso_size, iso_name,
+        bs, st as *mut SystemTable, iso_lba, bio_ptr, mid, iso_size, iso_name, &live_uuid,
     );
     let (device_handle, cdrom_dp, vbio_ptr, sfs_instance) = match cdrom_tuple {
         Some((h, dp, vb, sfs)) => (h, dp, vb, sfs),
@@ -668,8 +667,113 @@ fn uefi_chainload_iso(
         }
     };
 
+    // ── Build premount cpio initrd (under 2 KB, no disk I/O) ──
+    let premount_bundle = crate::premount::prepare_premount_initrd(
+        bs, iso_lba - part1_lba,
+    );
+    if premount_bundle.is_none() {
+        print_raw(st, b"[premount] no squashfs found (or allocation failed), skipping\r\n\0");
+    }
+    if !vbio_ptr.is_null() && premount_bundle.is_some() {
+        let vb = unsafe { &mut *vbio_ptr };
+        let bundle = premount_bundle.as_ref().unwrap();
+
+        // ── Reliable PREMOUNT.CPIO injection ──
+        // Strategy: find an existing small file in the ISO root directory,
+        // overwrite its directory entry to redirect to premount cpio data
+        // (same mechanism as grub.cfg patching — proven reliable).
+
+        // 1. Reuse the already-allocated cpio buffer (zero the trailing padding)
+        //    bundle.cpio_buf is exactly 2048 bytes from prepare_premount_initrd.
+        {
+            let dst = unsafe { core::slice::from_raw_parts_mut(bundle.cpio_buf, 2048) };
+            for i in bundle.cpio_size..2048 { dst[i] = 0; }
+        }
+
+        // 2. Append after current last block
+        let orig_end = vb.media.bim_lb + 1;
+        vb.premount_file_sector = orig_end as u32;
+        vb.premount_file_sectors = 1;
+        vb.premount_file_buf = bundle.cpio_buf;
+        vb.media.bim_lb = orig_end;
+
+        // 3. Find an existing file in root dir to overwrite
+        let mut pvd = [0u8; 2048];
+        if read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, 16, &mut pvd)
+            && pvd[0] == 1 && &pvd[1..6] == b"CD001"
+        {
+            let root_lba = u32::from_le_bytes(pvd[158..162].try_into().unwrap());
+            let root_size = u32::from_le_bytes(pvd[166..170].try_into().unwrap());
+
+            // Look for md5sum.txt or any .txt file to overwrite
+            let targets: [&[u8]; 2] = [b"MD5SUM.TXT", b"UBUNTU"];
+            for &target_name in &targets {
+                if let Some((_ext, _size, dir_sector, dir_offset)) =
+                    find_in_dir_with_loc(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, target_name, &mut [0u8; 2048])
+                {
+                    vb.premount_entry_sector = dir_sector;
+                    vb.premount_entry_offset = dir_offset;
+                    vb.premount_entry_new_extent = vb.premount_file_sector;
+                    vb.premount_entry_new_size = bundle.cpio_size as u32;
+                    vb.premount_entry_patched = true;
+
+                    // Also inject into SFS for root-level synthetic file
+                    if !sfs_instance.is_null() {
+                        let sfs = unsafe { &mut *sfs_instance };
+                        sfs.ctx.premount_cpio_buf = bundle.cpio_buf;
+                        sfs.ctx.premount_cpio_size = bundle.cpio_size;
+                        // Record which file was chosen as the premount target
+                        let tlen = target_name.len().min(15);
+                        sfs.ctx.premount_target_name[..tlen].copy_from_slice(&target_name[..tlen]);
+                        sfs.ctx.premount_target_name_len = tlen;
+                    }
+
+                    print_raw(st, b"[premount] overwriting ");
+                    print_raw(st, target_name);
+                    print_raw(st, b" dir entry at sector=\0");
+                    let mut nbuf = [0u8; 16];
+                    let mut nv = dir_sector as u64; let mut np = 15;
+                    loop { nbuf[np] = b'0' + (nv % 10) as u8; nv /= 10; if nv == 0 || np == 0 { break; } np -= 1; }
+                    print_raw(st, &nbuf[np..]);
+                    print_raw(st, b" off=\0");
+                    let mut nv2 = dir_offset as u64; let mut np2 = 15;
+                    loop { nbuf[np2] = b'0' + (nv2 % 10) as u8; nv2 /= 10; if nv2 == 0 || np2 == 0 { break; } np2 -= 1; }
+                    print_raw(st, &nbuf[np2..]);
+                    print_raw(st, b", cpio=\0");
+                    let mut nv3 = bundle.cpio_size as u64; let mut np3 = 15;
+                    loop { nbuf[np3] = b'0' + (nv3 % 10) as u8; nv3 /= 10; if nv3 == 0 || np3 == 0 { break; } np3 -= 1; }
+                    print_raw(st, &nbuf[np3..]);
+                    print_raw(st, b" bytes\r\n\0");
+                    break;
+                }
+            }
+        }
+    }
+
+    // Cleanup: also inject into SFS for root-level synthetic file
+    if !sfs_instance.is_null() && premount_bundle.is_some() && !vbio_ptr.is_null() {
+        let vb = unsafe { &*vbio_ptr };
+        if !vb.premount_entry_patched {
+            // BlockIO injection failed or no target found
+            let bundle = premount_bundle.as_ref().unwrap();
+            let sfs = unsafe { &mut *sfs_instance };
+            sfs.ctx.premount_cpio_buf = bundle.cpio_buf;
+            sfs.ctx.premount_cpio_size = bundle.cpio_size;
+        }
+    }
+
+    // ── Build IsoLocation from the selected ISO entry ─────────
+    let locator = FileBackedIsoLocator::from_iso_entry(
+        &files[idx],
+        crate::protocol::Guid { d1: 0, d2: 0, d3: 0, d4: [0u8; 8] },
+        1, // partition 1
+        part1_lba,
+    );
+    let iso_loc = locator.locate();
+
     // ── Patch grub.cfg at BlockIO+SFS level ────────────────────
-    patch_grub_cfg_blockio(st, bs, vbio_ptr, sfs_instance, bio_ref, bio_ptr, mid, iso_lba, iso_name);
+    patch_grub_cfg_blockio(st, bs, vbio_ptr, sfs_instance, bio_ref, bio_ptr, mid, iso_lba, iso_name,
+        &live_uuid, Some(&iso_loc));
 
     let (efi_lba, efi_size) = match find_efi_boot(st, bio_ref, bio_ptr, mid, iso_lba) {
         Some(v) => v,

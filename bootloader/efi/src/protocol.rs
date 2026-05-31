@@ -199,6 +199,7 @@ pub struct BlockIoMedia {
     pub bim_lb: u64,
 }
 
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct Guid {
     pub d1: u32,
@@ -234,6 +235,7 @@ pub enum LocateSearchType {
 #[repr(u32)]
 pub enum AllocateType {
     AllocateAnyPages = 0,
+    AllocateMaxAddress = 1,
     AllocateAddress = 2,
 }
 
@@ -308,6 +310,20 @@ pub struct VirtualBlockIo {
     pub dir_entry_new_size: u32,
     /// Whether directory entry patching is active
     pub dir_entry_patched: bool,
+    /// ── Premount cpio data (appended to initrd) ──────────────────
+    pub premount_cpio_buf: *mut u8,
+    pub premount_cpio_size: usize,
+    pub premount_squashfs_addr: u64,
+    pub premount_squashfs_size: u64,
+    /// ── Root directory premount entry ─────────────────────────
+    pub premount_file_sector: u32,
+    pub premount_file_sectors: u32,
+    pub premount_file_buf: *mut u8,
+    pub premount_entry_sector: u32,
+    pub premount_entry_offset: u32,
+    pub premount_entry_new_extent: u32,
+    pub premount_entry_new_size: u32,
+    pub premount_entry_patched: bool,
 }
 
 pub const DEVICE_PATH_PROTOCOL_GUID: Guid = Guid {

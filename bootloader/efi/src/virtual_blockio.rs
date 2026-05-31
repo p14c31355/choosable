@@ -71,7 +71,58 @@ unsafe extern "efiapi" fn vblock_read(
                 entry[off + 14..off + 18].copy_from_slice(&vbio.dir_entry_new_size.to_be_bytes());
             }
         }
-        // Case 2: Patched file sector — served from appended data
+        // Case 2a: Root directory sector — inject premount entry redirect,
+        //          OR guard against fall-through when Case 1 already handled
+        //          this sector (grub.cfg and premount target sharing a
+        //          directory sector, the common case).
+        if (vbio.premount_entry_patched && block_lba == vbio.premount_entry_sector as u64)
+            || (vbio.dir_entry_patched && block_lba == vbio.dir_entry_sector as u64)
+        {
+            if vbio.premount_entry_patched && block_lba == vbio.premount_entry_sector as u64 {
+                // If Case 1 already read this sector, skip the disk read to avoid
+                // overwriting the grub.cfg patch.
+                if !(vbio.dir_entry_patched && block_lba == vbio.dir_entry_sector as u64) {
+                    let disk_lba = vbio.iso_lba + block_lba * 4;
+                    let status = unsafe {
+                        ((*vbio.real_bio_ptr).read_blocks)(
+                            vbio.real_bio_ptr,
+                            vbio.real_media_id,
+                            disk_lba,
+                            2048,
+                            dst.as_mut_ptr().add(block_offset) as *mut c_void,
+                        )
+                    };
+                    if status != EFI_SUCCESS { return EFI_DEVICE_ERROR; }
+                }
+                let entry = &mut dst[block_offset..block_offset + 2048];
+                let off = vbio.premount_entry_offset as usize;
+                // Only overwrite extent LBA and data length — keep the original
+                // filename (MD5SUM.TXT) intact.  Changing the name to a longer
+                // one (PREMOUNT.CPIO;1: 15 bytes vs MD5SUM.TXT;1: 12 bytes)
+                // would overwrite the record_len of the next directory entry,
+                // corrupting the root directory and crashing GRUB/kernel parsers.
+                if off + 18 <= 2048 {
+                    // extent LBA LE + BE
+                    entry[off + 2..off + 6].copy_from_slice(&vbio.premount_entry_new_extent.to_le_bytes());
+                    entry[off + 6..off + 10].copy_from_slice(&vbio.premount_entry_new_extent.to_be_bytes());
+                    // data length LE + BE
+                    entry[off + 10..off + 14].copy_from_slice(&vbio.premount_entry_new_size.to_le_bytes());
+                    entry[off + 14..off + 18].copy_from_slice(&vbio.premount_entry_new_size.to_be_bytes());
+                }
+            }
+        }
+
+        // Case 2b: Premount file sector — served from memory
+        else if vbio.premount_file_sectors > 0
+            && !vbio.premount_file_buf.is_null()
+            && block_lba >= vbio.premount_file_sector as u64
+            && block_lba < vbio.premount_file_sector as u64 + vbio.premount_file_sectors as u64
+        {
+            let p_off = ((block_lba - vbio.premount_file_sector as u64) as usize) * 2048;
+            let src = unsafe { core::slice::from_raw_parts(vbio.premount_file_buf.add(p_off), 2048) };
+            dst[block_offset..block_offset + 2048].copy_from_slice(src);
+        }
+        // Case 2c: Patched file sector — served from appended data
         else if vbio.patched_file_sectors > 0
             && !vbio.patched_file_buf.is_null()
             && block_lba >= vbio.patched_file_sector as u64
@@ -118,6 +169,7 @@ pub fn create_virtual_cdrom(
     real_media_id: u32,
     iso_size_bytes: u64,
     iso_name: &[u8],
+    live_media_uuid: &[u8; 10],
 ) -> Option<(*mut c_void, *mut c_void, *mut VirtualBlockIo, *mut IsoFsInstance)> {
     // ═════════════════════════════════════════════════════════════
     // 1. Build CD-ROM DevicePath
@@ -202,6 +254,20 @@ pub fn create_virtual_cdrom(
     vbio.dir_entry_new_size = 0;
     vbio.dir_entry_patched = false;
 
+    // Initialize premount fields
+    vbio.premount_cpio_buf = core::ptr::null_mut();
+    vbio.premount_cpio_size = 0;
+    vbio.premount_squashfs_addr = 0;
+    vbio.premount_squashfs_size = 0;
+    vbio.premount_entry_sector = 0;
+    vbio.premount_entry_offset = 0;
+    vbio.premount_entry_new_extent = 0;
+    vbio.premount_entry_new_size = 0;
+    vbio.premount_entry_patched = false;
+    vbio.premount_file_sector = 0;
+    vbio.premount_file_sectors = 0;
+    vbio.premount_file_buf = core::ptr::null_mut();
+
     // ═════════════════════════════════════════════════════════════
     // 3. Install BlockIO protocol (creates the handle)
     // ═════════════════════════════════════════════════════════════
@@ -241,7 +307,8 @@ pub fn create_virtual_cdrom(
     // 5. Install ISO9660 SimpleFileSystem protocol on the same handle
     // ═════════════════════════════════════════════════════════════
     let iso_fs_instance = crate::iso_fs::create_iso_fs(
-        bs, st, real_bio_ptr, real_media_id, iso_lba, iso_size_bytes, iso_name,
+        bs, st, real_bio_ptr, real_media_id, iso_lba, iso_size_bytes, iso_name, live_media_uuid,
+        core::ptr::null_mut(), 0, // premount set later via vbio
     );
     if !iso_fs_instance.is_null() {
         let sfs_status = unsafe {
