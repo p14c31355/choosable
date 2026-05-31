@@ -22,6 +22,11 @@ pub struct PatchInput<'a> {
     pub bs: *mut BootServices,
     pub live_media_uuid: &'a [u8; 10],
     pub iso_location: Option<&'a IsoLocation>,
+    /// ISO9660 name of the file whose directory entry was overwritten for
+    /// premount cpio injection (e.g. "MD5SUM.TXT" or "UBUNTU").
+    /// Used to construct the initrd line injection dynamically so GRUB
+    /// finds the synthetic file under its original name.
+    pub premount_target_name: &'a [u8],
 }
 
 pub struct PatchOutput {
@@ -73,9 +78,23 @@ fn count_matching_lines(orig: &[u8]) -> (usize, usize) {
     (linux_count, initrd_count)
 }
 
-fn patch_grub_cfg_impl(inp: &PatchInput, linux_extra: &[u8], initrd_extra: &[u8]) -> Option<PatchOutput> {
+fn patch_grub_cfg_impl(inp: &PatchInput, linux_extra: &[u8], premount_target_name: &[u8]) -> Option<PatchOutput> {
     let bs = unsafe { &mut *inp.bs };
     let orig = inp.original;
+
+    // Build " /<target_name>" for initrd line injection.
+    let mut initrd_extra_buf = [0u8; 32];
+    initrd_extra_buf[0] = b' ';
+    initrd_extra_buf[1] = b'/';
+    let name_len = premount_target_name.len().min(30);
+    initrd_extra_buf[2..2 + name_len].copy_from_slice(&premount_target_name[..name_len]);
+    let initrd_extra = &initrd_extra_buf[..2 + name_len];
+
+    // Build "/<target_name>" for dedup check.
+    let mut dedup_buf = [0u8; 32];
+    dedup_buf[0] = b'/';
+    dedup_buf[1..1 + name_len].copy_from_slice(&premount_target_name[..name_len]);
+    let dedup_slice = &dedup_buf[..1 + name_len];
 
     // Count matching lines first so the output buffer is large enough for
     // all injections (typical grub.cfg has multiple menu entries).
@@ -116,9 +135,11 @@ fn patch_grub_cfg_impl(inp: &PatchInput, linux_extra: &[u8], initrd_extra: &[u8]
             }
             // ── initrd lines ──
             else if (t.starts_with(b"initrd ") || t.starts_with(b"initrd\t"))
-                && !line.windows(12).any(|w| w == b"/MD5SUM.TXT")
+                && dedup_slice.len() <= line.len()
+                && !line.windows(dedup_slice.len()).any(|w| w == dedup_slice)
             {
-                // Inject before the line ending: "initrd /path\N\n" → "initrd /path /MD5SUM.TXT\N\n"
+                // Inject before the line ending:
+                //   "initrd /path\n" → "initrd /path /<target_name>\n"
                 let mut inject_at = dst;
                 // Step back over \n
                 if dst > 0 && out[dst - 1] == b'\n' {
@@ -176,7 +197,7 @@ impl BootStrategy for CasperStrategy {
         patch_grub_cfg_impl(
             inp,
             b" boot=casper rootwait rootdelay=300 debug",
-            b" /MD5SUM.TXT",
+            inp.premount_target_name,
         )
     }
 }
@@ -202,7 +223,7 @@ impl BootStrategy for LiveOSStrategy {
         patch_grub_cfg_impl(
             inp,
             b" rd.live.image rootdelay=300",
-            b" /MD5SUM.TXT",
+            inp.premount_target_name,
         )
     }
 }
@@ -223,5 +244,6 @@ pub fn patch_grub_cfg(ctx: &IsoFsCtx, original: &[u8], bs: *mut BootServices, is
         bs,
         live_media_uuid: &ctx.live_media_uuid,
         iso_location,
+        premount_target_name: &ctx.premount_target_name[..ctx.premount_target_name_len],
     })
 }

@@ -5,7 +5,6 @@ mod disk;
 mod fs;
 mod iso;
 mod iso_fs;
-mod iso_source;
 mod locator;
 mod output;
 mod premount;

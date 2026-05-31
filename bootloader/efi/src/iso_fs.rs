@@ -41,6 +41,9 @@ pub struct IsoFsCtx {
     /// Premount cpio data (served as /CHOOSABLE/PREMOUNT.CPIO synthetic file)
     pub premount_cpio_buf: *mut u8,
     pub premount_cpio_size: usize,
+    /// ISO9660 name used as premount injection target (e.g. "MD5SUM.TXT")
+    pub premount_target_name: [u8; 16],
+    pub premount_target_name_len: usize,
 }
 
 #[repr(C)]
@@ -564,6 +567,8 @@ pub fn create_iso_fs(
         iso_name: name_arr, iso_name_len: name_len,
         live_media_uuid: uuid_arr,
         premount_cpio_buf, premount_cpio_size,
+        premount_target_name: [0u8; 16],
+        premount_target_name_len: 0,
     };
     if let Some((rlb, rsz)) = parse_pvd(&instance.ctx) { instance.ctx.root_lba = rlb; instance.ctx.root_size = rsz; }
     else { unsafe { (bs.free_pool)(ptr); } return core::ptr::null_mut(); }

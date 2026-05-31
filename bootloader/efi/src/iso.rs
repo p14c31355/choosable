@@ -285,6 +285,8 @@ fn try_patch_candidate(
         live_media_uuid: *live_media_uuid,
         premount_cpio_buf: core::ptr::null_mut(),
         premount_cpio_size: 0,
+        premount_target_name: [0u8; 16],
+        premount_target_name_len: 0,
     };
 
     let patch = strategy::patch_grub_cfg(&ctx, orig, bs as *mut BootServices, iso_location);
@@ -720,6 +722,10 @@ fn uefi_chainload_iso(
                         let sfs = unsafe { &mut *sfs_instance };
                         sfs.ctx.premount_cpio_buf = bundle.cpio_buf;
                         sfs.ctx.premount_cpio_size = bundle.cpio_size;
+                        // Record which file was chosen as the premount target
+                        let tlen = target_name.len().min(15);
+                        sfs.ctx.premount_target_name[..tlen].copy_from_slice(&target_name[..tlen]);
+                        sfs.ctx.premount_target_name_len = tlen;
                     }
 
                     print_raw(st, b"[premount] overwriting ");

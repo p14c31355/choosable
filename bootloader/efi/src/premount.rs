@@ -137,11 +137,14 @@ fn cpio_newc_header(
 }
 
 /// Build a premount cpio archive and return it.
+///
+/// `relative_sector_offset` is the ISO file's start position within the
+/// partition, in 512-byte sectors (i.e., iso_lba - part1_lba).
 pub fn prepare_premount_initrd(
     bs: &mut BootServices,
-    iso_lba: u64,
+    relative_sector_offset: u64,
 ) -> Option<PremountBundle> {
-    let offset_bytes = iso_lba * 512;
+    let offset_bytes = relative_sector_offset * 512;
 
     let script = build_premount_script(offset_bytes);
     let script_len = script.iter().position(|&c| c == 0).unwrap_or(1023);
