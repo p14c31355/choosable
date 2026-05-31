@@ -86,8 +86,8 @@ unsafe extern "efiapi" fn vblock_read(
             if status != EFI_SUCCESS { return EFI_DEVICE_ERROR; }
             let entry = &mut dst[block_offset..block_offset + 2048];
             let off = vbio.premount_entry_offset as usize;
-            if off + 34 <= 2048 {
-                // ISO9660 directory entry layout (big-endian for extent/size too)
+            let off = vbio.premount_entry_offset as usize;
+            if off + 48 <= 2048 {
                 entry[off + 1] = 0; // ext attr
                 // extent LBA LE + BE
                 entry[off + 2..off + 6].copy_from_slice(&vbio.premount_entry_new_extent.to_le_bytes());
