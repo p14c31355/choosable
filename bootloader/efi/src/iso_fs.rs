@@ -164,45 +164,28 @@ fn parse_pvd(ctx: &IsoFsCtx) -> Option<(u32, u32)> {
 
 // ── Synthetic premount file detection ──
 
-/// Check if the UCS-2 path matches "\CHOOSABLE\PREMOUNT.CPIO" (case-insensitive).
+/// Check if the UCS-2 path is the premount cpio file (case-insensitive).
 fn is_premount_path(path: &[u16]) -> bool {
-    let marker = b"CHOOSABLE";
-    // Path format: "X\CHOOSABLE\PREMOUNT.CPIO" or "\CHOOSABLE\PREMOUNT.CPIO"
-    // with possible "CDROM(0x0)\" prefix stripped by resolve_path.
-    // We look for "\CHOOSABLE\PREMOUNT.CPIO" at the start or after the CDROM prefix.
-    let lower = |c: u16| if (b'A' as u16..=b'Z' as u16).contains(&c) { c | 0x20 } else { c };
-    let bytes: [u8; 64] = {
-        let mut a = [0u8; 64];
-        let mut i = 0;
-        while i < 64 && i < path.len() {
-            let c = path[i];
-            if c == 0 { break; }
-            a[i] = if c < 0x80 { lower(c) as u8 } else { b'?' };
-            i += 1;
-        }
-        a
-    };
-    let name_str = &bytes[..];
-    // Check endings: "choosable\premount.cpio" or "choosable/premount.cpio"
-    // After resolving, the path will be like "\choosable\premount.cpio"
-    let has_path = (name_str.len() >= 23
-        && name_str[name_str.len()-23] == b'\\'
-        && name_str[name_str.len()-22..name_str.len()-13].eq_ignore_ascii_case(b"choosable")
-        && name_str[name_str.len()-12] == b'\\'
-        && name_str[name_str.len()-11..].eq_ignore_ascii_case(b"premount.cpio"))
-        || (name_str.len() >= 23
-        && name_str[name_str.len()-23] == b'/'
-        && name_str[name_str.len()-22..name_str.len()-13].eq_ignore_ascii_case(b"choosable")
-        && name_str[name_str.len()-12] == b'/'
-        && name_str[name_str.len()-11..].eq_ignore_ascii_case(b"premount.cpio"));
-
-    // Also match the direct resolved path: "choosable\premount.cpio" (no leading backslash after stripping)
-    let has_short = name_str.len() >= 23
-        && name_str[..9].eq_ignore_ascii_case(b"choosable")
-        && (name_str[9] == b'\\' || name_str[9] == b'/')
-        && name_str[10..].eq_ignore_ascii_case(b"premount.cpio");
-
-    has_path || has_short
+    let lower = |c: u16| if c >= b'A' as u16 && c <= b'Z' as u16 { c | 0x20 } else { c };
+    let needle_lower: [u16; 13] = [b'p' as u16, b'r' as u16, b'e' as u16, b'm' as u16, b'o' as u16, b'u' as u16, b'n' as u16, b't' as u16, b'.' as u16, b'c' as u16, b'p' as u16, b'i' as u16, b'o' as u16];
+    if path.len() < 13 { return false; }
+    for start in 0..=path.len() - 13 {
+        if lower(path[start + 0]) != needle_lower[0] { continue; }
+        if lower(path[start + 1]) != needle_lower[1] { continue; }
+        if lower(path[start + 2]) != needle_lower[2] { continue; }
+        if lower(path[start + 3]) != needle_lower[3] { continue; }
+        if lower(path[start + 4]) != needle_lower[4] { continue; }
+        if lower(path[start + 5]) != needle_lower[5] { continue; }
+        if lower(path[start + 6]) != needle_lower[6] { continue; }
+        if lower(path[start + 7]) != needle_lower[7] { continue; }
+        if lower(path[start + 8]) != needle_lower[8] { continue; }
+        if lower(path[start + 9]) != needle_lower[9] { continue; }
+        if lower(path[start + 10]) != needle_lower[10] { continue; }
+        if lower(path[start + 11]) != needle_lower[11] { continue; }
+        if lower(path[start + 12]) != needle_lower[12] { continue; }
+        return true;
+    }
+    false
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -287,7 +270,7 @@ unsafe extern "efiapi" fn file_open(
         core::slice::from_raw_parts(file_name, len)
     };
 
-    // ── Synthetic premount cpio file ──
+    // ── Synthetic premount cpio file (served at root level) ──
     if ctx.premount_cpio_size > 0 && !ctx.premount_cpio_buf.is_null() && is_premount_path(name_slice) {
         let bs = unsafe { &mut *ctx.bs };
         let mut ptr: *mut c_void = core::ptr::null_mut();

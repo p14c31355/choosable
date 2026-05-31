@@ -132,7 +132,7 @@ impl BootStrategy for CasperStrategy {
         patch_grub_cfg_impl(
             inp,
             b" boot=casper rootwait rootdelay=300 debug",
-            b" /choosable/premount.cpio",
+            b" /premount.cpio",
         )
     }
 }
@@ -158,7 +158,7 @@ impl BootStrategy for LiveOSStrategy {
         patch_grub_cfg_impl(
             inp,
             b" rd.live.image rootdelay=300",
-            b" /choosable/premount.cpio",
+            b" /premount.cpio",
         )
     }
 }

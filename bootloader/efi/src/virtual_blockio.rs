@@ -71,7 +71,57 @@ unsafe extern "efiapi" fn vblock_read(
                 entry[off + 14..off + 18].copy_from_slice(&vbio.dir_entry_new_size.to_be_bytes());
             }
         }
-        // Case 2: Patched file sector — served from appended data
+        // Case 2a: Root directory sector — inject PREMOUNT.CPIO entry
+        if vbio.premount_entry_patched && block_lba == vbio.premount_entry_sector as u64 {
+            let disk_lba = vbio.iso_lba + block_lba * 4;
+            let status = unsafe {
+                ((*vbio.real_bio_ptr).read_blocks)(
+                    vbio.real_bio_ptr,
+                    vbio.real_media_id,
+                    disk_lba,
+                    2048,
+                    dst.as_mut_ptr().add(block_offset) as *mut c_void,
+                )
+            };
+            if status != EFI_SUCCESS { return EFI_DEVICE_ERROR; }
+            let entry = &mut dst[block_offset..block_offset + 2048];
+            let off = vbio.premount_entry_offset as usize;
+            if off + 34 <= 2048 {
+                // ISO9660 directory entry layout (big-endian for extent/size too)
+                entry[off] = 34; // record length
+                entry[off + 1] = 0; // ext attr
+                // extent LBA LE + BE
+                entry[off + 2..off + 6].copy_from_slice(&vbio.premount_entry_new_extent.to_le_bytes());
+                entry[off + 6..off + 10].copy_from_slice(&vbio.premount_entry_new_extent.to_be_bytes());
+                // data length LE + BE
+                entry[off + 10..off + 14].copy_from_slice(&vbio.premount_entry_new_size.to_le_bytes());
+                entry[off + 14..off + 18].copy_from_slice(&vbio.premount_entry_new_size.to_be_bytes());
+                // recording date/time (zero)
+                for i in 18..25 { entry[off + i] = 0; }
+                entry[off + 25] = 0; // file flags (not directory)
+                entry[off + 26] = 0; // file unit size
+                entry[off + 27] = 0; // interleave
+                // volume seq LE+BE
+                entry[off + 28..off + 32].copy_from_slice(&1u16.to_le_bytes());
+                entry[off + 30..off + 34].copy_from_slice(&1u16.to_be_bytes());
+                entry[off + 32] = 13; // name length
+                // "PREMOUNT.CPIO;1" = 14 chars
+                let name = b"PREMOUNT.CPIO;1";
+                for j in 0..14 { entry[off + 33 + j] = name[j]; }
+            }
+        }
+
+        // Case 2b: Premount file sector — served from memory
+        else if vbio.premount_file_sectors > 0
+            && !vbio.premount_file_buf.is_null()
+            && block_lba >= vbio.premount_file_sector as u64
+            && block_lba < vbio.premount_file_sector as u64 + vbio.premount_file_sectors as u64
+        {
+            let p_off = ((block_lba - vbio.premount_file_sector as u64) as usize) * 2048;
+            let src = unsafe { core::slice::from_raw_parts(vbio.premount_file_buf.add(p_off), 2048) };
+            dst[block_offset..block_offset + 2048].copy_from_slice(src);
+        }
+        // Case 2c: Patched file sector — served from appended data
         else if vbio.patched_file_sectors > 0
             && !vbio.patched_file_buf.is_null()
             && block_lba >= vbio.patched_file_sector as u64
@@ -208,6 +258,14 @@ pub fn create_virtual_cdrom(
     vbio.premount_cpio_size = 0;
     vbio.premount_squashfs_addr = 0;
     vbio.premount_squashfs_size = 0;
+    vbio.premount_entry_sector = 0;
+    vbio.premount_entry_offset = 0;
+    vbio.premount_entry_new_extent = 0;
+    vbio.premount_entry_new_size = 0;
+    vbio.premount_entry_patched = false;
+    vbio.premount_file_sector = 0;
+    vbio.premount_file_sectors = 0;
+    vbio.premount_file_buf = core::ptr::null_mut();
 
     // ═════════════════════════════════════════════════════════════
     // 3. Install BlockIO protocol (creates the handle)

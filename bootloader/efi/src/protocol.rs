@@ -315,6 +315,15 @@ pub struct VirtualBlockIo {
     pub premount_cpio_size: usize,
     pub premount_squashfs_addr: u64,
     pub premount_squashfs_size: u64,
+    /// ── Root directory premount entry ─────────────────────────
+    pub premount_file_sector: u32,
+    pub premount_file_sectors: u32,
+    pub premount_file_buf: *mut u8,
+    pub premount_entry_sector: u32,
+    pub premount_entry_offset: u32,
+    pub premount_entry_new_extent: u32,
+    pub premount_entry_new_size: u32,
+    pub premount_entry_patched: bool,
 }
 
 pub const DEVICE_PATH_PROTOCOL_GUID: Guid = Guid {
