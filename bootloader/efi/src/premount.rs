@@ -59,7 +59,7 @@ fn build_premount_script(offset_bytes: u64) -> [u8; 1024] {
 #!/bin/sh
 # Choosable premount: loop-mounts ISO from raw partition offset
 echo '[choosable] premount starting, offset=OFFSET'
-for dev in /dev/sd[a-z][0-9]* /dev/nvme[0-9]*p[0-9]* /dev/mmcblk[0-9]*p[0-9]*; do
+for dev in /dev/sd[a-z][0-9]* /dev/nvme[0-9]*p[0-9]* /dev/mmcblk[0-9]*p[0-9]* /dev/vd[a-z][0-9]*; do
   [ -b \"$dev\" ] || continue
   losetup -o OFFSET /dev/loop0 \"$dev\" 2>/dev/null || continue
   if mount -t iso9660 -o ro /dev/loop0 /cdrom 2>/dev/null; then
