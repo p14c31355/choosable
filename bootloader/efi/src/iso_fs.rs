@@ -294,7 +294,7 @@ unsafe extern "efiapi" fn file_open(
     let is_synthetic = ctx.premount_cpio_size > 0
         && !ctx.premount_cpio_buf.is_null()
         && (path_component_matches(name_slice, &ctx.premount_target_name[..ctx.premount_target_name_len])
-            || (ctx.premount_target_name_len == 0 && path_component_matches(name_slice, b"PREMOUNT.CPIO")));
+            || path_component_matches(name_slice, b"PREMOUNT.CPIO"));
     if is_synthetic {
         let bs = unsafe { &mut *ctx.bs };
         let mut ptr: *mut c_void = core::ptr::null_mut();
