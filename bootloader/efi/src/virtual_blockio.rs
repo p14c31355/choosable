@@ -71,39 +71,44 @@ unsafe extern "efiapi" fn vblock_read(
                 entry[off + 14..off + 18].copy_from_slice(&vbio.dir_entry_new_size.to_be_bytes());
             }
         }
-        // Case 2a: Root directory sector — inject PREMOUNT.CPIO entry
-        if vbio.premount_entry_patched && block_lba == vbio.premount_entry_sector as u64 {
-            // If Case 1 already read this sector, skip the disk read to avoid
-            // overwriting the grub.cfg patch.  This happens when grub.cfg and
-            // the PREMOUNT.CPIO injection target are in the same directory
-            // sector (the common case).
-            if !(vbio.dir_entry_patched && block_lba == vbio.dir_entry_sector as u64) {
-                let disk_lba = vbio.iso_lba + block_lba * 4;
-                let status = unsafe {
-                    ((*vbio.real_bio_ptr).read_blocks)(
-                        vbio.real_bio_ptr,
-                        vbio.real_media_id,
-                        disk_lba,
-                        2048,
-                        dst.as_mut_ptr().add(block_offset) as *mut c_void,
-                    )
-                };
-                if status != EFI_SUCCESS { return EFI_DEVICE_ERROR; }
-            }
-            let entry = &mut dst[block_offset..block_offset + 2048];
-            let off = vbio.premount_entry_offset as usize;
-            // Only overwrite extent LBA and data length — keep the original
-            // filename (MD5SUM.TXT) intact.  Changing the name to a longer
-            // one (PREMOUNT.CPIO;1: 15 bytes vs MD5SUM.TXT;1: 12 bytes)
-            // would overwrite the record_len of the next directory entry,
-            // corrupting the root directory and crashing GRUB/kernel parsers.
-            if off + 18 <= 2048 {
-                // extent LBA LE + BE
-                entry[off + 2..off + 6].copy_from_slice(&vbio.premount_entry_new_extent.to_le_bytes());
-                entry[off + 6..off + 10].copy_from_slice(&vbio.premount_entry_new_extent.to_be_bytes());
-                // data length LE + BE
-                entry[off + 10..off + 14].copy_from_slice(&vbio.premount_entry_new_size.to_le_bytes());
-                entry[off + 14..off + 18].copy_from_slice(&vbio.premount_entry_new_size.to_be_bytes());
+        // Case 2a: Root directory sector — inject premount entry redirect,
+        //          OR guard against fall-through when Case 1 already handled
+        //          this sector (grub.cfg and premount target sharing a
+        //          directory sector, the common case).
+        if (vbio.premount_entry_patched && block_lba == vbio.premount_entry_sector as u64)
+            || (vbio.dir_entry_patched && block_lba == vbio.dir_entry_sector as u64)
+        {
+            if vbio.premount_entry_patched && block_lba == vbio.premount_entry_sector as u64 {
+                // If Case 1 already read this sector, skip the disk read to avoid
+                // overwriting the grub.cfg patch.
+                if !(vbio.dir_entry_patched && block_lba == vbio.dir_entry_sector as u64) {
+                    let disk_lba = vbio.iso_lba + block_lba * 4;
+                    let status = unsafe {
+                        ((*vbio.real_bio_ptr).read_blocks)(
+                            vbio.real_bio_ptr,
+                            vbio.real_media_id,
+                            disk_lba,
+                            2048,
+                            dst.as_mut_ptr().add(block_offset) as *mut c_void,
+                        )
+                    };
+                    if status != EFI_SUCCESS { return EFI_DEVICE_ERROR; }
+                }
+                let entry = &mut dst[block_offset..block_offset + 2048];
+                let off = vbio.premount_entry_offset as usize;
+                // Only overwrite extent LBA and data length — keep the original
+                // filename (MD5SUM.TXT) intact.  Changing the name to a longer
+                // one (PREMOUNT.CPIO;1: 15 bytes vs MD5SUM.TXT;1: 12 bytes)
+                // would overwrite the record_len of the next directory entry,
+                // corrupting the root directory and crashing GRUB/kernel parsers.
+                if off + 18 <= 2048 {
+                    // extent LBA LE + BE
+                    entry[off + 2..off + 6].copy_from_slice(&vbio.premount_entry_new_extent.to_le_bytes());
+                    entry[off + 6..off + 10].copy_from_slice(&vbio.premount_entry_new_extent.to_be_bytes());
+                    // data length LE + BE
+                    entry[off + 10..off + 14].copy_from_slice(&vbio.premount_entry_new_size.to_le_bytes());
+                    entry[off + 14..off + 18].copy_from_slice(&vbio.premount_entry_new_size.to_be_bytes());
+                }
             }
         }
 

@@ -171,13 +171,25 @@ pub fn prepare_premount_initrd(
     };
 
     // Directory: scripts/
-    if !append_entry(cpio, &mut off, b"scripts", b"", 0o40755) { return None; }
+    if !append_entry(cpio, &mut off, b"scripts", b"", 0o40755) {
+        unsafe { (bs.free_pool)(cpio_ptr); }
+        return None;
+    }
     // Directory: scripts/casper-premount/
-    if !append_entry(cpio, &mut off, b"scripts/casper-premount", b"", 0o40755) { return None; }
+    if !append_entry(cpio, &mut off, b"scripts/casper-premount", b"", 0o40755) {
+        unsafe { (bs.free_pool)(cpio_ptr); }
+        return None;
+    }
     // File: scripts/casper-premount/choosable
-    if !append_entry(cpio, &mut off, b"scripts/casper-premount/choosable", &script[..script_len], 0o100755) { return None; }
+    if !append_entry(cpio, &mut off, b"scripts/casper-premount/choosable", &script[..script_len], 0o100755) {
+        unsafe { (bs.free_pool)(cpio_ptr); }
+        return None;
+    }
     // Trailer
-    if !append_entry(cpio, &mut off, b"TRAILER!!!", b"", 0) { return None; }
+    if !append_entry(cpio, &mut off, b"TRAILER!!!", b"", 0) {
+        unsafe { (bs.free_pool)(cpio_ptr); }
+        return None;
+    }
 
     Some(PremountBundle {
         cpio_buf: cpio_ptr as *mut u8,
