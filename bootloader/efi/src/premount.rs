@@ -142,7 +142,7 @@ pub fn prepare_premount_initrd(
     let offset_bytes = iso_lba * 512;
 
     let script = build_premount_script(offset_bytes);
-    let script_len = script.iter().position(|&c| c == 0).unwrap_or(511);
+    let script_len = script.iter().position(|&c| c == 0).unwrap_or(1023);
 
     let cpio_estimate = 2048usize;
     let mut cpio_ptr: *mut c_void = core::ptr::null_mut();
