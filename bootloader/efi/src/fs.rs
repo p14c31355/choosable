@@ -111,7 +111,11 @@ fn scan_exfat_dir(
     heap_start: u64,
     files: &mut [IsoEntry; 64],
     count: &mut usize,
+    path_prefix: &[u8],
 ) {
+    if *count >= 64 {
+        return;
+    }
     let mut cluster = root_cluster;
     let mut buf: [u8; 512] = [0; 512];
     let mut carry: [u8; 608] = [0; 608];
@@ -160,6 +164,11 @@ fn scan_exfat_dir(
                         pos += total_ents;
                         continue;
                     }
+                    let file_attrs = u16::from_le_bytes([
+                        entries[pos * 32 + 4],
+                        entries[pos * 32 + 5],
+                    ]);
+                    let is_dir = (file_attrs & 0x10) != 0;
                     let start_cl = u32::from_le_bytes([
                         entries[stream_off + 20],
                         entries[stream_off + 21],
@@ -206,16 +215,50 @@ fn scan_exfat_dir(
                         name_pos += to_copy;
                     }
 
-                    if name_pos >= 4
+                    if is_dir && start_cl >= 2 && *count < 64 {
+                        // Build sub-path and recurse
+                        let prefix_len = path_prefix.len();
+                        let mut sub_path = [0u8; 256];
+                        let mut sp = 0usize;
+                        sub_path[sp..sp + prefix_len].copy_from_slice(path_prefix);
+                        sp += prefix_len;
+                        if prefix_len != 1 || path_prefix[0] != b'/' {
+                            if sp < 256 { sub_path[sp] = b'/'; sp += 1; }
+                        }
+                        let cl = name_pos.min(256 - sp);
+                        sub_path[sp..sp + cl].copy_from_slice(&name_buf[..cl]);
+                        sp += cl;
+
+                        scan_exfat_dir(
+                            bio_ref, bio_ptr, mid, start_cl, spc, fat_start, heap_start,
+                            files, count, &sub_path[..sp],
+                        );
+                    } else if name_pos >= 4
                         && name_buf[name_pos - 4..name_pos]
                             .eq_ignore_ascii_case(b".iso")
                         && *count < 64
                     {
                         let file_lba = heap_start
                             + (start_cl as u64 - 2) * spc as u64;
+
+                        // Build full path
+                        let prefix_len = path_prefix.len();
+                        let mut full_buf = [0u8; 256];
+                        let mut fp = 0usize;
+                        full_buf[fp..fp + prefix_len].copy_from_slice(path_prefix);
+                        fp += prefix_len;
+                        if prefix_len == 1 && path_prefix[0] == b'/' {
+                            // root: "/" + "name" = "/name"
+                        } else {
+                            if fp < 256 { full_buf[fp] = b'/'; fp += 1; }
+                        }
+                        let cl = name_pos.min(256 - fp);
+                        full_buf[fp..fp + cl].copy_from_slice(&name_buf[..cl]);
+                        fp += cl;
+
                         files[*count] = IsoEntry {
-                            name: name_buf,
-                            name_len: name_pos,
+                            name: full_buf,
+                            name_len: fp,
                             file_start_lba: file_lba,
                             file_size: fsize,
                         };
@@ -259,8 +302,9 @@ fn scan_fat32_dir(
     data_start: u64,
     files: &mut [IsoEntry; 64],
     count: &mut usize,
+    path_prefix: &[u8],
 ) {
-    if root_cluster == 0 {
+    if root_cluster == 0 || *count >= 64 {
         return;
     }
     let mut cluster = root_cluster;
@@ -387,6 +431,39 @@ fn scan_fat32_dir(
                     name_len = nlen;
                 }
                 lfn_len = 0;
+                let is_dir = (attr & 0x10) != 0;
+
+                // Skip . and ..
+                let is_dot = name_len == 1 && name_buf[0] == b'.';
+                let is_dotdot = name_len == 2 && name_buf[0] == b'.' && name_buf[1] == b'.';
+
+                if is_dir && !is_dot && !is_dotdot && *count < 64 {
+                    let dir_cl = u32::from_le_bytes([
+                        buf[off + 26],
+                        buf[off + 27],
+                        buf[off + 20],
+                        buf[off + 21],
+                    ]);
+                    // Build sub-path
+                    let prefix_len = path_prefix.len();
+                    let mut sub_path = [0u8; 256];
+                    let mut sp = 0usize;
+                    sub_path[sp..sp + prefix_len].copy_from_slice(path_prefix);
+                    sp += prefix_len;
+                    if prefix_len != 1 || path_prefix[0] != b'/' {
+                        if sp < 256 { sub_path[sp] = b'/'; sp += 1; }
+                    }
+                    let copy_len = name_len.min(256 - sp);
+                    sub_path[sp..sp + copy_len].copy_from_slice(&name_buf[..copy_len]);
+                    sp += copy_len;
+
+                    scan_fat32_dir(
+                        bio_ref, bio_ptr, mid, dir_cl, spc, fat_start, data_start,
+                        files, count,
+                        &sub_path[..sp],
+                    );
+                    continue;
+                }
 
                 let is_iso = name_len >= 4
                     && name_buf[name_len - 4..name_len]
@@ -407,9 +484,26 @@ fn scan_fat32_dir(
                     ]);
                     let file_lba = data_start
                         + (file_cl as u64 - 2) * spc as u64;
+
+                    // Build full path: path_prefix is always "/"-prefixed.
+                    // If prefix is just "/", don't add another separator.
+                    let prefix_len = path_prefix.len();
+                    let mut full_buf = [0u8; 256];
+                    let mut fp = 0usize;
+                    full_buf[fp..fp + prefix_len].copy_from_slice(path_prefix);
+                    fp += prefix_len;
+                    if prefix_len == 1 && path_prefix[0] == b'/' {
+                        // root: "/" + "name" = "/name"
+                    } else {
+                        if fp < 256 { full_buf[fp] = b'/'; fp += 1; }
+                    }
+                    let cl = name_len.min(256 - fp);
+                    full_buf[fp..fp + cl].copy_from_slice(&name_buf[..cl]);
+                    fp += cl;
+
                     files[*count] = IsoEntry {
-                        name: name_buf,
-                        name_len,
+                        name: full_buf,
+                        name_len: fp,
                         file_start_lba: file_lba,
                         file_size: file_sz as u64,
                     };
@@ -563,6 +657,7 @@ fn scan_ntfs_dir(
     ctx: &FsCtx,
     files: &mut [IsoEntry; 64],
     count: &mut usize,
+    path_prefix: &[u8],
 ) {
     let rec_size = ctx.mft_record_size as usize;
     if rec_size > 4096 {
@@ -611,6 +706,7 @@ fn scan_ntfs_dir(
         &rec_buf[attrs_off..],
         files,
         count,
+        path_prefix,
     );
 }
 
@@ -622,6 +718,7 @@ fn parse_ntfs_attrs(
     attrs: &[u8],
     files: &mut [IsoEntry; 64],
     count: &mut usize,
+    path_prefix: &[u8],
 ) {
     let mut off = 0usize;
     while off + 4 < attrs.len() {
@@ -660,7 +757,7 @@ fn parse_ntfs_attrs(
                     &attrs[off + val_off..off + alen];
                 parse_ntfs_index_root(
                     bio_ref, bio_ptr, mid, ctx, index_data,
-                    files, count,
+                    files, count, path_prefix,
                 );
             }
         }
@@ -676,6 +773,7 @@ fn parse_ntfs_index_root(
     data: &[u8],
     files: &mut [IsoEntry; 64],
     count: &mut usize,
+    path_prefix: &[u8],
 ) {
     if data.len() < 20 {
         return;
@@ -690,7 +788,7 @@ fn parse_ntfs_index_root(
     parse_ntfs_index_entries(
         bio_ref, bio_ptr, mid, ctx,
         &data[entries_off..],
-        files, count,
+        files, count, path_prefix,
     );
 }
 
@@ -702,6 +800,7 @@ fn parse_ntfs_index_entries(
     mut entries: &[u8],
     files: &mut [IsoEntry; 64],
     count: &mut usize,
+    path_prefix: &[u8],
 ) {
     while entries.len() >= 0x50 {
         let mft_ref =
@@ -746,9 +845,24 @@ fn parse_ntfs_index_entries(
                             mft_rec,
                         )
                     {
+                        // Build full path: prefix + "/" + name
+                        let prefix_len = path_prefix.len();
+                        let mut full_buf = [0u8; 256];
+                        let mut fp = 0usize;
+                        full_buf[fp..fp + prefix_len].copy_from_slice(path_prefix);
+                        fp += prefix_len;
+                        if prefix_len == 1 && path_prefix[0] == b'/' {
+                            // root: "/" + "name" = "/name"
+                        } else {
+                            if fp < 256 { full_buf[fp] = b'/'; fp += 1; }
+                        }
+                        let cl = np.min(256 - fp);
+                        full_buf[fp..fp + cl].copy_from_slice(&name_buf[..cl]);
+                        fp += cl;
+
                         files[*count] = IsoEntry {
-                            name: name_buf,
-                            name_len: np,
+                            name: full_buf,
+                            name_len: fp,
                             file_start_lba: lba,
                             file_size: sz,
                         };
@@ -779,14 +893,14 @@ pub fn scan_directory(
     match ctx.fs {
         FsType::Exfat => scan_exfat_dir(
             bio_ref, bio_ptr, mid, ctx.root_cluster, ctx.spc,
-            ctx.fat_start, ctx.heap_start, files, count,
+            ctx.fat_start, ctx.heap_start, files, count, b"/",
         ),
         FsType::Fat32 => scan_fat32_dir(
             bio_ref, bio_ptr, mid, ctx.root_cluster, ctx.spc,
-            ctx.fat_start, ctx.heap_start, files, count,
+            ctx.fat_start, ctx.heap_start, files, count, b"/",
         ),
         FsType::Ntfs => {
-            scan_ntfs_dir(bio_ref, bio_ptr, mid, ctx, files, count);
+            scan_ntfs_dir(bio_ref, bio_ptr, mid, ctx, files, count, b"/");
         }
     }
 }

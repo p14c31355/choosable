@@ -149,7 +149,7 @@ impl BootStrategy for CasperStrategy {
     }
 
     fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> {
-        patch_common(inp, b" rootdelay=5 iso-scan/filename=/")
+        patch_common(inp, b" rootwait rootdelay=15 iso-scan/filename=")
     }
 }
 
@@ -171,7 +171,7 @@ impl BootStrategy for LiveOSStrategy {
     }
 
     fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> {
-        patch_common(inp, b" rd.live.image rootdelay=15 iso-scan/filename=/")
+        patch_common(inp, b" rd.live.image rootdelay=15 iso-scan/filename=")
     }
 }
 
