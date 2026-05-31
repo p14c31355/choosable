@@ -76,25 +76,14 @@ fn read_fat_entry(
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn parse_varlen_le(data: &[u8], n: usize) -> u64 {
-    let mut val: u64 = 0;
-    let end = data.len().min(n).min(8);
-    for (i, &b) in data[..end].iter().enumerate() {
-        val |= (b as u64) << (i * 8);
-    }
-    val
+    data[..data.len().min(n).min(8)].iter().enumerate().fold(0, |v, (i, &b)| v | ((b as u64) << (i * 8)))
 }
 
 fn parse_varlen_le_signed(data: &[u8], n: usize) -> i64 {
-    if n == 0 || n > 8 {
-        return 0;
-    }
+    if n == 0 || n > 8 { return 0; }
     let val = parse_varlen_le(data, n);
     let bits = (n * 8) as u64;
-    if n < 8 && (val & (1u64 << (bits - 1))) != 0 {
-        (val as i64) - (1i64 << bits)
-    } else {
-        val as i64
-    }
+    (val as i64).wrapping_sub(if n < 8 && (val & (1u64 << (bits - 1))) != 0 { 1i64 << bits } else { 0 })
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
