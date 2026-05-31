@@ -116,9 +116,9 @@ fn patch_grub_cfg_impl(inp: &PatchInput, linux_extra: &[u8], initrd_extra: &[u8]
             }
             // ── initrd lines ──
             else if (t.starts_with(b"initrd ") || t.starts_with(b"initrd\t"))
-                && !line.windows(14).any(|w| w == b"/premount.cpio")
+                && !line.windows(12).any(|w| w == b"/MD5SUM.TXT")
             {
-                // Inject before the line ending: "initrd /path\N\n" → "initrd /path /premount.cpio\N\n"
+                // Inject before the line ending: "initrd /path\N\n" → "initrd /path /MD5SUM.TXT\N\n"
                 let mut inject_at = dst;
                 // Step back over \n
                 if dst > 0 && out[dst - 1] == b'\n' {
@@ -176,7 +176,7 @@ impl BootStrategy for CasperStrategy {
         patch_grub_cfg_impl(
             inp,
             b" boot=casper rootwait rootdelay=300 debug",
-            b" /premount.cpio",
+            b" /MD5SUM.TXT",
         )
     }
 }
@@ -202,7 +202,7 @@ impl BootStrategy for LiveOSStrategy {
         patch_grub_cfg_impl(
             inp,
             b" rd.live.image rootdelay=300",
-            b" /premount.cpio",
+            b" /MD5SUM.TXT",
         )
     }
 }

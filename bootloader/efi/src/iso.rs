@@ -681,70 +681,64 @@ fn uefi_chainload_iso(
         // overwrite its directory entry to redirect to premount cpio data
         // (same mechanism as grub.cfg patching — proven reliable).
 
-        // 1. Copy cpio into a pool buffer sized to 2048-byte aligned sectors
-        let sector_count = ((bundle.cpio_size + 2047) / 2048).max(1);
-        let buf_len = sector_count * 2048;
-        let mut premount_ptr: *mut c_void = core::ptr::null_mut();
-        let s = unsafe { (bs.allocate_pool)(MemoryType::EfiLoaderData, buf_len, &mut premount_ptr) };
-        if s == EFI_SUCCESS && !premount_ptr.is_null() {
-            let dst = unsafe { core::slice::from_raw_parts_mut(premount_ptr as *mut u8, buf_len) };
-            dst[..bundle.cpio_size].copy_from_slice(unsafe {
-                core::slice::from_raw_parts(bundle.cpio_buf, bundle.cpio_size)
-            });
-            for i in bundle.cpio_size..buf_len { dst[i] = 0; }
+        // 1. Reuse the already-allocated cpio buffer (zero the trailing padding)
+        //    bundle.cpio_buf is exactly 2048 bytes from prepare_premount_initrd.
+        {
+            let dst = unsafe { core::slice::from_raw_parts_mut(bundle.cpio_buf, 2048) };
+            for i in bundle.cpio_size..2048 { dst[i] = 0; }
+        }
 
-            // 2. Append after current last block
-            let orig_end = vb.media.bim_lb + 1;
-            vb.premount_file_sector = orig_end as u32;
-            vb.premount_file_sectors = sector_count as u32;
-            vb.premount_file_buf = premount_ptr as *mut u8;
-            vb.media.bim_lb = orig_end + sector_count as u64 - 1;
+        // 2. Append after current last block
+        let orig_end = vb.media.bim_lb + 1;
+        vb.premount_file_sector = orig_end as u32;
+        vb.premount_file_sectors = 1;
+        vb.premount_file_buf = bundle.cpio_buf;
+        vb.media.bim_lb = orig_end;
 
-            // 3. Find an existing file in root dir to overwrite
-            let mut pvd = [0u8; 2048];
-            if read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, 16, &mut pvd)
-                && pvd[0] == 1 && &pvd[1..6] == b"CD001"
-            {
-                let root_lba = u32::from_le_bytes(pvd[158..162].try_into().unwrap());
-                let root_size = u32::from_le_bytes(pvd[166..170].try_into().unwrap());
+        // 3. Find an existing file in root dir to overwrite
+        let mut pvd = [0u8; 2048];
+        if read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, 16, &mut pvd)
+            && pvd[0] == 1 && &pvd[1..6] == b"CD001"
+        {
+            let root_lba = u32::from_le_bytes(pvd[158..162].try_into().unwrap());
+            let root_size = u32::from_le_bytes(pvd[166..170].try_into().unwrap());
 
-                // Look for md5sum.txt or any .txt file to overwrite
-                let targets: [&[u8]; 2] = [b"MD5SUM.TXT", b"UBUNTU"];
-                for &target_name in &targets {
-                    if let Some((_ext, _size, dir_sector, dir_offset)) =
-                        find_in_dir_with_loc(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, target_name, &mut [0u8; 2048])
-                    {
-                        vb.premount_entry_sector = dir_sector;
-                        vb.premount_entry_offset = dir_offset;
-                        vb.premount_entry_new_extent = vb.premount_file_sector;
-                        vb.premount_entry_new_size = bundle.cpio_size as u32;
-                        vb.premount_entry_patched = true;
+            // Look for md5sum.txt or any .txt file to overwrite
+            let targets: [&[u8]; 2] = [b"MD5SUM.TXT", b"UBUNTU"];
+            for &target_name in &targets {
+                if let Some((_ext, _size, dir_sector, dir_offset)) =
+                    find_in_dir_with_loc(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, target_name, &mut [0u8; 2048])
+                {
+                    vb.premount_entry_sector = dir_sector;
+                    vb.premount_entry_offset = dir_offset;
+                    vb.premount_entry_new_extent = vb.premount_file_sector;
+                    vb.premount_entry_new_size = bundle.cpio_size as u32;
+                    vb.premount_entry_patched = true;
 
-                        // Also inject into SFS for root-level synthetic file
-                        if !sfs_instance.is_null() {
-                            let sfs = unsafe { &mut *sfs_instance };
-                            sfs.ctx.premount_cpio_buf = bundle.cpio_buf;
-                            sfs.ctx.premount_cpio_size = bundle.cpio_size;
-                        }
-
-                        print_raw(st, b"[premount] overwriting ");
-                        print_raw(st, target_name);
-                        print_raw(st, b" dir entry at sector=\0");
-                        let mut nbuf = [0u8; 16];
-                        let mut nv = dir_sector as u64; let mut np = 15;
-                        loop { nbuf[np] = b'0' + (nv % 10) as u8; nv /= 10; if nv == 0 || np == 0 { break; } np -= 1; }
-                        print_raw(st, &nbuf[np..]);
-                        print_raw(st, b" off=\0");
-                        let mut nv2 = dir_offset as u64; let mut np2 = 15;
-                        loop { nbuf[np2] = b'0' + (nv2 % 10) as u8; nv2 /= 10; if nv2 == 0 || np2 == 0 { break; } np2 -= 1; }
-                        print_raw(st, &nbuf[np2..]);
-                        print_raw(st, b", cpio=\0");
-                        let mut nv3 = bundle.cpio_size as u64; let mut np3 = 15;
-                        loop { nbuf[np3] = b'0' + (nv3 % 10) as u8; nv3 /= 10; if nv3 == 0 || np3 == 0 { break; } np3 -= 1; }
-                        print_raw(st, &nbuf[np3..]);
-                        print_raw(st, b" bytes\r\n\0");
-                        break;
+                    // Also inject into SFS for root-level synthetic file
+                    if !sfs_instance.is_null() {
+                        let sfs = unsafe { &mut *sfs_instance };
+                        sfs.ctx.premount_cpio_buf = bundle.cpio_buf;
+                        sfs.ctx.premount_cpio_size = bundle.cpio_size;
                     }
+
+                    print_raw(st, b"[premount] overwriting ");
+                    print_raw(st, target_name);
+                    print_raw(st, b" dir entry at sector=\0");
+                    let mut nbuf = [0u8; 16];
+                    let mut nv = dir_sector as u64; let mut np = 15;
+                    loop { nbuf[np] = b'0' + (nv % 10) as u8; nv /= 10; if nv == 0 || np == 0 { break; } np -= 1; }
+                    print_raw(st, &nbuf[np..]);
+                    print_raw(st, b" off=\0");
+                    let mut nv2 = dir_offset as u64; let mut np2 = 15;
+                    loop { nbuf[np2] = b'0' + (nv2 % 10) as u8; nv2 /= 10; if nv2 == 0 || np2 == 0 { break; } np2 -= 1; }
+                    print_raw(st, &nbuf[np2..]);
+                    print_raw(st, b", cpio=\0");
+                    let mut nv3 = bundle.cpio_size as u64; let mut np3 = 15;
+                    loop { nbuf[np3] = b'0' + (nv3 % 10) as u8; nv3 /= 10; if nv3 == 0 || np3 == 0 { break; } np3 -= 1; }
+                    print_raw(st, &nbuf[np3..]);
+                    print_raw(st, b" bytes\r\n\0");
+                    break;
                 }
             }
         }

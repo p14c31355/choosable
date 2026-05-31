@@ -92,25 +92,18 @@ unsafe extern "efiapi" fn vblock_read(
             }
             let entry = &mut dst[block_offset..block_offset + 2048];
             let off = vbio.premount_entry_offset as usize;
-            if off + 48 <= 2048 {
-                entry[off + 1] = 0; // ext attr
+            // Only overwrite extent LBA and data length — keep the original
+            // filename (MD5SUM.TXT) intact.  Changing the name to a longer
+            // one (PREMOUNT.CPIO;1: 15 bytes vs MD5SUM.TXT;1: 12 bytes)
+            // would overwrite the record_len of the next directory entry,
+            // corrupting the root directory and crashing GRUB/kernel parsers.
+            if off + 18 <= 2048 {
                 // extent LBA LE + BE
                 entry[off + 2..off + 6].copy_from_slice(&vbio.premount_entry_new_extent.to_le_bytes());
                 entry[off + 6..off + 10].copy_from_slice(&vbio.premount_entry_new_extent.to_be_bytes());
                 // data length LE + BE
                 entry[off + 10..off + 14].copy_from_slice(&vbio.premount_entry_new_size.to_le_bytes());
                 entry[off + 14..off + 18].copy_from_slice(&vbio.premount_entry_new_size.to_be_bytes());
-                // recording date/time (zero)
-                for i in 18..25 { entry[off + i] = 0; }
-                entry[off + 25] = 0; // file flags (not directory)
-                entry[off + 26] = 0; // file unit size
-                entry[off + 27] = 0; // interleave
-                // volume seq LE+BE
-                entry[off + 28..off + 30].copy_from_slice(&1u16.to_le_bytes());
-                entry[off + 30..off + 32].copy_from_slice(&1u16.to_be_bytes());
-                entry[off + 32] = 15; // name length
-                let name = b"PREMOUNT.CPIO;1";
-                entry[off + 33..off + 33 + 15].copy_from_slice(name);
             }
         }
 
