@@ -167,19 +167,11 @@ fn parse_pvd(ctx: &IsoFsCtx) -> Option<(u32, u32)> {
 
 // ── Synthetic premount file detection ──
 
-/// Check if the UCS-2 path ends with "/PREMOUNT.CPIO" (case-insensitive).
-///
-/// Only matches when the last path component is exactly "premount.cpio",
-/// avoiding false positives like "not_premount.cpio.txt".
-fn is_premount_path(path: &[u16]) -> bool {
-    let lower = |c: u16| if (b'A' as u16..=b'Z' as u16).contains(&c) { c | 0x20 } else { c };
-    const NEEDLE: [u16; 13] = [
-        b'p' as u16, b'r' as u16, b'e' as u16, b'm' as u16, b'o' as u16, b'u' as u16,
-        b'n' as u16, b't' as u16, b'.' as u16, b'c' as u16, b'p' as u16, b'i' as u16,
-        b'o' as u16,
-    ];
-
-    // Find the last path separator.
+/// Check if the UCS-2 path component matches a target byte string case-insensitively.
+/// Handles ISO9660 version suffix (e.g. ";1") by stripping it from the component
+/// before comparison.
+fn path_component_matches(path: &[u16], target: &[u8]) -> bool {
+    // Find the last path separator to extract filename component.
     let mut start = 0usize;
     for i in (0..path.len()).rev() {
         if path[i] == b'\\' as u16 || path[i] == b'/' as u16 {
@@ -187,13 +179,25 @@ fn is_premount_path(path: &[u16]) -> bool {
             break;
         }
     }
-
     let component = &path[start..];
-    if component.len() != 13 {
+    if component.is_empty() {
         return false;
     }
-    for i in 0..13 {
-        if lower(component[i]) != NEEDLE[i] {
+
+    // Strip ISO9660 version suffix ";" + digits from component, e.g. "MD5SUM.TXT;1" → "MD5SUM.TXT"
+    let comp_len = if component.len() >= 2 && component[component.len() - 2] == b';' as u16 {
+        component.len() - 2
+    } else {
+        component.len()
+    };
+
+    if comp_len != target.len() {
+        return false;
+    }
+    let lower = |c: u16| if (b'A' as u16..=b'Z' as u16).contains(&c) { c | 0x20 } else { c };
+    let target_lower = |b: u8| b | 0x20;
+    for i in 0..target.len() {
+        if lower(component[i]) != target_lower(target[i]) as u16 {
             return false;
         }
     }
@@ -283,7 +287,11 @@ unsafe extern "efiapi" fn file_open(
     };
 
     // ── Synthetic premount cpio file (served at root level) ──
-    if ctx.premount_cpio_size > 0 && !ctx.premount_cpio_buf.is_null() && is_premount_path(name_slice) {
+    let is_synthetic = ctx.premount_cpio_size > 0
+        && !ctx.premount_cpio_buf.is_null()
+        && (path_component_matches(name_slice, &ctx.premount_target_name[..ctx.premount_target_name_len])
+            || (ctx.premount_target_name_len == 0 && path_component_matches(name_slice, b"PREMOUNT.CPIO")));
+    if is_synthetic {
         let bs = unsafe { &mut *ctx.bs };
         let mut ptr: *mut c_void = core::ptr::null_mut();
         let status = unsafe { (bs.allocate_pool)(crate::protocol::MemoryType::EfiLoaderData, core::mem::size_of::<VirtualFile>(), &mut ptr) };
