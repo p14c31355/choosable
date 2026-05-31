@@ -69,7 +69,6 @@ fn read_extent(
     }
     let ptr_u8: *mut u8 = ptr as *mut u8;
 
-    // Read the entire extent directly into the pool buffer
     let disk_lba = iso_lba + lba as u64 * 4;
     let read_status = unsafe {
         (bio_ref.read_blocks)(bio_ptr, mid, disk_lba, buf_len, ptr)
@@ -85,8 +84,6 @@ fn read_extent(
 //  ISO9660 directory walker
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Get root directory record from the Primary Volume Descriptor (sector 16).
-/// Returns (extent_lba, extent_size) in ISO sectors/bytes.
 fn get_root_dir(
     st: &mut SystemTable,
     bio_ref: &BlockIoProtocol,
@@ -103,17 +100,11 @@ fn get_root_dir(
         print_raw(st, b"Invalid ISO PVD signature.\r\n\0");
         return None;
     }
-    // Root directory record at offset 156 in PVD.
-    // Fields (offsets from record start):
-    //   extent LE @ +2 (4 bytes)
-    //   size LE   @ +10 (4 bytes)
     let root_extent = u32::from_le_bytes(pvd[158..162].try_into().unwrap());
     let root_size = u32::from_le_bytes(pvd[166..170].try_into().unwrap());
     Some((root_extent, root_size))
 }
 
-/// Search an ISO9660 directory extent for a child by name (case-insensitive).
-/// Returns (child_extent_lba, child_size_in_bytes) or None.
 fn find_in_dir(
     bio_ref: &BlockIoProtocol,
     bio_ptr: *mut BlockIoProtocol,
@@ -128,9 +119,6 @@ fn find_in_dir(
         .map(|(extent, size, _sector, _offset)| (extent, size))
 }
 
-/// Search an ISO9660 directory extent for a child by name, returning the
-/// file extent AND the location of its directory entry (sector + byte offset).
-/// Returns (extent_lba, extent_size, dir_sector, byte_offset_within_sector).
 fn find_in_dir_with_loc(
     bio_ref: &BlockIoProtocol,
     bio_ptr: *mut BlockIoProtocol,
@@ -180,7 +168,71 @@ fn find_in_dir_with_loc(
     None
 }
 
-/// Resolve path "/EFI/BOOT/BOOTX64.EFI" within the ISO directory tree.
+/// Scan a directory for the first non-directory entry that is safe to
+/// overwrite (i.e. not ".", "..", or El Torito boot catalog files).
+/// Returns (entry_sector, entry_offset, iso9660_name_bytes, effective_name_len).
+fn find_first_file_in_dir(
+    bio_ref: &BlockIoProtocol,
+    bio_ptr: *mut BlockIoProtocol,
+    mid: u32,
+    iso_lba: u64,
+    dir_lba: u32,
+    dir_size: u32,
+    scratch: &mut [u8; 2048],
+) -> Option<(u32, u32, [u8; 16], usize)> {
+    let total_sectors = ((dir_size as u64 + 2047) / 2048) as u32;
+    for s in 0..total_sectors {
+        if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, dir_lba + s, scratch) {
+            return None;
+        }
+        let mut offset: usize = 0;
+        while offset + 34 <= 2048 && offset < (dir_size as usize).saturating_sub(s as usize * 2048) {
+            let record_len = scratch[offset] as usize;
+            if record_len == 0 { break; }
+            if offset + record_len > 2048 { break; }
+            let name_len = scratch[offset + 32] as usize;
+            let name_offset = offset + 33;
+            if name_offset + name_len > 2048 { break; }
+            let flags = scratch[offset + 25];
+            let is_dir = flags & 0x02 != 0;
+            let is_dot = name_len == 1 && (scratch[name_offset] == 0 || scratch[name_offset] == 1);
+
+            if !is_dot && !is_dir {
+                let eff_len = if name_len >= 2 && scratch[name_offset + name_len - 2] == b';' {
+                    name_len - 2
+                } else {
+                    name_len
+                };
+
+                // Skip El Torito boot catalog files — GRUB reads these on boot.
+                let is_boot_catalog = {
+                    let cl = eff_len.min(12);
+                    let mut buf = [0u8; 12];
+                    for i in 0..cl {
+                        buf[i] = scratch[name_offset + i].to_ascii_uppercase();
+                    }
+                    &buf[..cl] == b"BOOT.CATALOG" || &buf[..cl.min(8)] == b"BOOT.CAT"
+                };
+                if is_boot_catalog {
+                    offset += record_len;
+                    continue;
+                }
+
+                let dir_sector = dir_lba + s;
+                let dir_offset = offset as u32;
+                let mut name_buf = [0u8; 16];
+                let copy_len = eff_len.min(15);
+                for i in 0..copy_len {
+                    name_buf[i] = scratch[name_offset + i].to_ascii_uppercase();
+                }
+                return Some((dir_sector, dir_offset, name_buf, eff_len));
+            }
+            offset += record_len;
+        }
+    }
+    None
+}
+
 fn find_efi_boot(
     st: &mut SystemTable,
     bio_ref: &BlockIoProtocol,
@@ -191,33 +243,30 @@ fn find_efi_boot(
     let (root_lba, root_size) = get_root_dir(st, bio_ref, bio_ptr, mid, iso_lba)?;
     let mut scratch = [0u8; 2048];
 
-    // 1. Find /EFI
     let (efi_lba, efi_size) = find_in_dir(
         bio_ref, bio_ptr, mid, iso_lba,
         root_lba, root_size, b"EFI", &mut scratch,
     )?;
-
-    // 2. Find /EFI/BOOT
     let (boot_lba, boot_size) = find_in_dir(
         bio_ref, bio_ptr, mid, iso_lba,
         efi_lba, efi_size, b"BOOT", &mut scratch,
     )?;
-
-    // 3. Find /EFI/BOOT/BOOTX64.EFI
     find_in_dir(
         bio_ref, bio_ptr, mid, iso_lba,
         boot_lba, boot_size, b"BOOTX64.EFI", &mut scratch,
     )
 }
 
-/// .CFG candidate entry with path metadata.
+// ═══════════════════════════════════════════════════════════════════════════
+//  .CFG patching helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
 #[derive(Copy, Clone)]
 struct CfgEntry {
     ext_lba: u32, ext_size: u32, dir_sector: u32, dir_offset: u32,
     path: [u8; 64], path_len: usize,
 }
 
-/// Add a .CFG candidate entry to the list (deduplicated by extent LBA).
 fn add_cfg_entry(
     entries: &mut [CfgEntry; 8],
     entry_count: &mut usize,
@@ -225,11 +274,9 @@ fn add_cfg_entry(
     path: &[u8],
 ) {
     if *entry_count >= 8 { return; }
-    let mut dup = false;
     for j in 0..*entry_count {
-        if entries[j].ext_lba == ext_lba { dup = true; break; }
+        if entries[j].ext_lba == ext_lba { return; }
     }
-    if dup { return; }
     let plen = path.len().min(63);
     let mut buf = [0u8; 64];
     buf[..plen].copy_from_slice(&path[..plen]);
@@ -240,7 +287,6 @@ fn add_cfg_entry(
     *entry_count += 1;
 }
 
-/// Try to patch a single candidate file. Returns true if successfully patched.
 fn try_patch_candidate(
     st: &mut SystemTable,
     bs: &mut BootServices,
@@ -261,7 +307,6 @@ fn try_patch_candidate(
     };
     let orig = unsafe { core::slice::from_raw_parts(orig_ptr, orig_len as usize) };
 
-    // Read premount target name from SFS instance (set earlier by uefi_chainload_iso)
     let mut premount_target_name = [0u8; 16];
     let mut premount_target_name_len: usize = 0;
     if !sfs_instance.is_null() {
@@ -273,15 +318,13 @@ fn try_patch_candidate(
         }
     }
 
-    // Check for linux/linuxefi line
-        let has_linux = (orig.len() >= 6 && orig.windows(6).any(|w| w == b"linux " || w == b"linux\t"))
+    let has_linux = (orig.len() >= 6 && orig.windows(6).any(|w| w == b"linux " || w == b"linux\t"))
         || (orig.len() >= 9 && orig.windows(9).any(|w| w == b"linuxefi " || w == b"linuxefi\t"));
     if !has_linux {
         unsafe { (bs.free_pool)(orig_ptr as *mut c_void); }
         return false;
     }
 
-    // Build IsoFsCtx
     let mut iso_name_arr = [0u8; 128];
     let nlen = iso_name.len().min(127);
     iso_name_arr[..nlen].copy_from_slice(&iso_name[..nlen]);
@@ -311,8 +354,7 @@ fn try_patch_candidate(
 
     let sector_aligned_patch = ((patched_size + 2047) / 2048) * 2048;
     let mut patch_block_ptr: *mut c_void = core::ptr::null_mut();
-    let s = unsafe { (bs.allocate_pool)(MemoryType::EfiLoaderData, sector_aligned_patch, &mut patch_block_ptr) };
-    if s != EFI_SUCCESS || patch_block_ptr.is_null() {
+    if unsafe { (bs.allocate_pool)(MemoryType::EfiLoaderData, sector_aligned_patch, &mut patch_block_ptr) } != EFI_SUCCESS || patch_block_ptr.is_null() {
         unsafe { (bs.free_pool)(patched_buf as *mut c_void); }
         return false;
     }
@@ -341,17 +383,10 @@ fn try_patch_candidate(
     let mut nv2 = patched_size as u64; let mut np2 = 15;
     loop { nbuf[np2] = b'0' + (nv2 % 10) as u8; nv2 /= 10; if nv2 == 0 || np2 == 0 { break; } np2 -= 1; }
     print_raw(st, &nbuf[np2..]);
-    print_raw(st, b", dir_sector=\0");
-    let mut nv4 = dir_sector as u64; let mut np4 = 15;
-    loop { nbuf[np4] = b'0' + (nv4 % 10) as u8; nv4 /= 10; if nv4 == 0 || np4 == 0 { break; } np4 -= 1; }
-    print_raw(st, &nbuf[np4..]);
     print_raw(st, b"\r\n\0");
     true
 }
 
-/// Find, patch grub.cfg, and install it via directory entry redirect.
-/// Collects known-path .CFG files first (fast), prints them, then tries to patch.
-/// Falls back to recursive scan only as last resort.
 fn patch_grub_cfg_blockio(
     st: &mut SystemTable,
     bs: &mut BootServices,
@@ -375,18 +410,12 @@ fn patch_grub_cfg_blockio(
     let root_size = u32::from_le_bytes(pvd[166..170].try_into().unwrap());
     let mut scratch = [0u8; 2048];
 
-    // Collect entries
     let mut entries = [CfgEntry {
-        ext_lba: 0,
-        ext_size: 0,
-        dir_sector: 0,
-        dir_offset: 0,
-        path: [0; 64],
-        path_len: 0,
+        ext_lba: 0, ext_size: 0, dir_sector: 0, dir_offset: 0,
+        path: [0; 64], path_len: 0,
     }; 8];
     let mut entry_count = 0usize;
 
-    // Phase 1: Collect from known paths (fast, no recursive scan)
     let known_paths: [(&[u8], &[u8], &[u8], &[u8]); 4] = [
         (b"BOOT", b"GRUB", b"GRUB.CFG",     b"/boot/grub/grub.cfg"),
         (b"BOOT", b"GRUB", b"LOOPBACK.CFG", b"/boot/grub/loopback.cfg"),
@@ -411,19 +440,16 @@ fn patch_grub_cfg_blockio(
         }
     }
 
-    // Phase 2: If nothing found, recursive scan
     if entry_count == 0 {
         let mut raw_entries: [(u32, u32, u32, u32); 32] = [(0,0,0,0); 32];
         let mut raw_count = 0usize;
         recursive_find_cfg_with_loc(
             bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size,
-            &mut scratch, &mut raw_entries, &mut raw_count,
-            0,
+            &mut scratch, &mut raw_entries, &mut raw_count, 0,
         );
         for i in 0..raw_count {
             let (ext_lba, ext_size, dir_sector, dir_offset) = raw_entries[i];
             if ext_size == 0 { continue; }
-            // Generic path for recursively found entries
             add_cfg_entry(&mut entries, &mut entry_count, ext_lba, ext_size, dir_sector, dir_offset, b"/<recursive>.cfg");
         }
     }
@@ -433,108 +459,17 @@ fn patch_grub_cfg_blockio(
         return;
     }
 
-    // Print all found entries
-    print_raw(st, b"[grub.cfg] Found \0");
-    let mut nbuf = [0u8; 16];
-    let mut nv = entry_count as u64; let mut np = 15;
-    loop { nbuf[np] = b'0' + (nv % 10) as u8; nv /= 10; if nv == 0 || np == 0 { break; } np -= 1; }
-    print_raw(st, &nbuf[np..]);
-    print_raw(st, b" .CFG entries:\r\n\0");
     for i in 0..entry_count {
-        print_raw(st, b"  #\0");
-        let mut nv2 = i as u64; let mut np2 = 15;
-        loop { nbuf[np2] = b'0' + (nv2 % 10) as u8; nv2 /= 10; if nv2 == 0 || np2 == 0 { break; } np2 -= 1; }
-        print_raw(st, &nbuf[np2..]);
-        print_raw(st, b" \0");
-        print_raw(st, &entries[i].path[..entries[i].path_len]);
-        print_raw(st, b"\r\n\0");
-    }
-
-    // Try each entry
-    for i in 0..entry_count {
-        let (ext_lba, ext_size, dir_sector, dir_offset, path, path_len) =
-            (entries[i].ext_lba, entries[i].ext_size,
-             entries[i].dir_sector, entries[i].dir_offset,
-             &entries[i].path, entries[i].path_len);
-
-        print_raw(st, b"[grub.cfg] Trying #\0");
-        let mut nv2 = i as u64; let mut np2 = 15;
-        loop { nbuf[np2] = b'0' + (nv2 % 10) as u8; nv2 /= 10; if nv2 == 0 || np2 == 0 { break; } np2 -= 1; }
-        print_raw(st, &nbuf[np2..]);
-        print_raw(st, b" \0");
-        print_raw(st, &path[..path_len]);
-        print_raw(st, b"...\r\n\0");
-
         if try_patch_candidate(st, bs, vb, sfs_instance, bio_ref, bio_ptr, mid, iso_lba, iso_name,
-            ext_lba, ext_size, dir_sector, dir_offset, iso_location, live_media_uuid) {
+            entries[i].ext_lba, entries[i].ext_size,
+            entries[i].dir_sector, entries[i].dir_offset,
+            iso_location, live_media_uuid) {
             return;
         }
     }
-
     print_raw(st, b"[grub.cfg] No patchable .CFG found (none have 'linux' line).\r\n\0");
 }
 
-/// Scan an ISO9660 directory for the first non-directory entry whose
-/// ISO9660 name (excluding version suffix) is <= 12 bytes — small enough
-/// to safely overwrite without corrupting adjacent directory entries.
-/// Returns (dir_entry_sector, dir_entry_offset, name_bytes, name_len).
-fn find_small_file_in_dir(
-    bio_ref: &BlockIoProtocol,
-    bio_ptr: *mut BlockIoProtocol,
-    mid: u32,
-    iso_lba: u64,
-    dir_lba: u32,
-    dir_size: u32,
-    scratch: &mut [u8; 2048],
-) -> Option<(u32, u32, [u8; 16], usize)> {
-    let total_sectors = ((dir_size as u64 + 2047) / 2048) as u32;
-    for s in 0..total_sectors {
-        if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, dir_lba + s, scratch) {
-            return None;
-        }
-        let mut offset: usize = 0;
-        while offset + 34 <= 2048 && offset < (dir_size as usize).saturating_sub(s as usize * 2048) {
-            let record_len = scratch[offset] as usize;
-            if record_len == 0 { break; }
-            if offset + record_len > 2048 { break; }
-            let name_len = scratch[offset + 32] as usize;
-            let name_offset = offset + 33;
-            if name_offset + name_len > 2048 { break; }
-            let flags = scratch[offset + 25];
-            let is_dir = flags & 0x02 != 0;
-
-            // Skip . and ..
-            let skip = if name_len == 1 && scratch[name_offset] == 0 { true }
-                else if name_len == 1 && scratch[name_offset] == 1 { true }
-                else { false };
-
-            if !skip && !is_dir {
-                let eff_len = if name_len >= 2 && scratch[name_offset + name_len - 2] == b';' {
-                    name_len - 2
-                } else {
-                    name_len
-                };
-                // Only use files whose ISO9660 name is short enough to be
-                // overwritten without corrupting adjacent entries.
-                if eff_len <= 12 {
-                    let dir_sector = dir_lba + s;
-                    let dir_offset = offset as u32;
-                    let mut name_buf = [0u8; 16];
-                    let copy_len = eff_len.min(15);
-                    for i in 0..copy_len {
-                        name_buf[i] = scratch[name_offset + i].to_ascii_uppercase();
-                    }
-                    return Some((dir_sector, dir_offset, name_buf, eff_len));
-                }
-            }
-            offset += record_len;
-        }
-    }
-    None
-}
-
-/// Recursively walk ISO9660 directories collecting ALL .CFG file entries
-/// with their full location info (extent_lba, extent_size, dir_sector, dir_offset).
 fn recursive_find_cfg_with_loc(
     bio_ref: &BlockIoProtocol,
     bio_ptr: *mut BlockIoProtocol,
@@ -547,8 +482,7 @@ fn recursive_find_cfg_with_loc(
     entry_count: &mut usize,
     depth: usize,
 ) {
-    if depth > 16 { return; }
-    if *entry_count >= 32 { return; }
+    if depth > 16 || *entry_count >= 32 { return; }
     let total_sectors = ((dir_size as u64 + 2047) / 2048) as u32;
     for s in 0..total_sectors {
         if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, dir_lba + s, scratch) { return; }
@@ -565,10 +499,7 @@ fn recursive_find_cfg_with_loc(
             let extent = u32::from_le_bytes(scratch[offset + 2..offset + 6].try_into().unwrap());
             let size = u32::from_le_bytes(scratch[offset + 10..offset + 14].try_into().unwrap());
 
-            let skip = if name_len == 1 && scratch[name_offset] == 0 { true }
-                else if name_len == 1 && scratch[name_offset] == 1 { true }
-                else { false };
-
+            let skip = name_len == 1 && (scratch[name_offset] == 0 || scratch[name_offset] == 1);
             if !skip {
                 let eff_len = if name_len >= 2 && scratch[name_offset + name_len - 2] == b';' {
                     name_len - 2
@@ -581,30 +512,16 @@ fn recursive_find_cfg_with_loc(
                         && (scratch[ofs+2] | 0x20) == b'f' && (scratch[ofs+3] | 0x20) == b'g'
                 };
                 if has_cfg && !is_dir && *entry_count < 32 {
-                    let dir_sector = dir_lba + s;
-                    let dir_offset = offset as u32;
-                    // Check duplicates
                     let mut dup = false;
-                    for i in 0..*entry_count {
-                        if entries[i].0 == extent { dup = true; break; }
-                    }
+                    for j in 0..*entry_count { if entries[j].0 == extent { dup = true; break; } }
                     if !dup {
-                        entries[*entry_count] = (extent, size, dir_sector, dir_offset);
+                        entries[*entry_count] = (extent, size, dir_lba + s, offset as u32);
                         *entry_count += 1;
                     }
                 }
                 if is_dir && extent != dir_lba && *entry_count < 32 {
-                    recursive_find_cfg_with_loc(
-                        bio_ref, bio_ptr, mid, iso_lba,
-                        extent, size, scratch,
-                        entries, entry_count,
-                        depth + 1,
-                    );
-                    // Re-read parent directory sector: recursive call
-                    // overwrote scratch with subdirectory data.
-                    if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, dir_lba + s, scratch) {
-                        return;
-                    }
+                    recursive_find_cfg_with_loc(bio_ref, bio_ptr, mid, iso_lba, extent, size, scratch, entries, entry_count, depth + 1);
+                    if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, dir_lba + s, scratch) { return; }
                 }
             }
             offset += record_len;
@@ -613,94 +530,51 @@ fn recursive_find_cfg_with_loc(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  UEFI chainload
+//  DevicePath builder
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Build a DevicePath for the ISO's EFI executable:
-///   CDROM(0) / File("\\EFI\\BOOT\\BOOTX64.EFI")
-///
-/// Uses a CD-ROM Media Device Path node so that UEFI (and the chainloaded
-/// shim/GRUB) recognize this as a CD-ROM device and route file access
-/// through the SimpleFileSystem protocol installed on the virtual CD-ROM handle.
-/// Returns a pool-allocated pointer, or null on failure.
-fn build_iso_device_path(
-    bs: &mut BootServices,
-    iso_size_bytes: u64,
-) -> *mut c_void {
-    // ── CD-ROM Media Device Path node (24 bytes) ─────────
+fn build_iso_device_path(bs: &mut BootServices, iso_size_bytes: u64) -> *mut c_void {
     const CDROM_NODE: [u8; 24] = {
         let mut n = [0u8; 24];
-        n[0] = 0x04; // Type: MEDIA_DEVICE_PATH
-        n[1] = 0x02; // SubType: CDROM
-        n[2] = 24u8; // Length = 24 (little-endian)
-        n[3] = 0x00;
-        // BootEntry (4 bytes at offset 4) = 0
-        // PartitionStart (8 bytes at offset 8) = 0 (start of virtual CD)
-        // PartitionSize (8 bytes at offset 16) = ISO size in 2048-byte sectors
+        n[0] = 0x04; n[1] = 0x02; n[2] = 24; n[3] = 0;
         n
     };
-
-    // ── File path node (UCS-2 string) ────────────────────
     let file_name: [u16; 22] = [
         b'\\' as u16, b'E' as u16, b'F' as u16, b'I' as u16,
         b'\\' as u16, b'B' as u16, b'O' as u16, b'O' as u16, b'T' as u16,
         b'\\' as u16,
         b'B' as u16, b'O' as u16, b'O' as u16, b'T' as u16, b'X' as u16,
         b'6' as u16, b'4' as u16, b'.' as u16, b'E' as u16, b'F' as u16, b'I' as u16,
-        0x0000u16, // null terminator
+        0x0000,
     ];
-
-    // ── End device path node (4 bytes) ────────────────────
     const END_NODE: [u8; 4] = [0x7F, 0xFF, 0x04, 0x00];
 
-    // CD-ROM node (24) + FilePath header (4) + UCS-2 string (44 bytes) + End (4) = 76
     let file_body_bytes = file_name.len() * 2;
     let total = CDROM_NODE.len() + 4 + file_body_bytes + END_NODE.len();
-
     let mut ptr: *mut c_void = core::ptr::null_mut();
-    let status = unsafe {
-        (bs.allocate_pool)(MemoryType::EfiLoaderData, total, &mut ptr)
-    };
-    if status != EFI_SUCCESS || ptr.is_null() {
+    if unsafe { (bs.allocate_pool)(MemoryType::EfiLoaderData, total, &mut ptr) } != EFI_SUCCESS || ptr.is_null() {
         return core::ptr::null_mut();
     }
     let dp = ptr as *mut u8;
-
     unsafe {
-        // CD-ROM node
-        let mut off = 0usize;
         dp.copy_from_nonoverlapping(CDROM_NODE.as_ptr(), CDROM_NODE.len());
-        off += CDROM_NODE.len();
-        // Patch PartitionStart = 0 (virtual CD starts at LBA 0)
-        // Patch PartitionSize = ISO size in 2048-byte sectors
-        // (offsets 8 and 16 within the CD-ROM node)
         *(dp.add(8) as *mut u64) = 0u64.to_le();
         *(dp.add(16) as *mut u64) = (iso_size_bytes / 2048).to_le();
-
-        // File path node header
-        dp.add(off).write_volatile(0x04u8); // Type: MEDIA_DEVICE_PATH
-        off += 1;
-        dp.add(off).write_volatile(0x04u8); // SubType: FILE_PATH
-        off += 1;
-        let file_node_len = (4 + file_body_bytes) as u16;
-        *(dp.add(off) as *mut u16) = file_node_len.to_le();
-        off += 2;
-        // File path body
-        core::ptr::copy_nonoverlapping(
-            file_name.as_ptr() as *const u8,
-            dp.add(off),
-            file_body_bytes,
-        );
+        let mut off = 24usize;
+        dp.add(off).write_volatile(0x04u8); off += 1;
+        dp.add(off).write_volatile(0x04u8); off += 1;
+        *(dp.add(off) as *mut u16) = ((4 + file_body_bytes) as u16).to_le(); off += 2;
+        core::ptr::copy_nonoverlapping(file_name.as_ptr() as *const u8, dp.add(off), file_body_bytes);
         off += file_body_bytes;
-
-        // End node
         dp.add(off).copy_from_nonoverlapping(END_NODE.as_ptr(), END_NODE.len());
     }
-
     ptr
 }
 
-/// Load and start an EFI executable from within an ISO.
+// ═══════════════════════════════════════════════════════════════════════════
+//  Main chainload entry
+// ═══════════════════════════════════════════════════════════════════════════
+
 fn uefi_chainload_iso(
     st: &mut SystemTable,
     image_handle: *mut c_void,
@@ -713,20 +587,11 @@ fn uefi_chainload_iso(
 ) {
     let iso_lba = files[idx].file_start_lba;
     let iso_size = files[idx].file_size;
-
     let bs = unsafe { &mut *st.boot_services };
-
-    // Disable watchdog timer to prevent firmware reset during chainload
-    unsafe {
-        (bs.set_watchdog_timer)(0, 0x10000, 0, core::ptr::null());
-    }
-
-    // ── ISO file name (for grub.cfg iso-scan/filename injection)
+    unsafe { (bs.set_watchdog_timer)(0, 0x10000, 0, core::ptr::null()); }
     let iso_name = &files[idx].name[..files[idx].name_len.min(files[idx].name.len())];
-
     let live_uuid = [0u8; 10];
 
-    // ── Create virtual CD-ROM from the ISO file ──────────────────────
     let cdrom_tuple = crate::virtual_blockio::create_virtual_cdrom(
         bs, st as *mut SystemTable, iso_lba, bio_ptr, mid, iso_size, iso_name, &live_uuid,
     );
@@ -738,166 +603,87 @@ fn uefi_chainload_iso(
         }
     };
 
-    // ── Build premount cpio initrd (under 2 KB, no disk I/O) ──
-    let premount_bundle = crate::premount::prepare_premount_initrd(
-        bs, iso_lba - part1_lba,
-    );
+    // ── Build premount cpio ──────────────────────────────────────────
+    let premount_bundle = crate::premount::prepare_premount_initrd(bs, iso_lba - part1_lba);
     if premount_bundle.is_none() {
-        print_raw(st, b"[premount] no squashfs found (or allocation failed), skipping\r\n\0");
+        print_raw(st, b"[premount] allocation failed, skipping\r\n\0");
     }
+
+    // ── BlockIO premount injection ────────────────────────────────────
     if !vbio_ptr.is_null() && premount_bundle.is_some() {
         let vb = unsafe { &mut *vbio_ptr };
         let bundle = premount_bundle.as_ref().unwrap();
-
-        // ── Reliable PREMOUNT.CPIO injection ──
-        // Strategy: find an existing small file in the ISO root directory,
-        // overwrite its directory entry to redirect to premount cpio data
-        // (same mechanism as grub.cfg patching — proven reliable).
-
-        // 1. Reuse the already-allocated cpio buffer (zero the trailing padding)
-        //    bundle.cpio_buf is exactly 2048 bytes from prepare_premount_initrd.
         {
             let dst = unsafe { core::slice::from_raw_parts_mut(bundle.cpio_buf, 2048) };
             for i in bundle.cpio_size..2048 { dst[i] = 0; }
         }
-
-        // 2. Append after current last block
         let orig_end = vb.media.bim_lb + 1;
         vb.premount_file_sector = orig_end as u32;
         vb.premount_file_sectors = 1;
         vb.premount_file_buf = bundle.cpio_buf;
         vb.media.bim_lb = orig_end;
 
-        // 3. Find an existing file in root dir to overwrite.
-        //    Ubuntu ISOs have MD5SUMS (no .TXT), README.diskdefines, etc.
-        //    If none of the known targets exist, scan the root directory for
-        //    the first non-directory entry with a name <= 12 bytes (so we can
-        //    safely overwrite it without corrupting adjacent entries).
         let mut pvd = [0u8; 2048];
         if read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, 16, &mut pvd)
             && pvd[0] == 1 && &pvd[1..6] == b"CD001"
         {
             let root_lba = u32::from_le_bytes(pvd[158..162].try_into().unwrap());
             let root_size = u32::from_le_bytes(pvd[166..170].try_into().unwrap());
+            let mut scratch = [0u8; 2048];
 
-            let mut found_target = false;
+            if let Some((dir_sector, dir_offset, name_buf, name_len)) =
+                find_first_file_in_dir(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, &mut scratch)
+            {
+                vb.premount_entry_sector = dir_sector;
+                vb.premount_entry_offset = dir_offset;
+                vb.premount_entry_new_extent = vb.premount_file_sector;
+                vb.premount_entry_new_size = bundle.cpio_size as u32;
+                vb.premount_entry_patched = true;
 
-            // Phase A: try known file names common in Ubuntu/Debian/Fedora ISOs
-            let targets: [&[u8]; 6] = [
-                b"MD5SUMS",             // Ubuntu 22.04+
-                b"MD5SUM.TXT",          // older ISOs
-                b"README.DISKDEFINES",  // Ubuntu
-                b"UBUNTU",              // some variants
-                b"README.TXT",          // generic
-                b"TRANS.TBL",           // ISO9660 TRANS.TBL (common)
-            ];
-            for &target_name in &targets {
-                if let Some((_ext, _size, dir_sector, dir_offset)) =
-                    find_in_dir_with_loc(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, target_name, &mut [0u8; 2048])
-                {
-                    vb.premount_entry_sector = dir_sector;
-                    vb.premount_entry_offset = dir_offset;
-                    vb.premount_entry_new_extent = vb.premount_file_sector;
-                    vb.premount_entry_new_size = bundle.cpio_size as u32;
-                    vb.premount_entry_patched = true;
-
-                    if !sfs_instance.is_null() {
-                        let sfs = unsafe { &mut *sfs_instance };
-                        sfs.ctx.premount_cpio_buf = bundle.cpio_buf;
-                        sfs.ctx.premount_cpio_size = bundle.cpio_size;
-                        let tlen = target_name.len().min(15);
-                        sfs.ctx.premount_target_name[..tlen].copy_from_slice(&target_name[..tlen]);
-                        sfs.ctx.premount_target_name_len = tlen;
-                    }
-
-                    print_raw(st, b"[premount] overwriting ");
-                    print_raw(st, target_name);
-                    print_raw(st, b" dir entry at sector=\0");
-                    let mut nbuf = [0u8; 16];
-                    let mut nv = dir_sector as u64; let mut np = 15;
-                    loop { nbuf[np] = b'0' + (nv % 10) as u8; nv /= 10; if nv == 0 || np == 0 { break; } np -= 1; }
-                    print_raw(st, &nbuf[np..]);
-                    print_raw(st, b" off=\0");
-                    let mut nv2 = dir_offset as u64; let mut np2 = 15;
-                    loop { nbuf[np2] = b'0' + (nv2 % 10) as u8; nv2 /= 10; if nv2 == 0 || np2 == 0 { break; } np2 -= 1; }
-                    print_raw(st, &nbuf[np2..]);
-                    print_raw(st, b", cpio=\0");
-                    let mut nv3 = bundle.cpio_size as u64; let mut np3 = 15;
-                    loop { nbuf[np3] = b'0' + (nv3 % 10) as u8; nv3 /= 10; if nv3 == 0 || np3 == 0 { break; } np3 -= 1; }
-                    print_raw(st, &nbuf[np3..]);
-                    print_raw(st, b" bytes\r\n\0");
-                    found_target = true;
-                    break;
+                if !sfs_instance.is_null() {
+                    let sfs = unsafe { &mut *sfs_instance };
+                    sfs.ctx.premount_cpio_buf = bundle.cpio_buf;
+                    sfs.ctx.premount_cpio_size = bundle.cpio_size;
+                    let tlen = name_len.min(15);
+                    sfs.ctx.premount_target_name[..tlen].copy_from_slice(&name_buf[..tlen]);
+                    sfs.ctx.premount_target_name_len = tlen;
                 }
-            }
 
-            // Phase B: fallback — scan the root directory for any non-directory
-            // file whose ISO9660 name is short enough to safely overwrite.
-            if !found_target {
-                let mut scratch = [0u8; 2048];
-                if let Some((dir_sector, dir_offset, name_buf, name_len)) =
-                    find_small_file_in_dir(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, &mut scratch)
-                {
-                    vb.premount_entry_sector = dir_sector;
-                    vb.premount_entry_offset = dir_offset;
-                    vb.premount_entry_new_extent = vb.premount_file_sector;
-                    vb.premount_entry_new_size = bundle.cpio_size as u32;
-                    vb.premount_entry_patched = true;
-
-                    if !sfs_instance.is_null() {
-                        let sfs = unsafe { &mut *sfs_instance };
-                        sfs.ctx.premount_cpio_buf = bundle.cpio_buf;
-                        sfs.ctx.premount_cpio_size = bundle.cpio_size;
-                        let tlen = name_len.min(15);
-                        sfs.ctx.premount_target_name[..tlen].copy_from_slice(&name_buf[..tlen]);
-                        sfs.ctx.premount_target_name_len = tlen;
-                    }
-
-                    print_raw(st, b"[premount] overwriting (fallback) \0");
-                    print_raw(st, &name_buf[..name_len.min(15)]);
-                    print_raw(st, b" dir entry at sector=\0");
-                    let mut nbuf = [0u8; 16];
-                    let mut nv = dir_sector as u64; let mut np = 15;
-                    loop { nbuf[np] = b'0' + (nv % 10) as u8; nv /= 10; if nv == 0 || np == 0 { break; } np -= 1; }
-                    print_raw(st, &nbuf[np..]);
-                    print_raw(st, b" off=\0");
-                    let mut nv2 = dir_offset as u64; let mut np2 = 15;
-                    loop { nbuf[np2] = b'0' + (nv2 % 10) as u8; nv2 /= 10; if nv2 == 0 || np2 == 0 { break; } np2 -= 1; }
-                    print_raw(st, &nbuf[np2..]);
-                    print_raw(st, b", cpio=\0");
-                    let mut nv3 = bundle.cpio_size as u64; let mut np3 = 15;
-                    loop { nbuf[np3] = b'0' + (nv3 % 10) as u8; nv3 /= 10; if nv3 == 0 || np3 == 0 { break; } np3 -= 1; }
-                    print_raw(st, &nbuf[np3..]);
-                    print_raw(st, b" bytes\r\n\0");
-                } else {
-                    print_raw(st, b"[premount] WARNING: no suitable file found in root dir to overwrite\r\n\0");
+                print_raw(st, b"[premount] overwriting \0");
+                print_raw(st, &name_buf[..name_len.min(15)]);
+                print_raw(st, b" dir entry at sector=\0");
+                let mut nbuf = [0u8; 16];
+                let mut nv = dir_sector as u64; let mut np = 15;
+                loop { nbuf[np] = b'0' + (nv % 10) as u8; nv /= 10; if nv == 0 || np == 0 { break; } np -= 1; }
+                print_raw(st, &nbuf[np..]);
+                print_raw(st, b" off=\0");
+                let mut nv2 = dir_offset as u64; let mut np2 = 15;
+                loop { nbuf[np2] = b'0' + (nv2 % 10) as u8; nv2 /= 10; if nv2 == 0 || np2 == 0 { break; } np2 -= 1; }
+                print_raw(st, &nbuf[np2..]);
+                print_raw(st, b" size=\0");
+                let mut nv3 = bundle.cpio_size as u64; let mut np3 = 15;
+                loop { nbuf[np3] = b'0' + (nv3 % 10) as u8; nv3 /= 10; if nv3 == 0 || np3 == 0 { break; } np3 -= 1; }
+                print_raw(st, &nbuf[np3..]);
+                print_raw(st, b" bytes\r\n\0");
+            } else {
+                // Fallback: SFS-only via PREMOUNT.CPIO
+                if !sfs_instance.is_null() {
+                    let sfs = unsafe { &mut *sfs_instance };
+                    sfs.ctx.premount_cpio_buf = bundle.cpio_buf;
+                    sfs.ctx.premount_cpio_size = bundle.cpio_size;
                 }
+                print_raw(st, b"[premount] WARNING: no safe file in root dir (SFS-only)\r\n\0");
             }
         }
     }
 
-    // Cleanup: also inject into SFS for root-level synthetic file
-    if !sfs_instance.is_null() && premount_bundle.is_some() && !vbio_ptr.is_null() {
-        let vb = unsafe { &*vbio_ptr };
-        if !vb.premount_entry_patched {
-            // BlockIO injection failed or no target found
-            let bundle = premount_bundle.as_ref().unwrap();
-            let sfs = unsafe { &mut *sfs_instance };
-            sfs.ctx.premount_cpio_buf = bundle.cpio_buf;
-            sfs.ctx.premount_cpio_size = bundle.cpio_size;
-        }
-    }
-
-    // ── Build IsoLocation from the selected ISO entry ─────────
     let locator = FileBackedIsoLocator::from_iso_entry(
         &files[idx],
         crate::protocol::Guid { d1: 0, d2: 0, d3: 0, d4: [0u8; 8] },
-        1, // partition 1
-        part1_lba,
+        1, part1_lba,
     );
     let iso_loc = locator.locate();
 
-    // ── Patch grub.cfg at BlockIO+SFS level ────────────────────
     patch_grub_cfg_blockio(st, bs, vbio_ptr, sfs_instance, bio_ref, bio_ptr, mid, iso_lba, iso_name,
         &live_uuid, Some(&iso_loc));
 
@@ -908,84 +694,42 @@ fn uefi_chainload_iso(
             return;
         }
     };
-
-    // Read the EFI executable into a pool-allocated buffer
     let (buf_ptr, buf_len) = match read_extent(bs, bio_ref, bio_ptr, mid, iso_lba, efi_lba, efi_size) {
         Some(v) => v,
         None => {
-            print_raw(st, b"ERROR: Failed to read EFI executable from ISO.\r\n\0");
+            print_raw(st, b"ERROR: Failed to read EFI executable.\r\n\0");
             return;
         }
     };
-
-    // Build a proper DevicePath so the child image can find its files
     let device_path = build_iso_device_path(bs, iso_size);
-
     print_raw(st, b"Loading EFI image...\r\n\0");
 
-    // LoadImage
     let mut child_handle: *mut c_void = core::ptr::null_mut();
-    let status = unsafe {
-        (bs.load_image)(
-            false,               // BootPolicy
-            image_handle,        // ParentImageHandle
-            device_path as *mut DevicePathProtocol, // DevicePath
-            buf_ptr,             // SourceBuffer
-            buf_len as u64,      // SourceSize
-            &mut child_handle,
-        )
-    };
-
-    // Free source buffer immediately — firmware has copied the image
-    unsafe { (bs.free_pool)(buf_ptr as _); }
-
-    // Patch LoadedImageProtocol.DeviceHandle + FilePath
-    if status == EFI_SUCCESS {
-        let mut lip: *mut LoadedImageProtocol = core::ptr::null_mut();
-        let lip_status = unsafe {
-            (bs.handle_protocol)(
-                child_handle,
-                &LOADED_IMAGE_PROTOCOL_GUID,
-                &mut lip as *mut _ as _,
-            )
-        };
-        if lip_status == EFI_SUCCESS && !lip.is_null() {
-            unsafe {
-                // Point DeviceHandle to the virtual CD-ROM (not USB disk)
-                (*lip).device_handle = device_handle;
-                (*lip).file_path = device_path;
-                if !cdrom_dp.is_null() {
-                    let _ = cdrom_dp; // already installed on the handle
-                }
-            }
-        }
-    } else {
+    if unsafe {
+        (bs.load_image)(false, image_handle, device_path as *mut DevicePathProtocol,
+            buf_ptr, buf_len as u64, &mut child_handle)
+    } != EFI_SUCCESS {
         print_raw(st, b"ERROR: LoadImage failed.\r\n\0");
-        unsafe { (bs.free_pool)(device_path); }
+        unsafe { (bs.free_pool)(buf_ptr as _); (bs.free_pool)(device_path); }
         return;
     }
+    unsafe { (bs.free_pool)(buf_ptr as _); }
 
+    let mut lip: *mut LoadedImageProtocol = core::ptr::null_mut();
+    if unsafe { (bs.handle_protocol)(child_handle, &LOADED_IMAGE_PROTOCOL_GUID, &mut lip as *mut _ as _) } == EFI_SUCCESS && !lip.is_null() {
+        unsafe {
+            (*lip).device_handle = device_handle;
+            (*lip).file_path = device_path;
+        }
+    }
     print_raw(st, b"Starting EFI image...\r\n\0");
-
-    // StartImage
-    let mut exit_data_size: u64 = 0;
-    let mut exit_data: *mut u16 = core::ptr::null_mut();
-    let status2 = unsafe {
-        (bs.start_image)(child_handle, &mut exit_data_size, &mut exit_data)
-    };
-
-    // If we get here, the child image returned
-    print_raw(st, b"WARNING: Image returned with status 0x");
-    crate::output::print_hex(st, b"", status2 as u64);
-    print_raw(st, b"\r\n\0");
+    unsafe { (bs.start_image)(child_handle, &mut 0u64, &mut core::ptr::null_mut::<u16>()); }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Chainloader entry point
+//  Public API
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Boot an ISO by chainloading its UEFI bootloader (/EFI/BOOT/BOOTX64.EFI).
-/// Returns on failure so the menu can continue.
 pub fn boot_iso(
     st: &mut SystemTable,
     image_handle: *mut c_void,
@@ -1000,10 +744,6 @@ pub fn boot_iso(
     print_raw(st, b"\r\nBooting ISO (UEFI chainload)...\r\n\0");
     uefi_chainload_iso(st, image_handle, part1_lba, files, idx, bio_ref, bio_ptr, mid);
 }
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  Boot menu
-// ═══════════════════════════════════════════════════════════════════════════
 
 use crate::fs::scan_directory;
 
@@ -1025,17 +765,13 @@ pub fn show_menu(
     print_raw(st, b"\r\n=== Choosable UEFI Boot Menu ===\r\n\0");
     for i in 0..count.min(20) {
         let (sb, sl) = format_u64_buf((i + 1) as u64);
-        print_raw(st, b" ");
-        print_raw(st, &sb[20 - sl..]);
-        print_raw(st, b". ");
+        print_raw(st, b" "); print_raw(st, &sb[20 - sl..]); print_raw(st, b". ");
         if files[i].name_len > 0 && files[i].name[0] != 0 {
             print_raw(st, &files[i].name[..files[i].name_len]);
         }
         let size_mb = files[i].file_size / (1024 * 1024);
         let (sb2, sl2) = format_u64_buf(size_mb);
-        print_raw(st, b" (");
-        print_raw(st, &sb2[20 - sl2..]);
-        print_raw(st, b" MiB)\r\n\0");
+        print_raw(st, b" ("); print_raw(st, &sb2[20 - sl2..]); print_raw(st, b" MiB)\r\n\0");
     }
     print_raw(st, b"Enter number to boot (or 'r' to scan): \0");
 
@@ -1044,17 +780,11 @@ pub fn show_menu(
         let mut k = Key { sc: 0, uc: 0 };
         if !st.con_in.is_null() {
             let ci = unsafe { &mut *(st.con_in as *mut SimpleTextInput) };
-            if unsafe { (ci.read_key_stroke)(ci as *mut _, &mut k) } != EFI_SUCCESS {
-                continue;
-            }
+            if unsafe { (ci.read_key_stroke)(ci as *mut _, &mut k) } != EFI_SUCCESS { continue; }
         }
-        let ch = if k.uc >= 0x20 && k.uc < 0x7F {
-            k.uc as u8
-        } else if k.uc == 0x0D || k.uc == 0x0A {
-            b'\n'
-        } else {
-            0x00
-        };
+        let ch = if k.uc >= 0x20 && k.uc < 0x7F { k.uc as u8 }
+            else if k.uc == 0x0D || k.uc == 0x0A { b'\n' }
+            else { 0 };
         if (b'1'..=b'9').contains(&ch) {
             let idx = (ch - b'1') as usize;
             if idx < count {
