@@ -204,28 +204,45 @@ fn find_first_file_in_dir(
                     name_len
                 };
 
+                // Build uppercase name buffer for pattern matching
+                let cl = eff_len.min(16);
+                let mut upper = [0u8; 16];
+                for i in 0..cl {
+                    upper[i] = scratch[name_offset + i].to_ascii_uppercase();
+                }
+
                 // Skip El Torito boot catalog files — GRUB reads these on boot.
-                let is_boot_catalog = {
-                    let cl = eff_len.min(12);
-                    let mut buf = [0u8; 12];
-                    for i in 0..cl {
-                        buf[i] = scratch[name_offset + i].to_ascii_uppercase();
-                    }
-                    &buf[..cl] == b"BOOT.CATALOG" || &buf[..cl.min(8)] == b"BOOT.CAT"
-                };
+                let is_boot_catalog =
+                    &upper[..cl.min(12)] == b"BOOT.CATALOG"
+                    || &upper[..cl.min(8)] == b"BOOT.CAT";
                 if is_boot_catalog {
+                    offset += record_len;
+                    continue;
+                }
+
+                // Skip .CFG files (grub.cfg, loopback.cfg etc.) — GRUB needs these.
+                let has_cfg_ext = eff_len >= 4
+                    && upper[eff_len - 4] == b'.'
+                    && upper[eff_len - 3] == b'C'
+                    && upper[eff_len - 2] == b'F'
+                    && upper[eff_len - 1] == b'G';
+                if has_cfg_ext {
+                    offset += record_len;
+                    continue;
+                }
+
+                // Skip EFI boot files — needed by the chainloaded shim/GRUB.
+                let is_efi_boot =
+                    &upper[..cl.min(11)] == b"BOOTX64.EFI"
+                    || &upper[..cl.min(11)] == b"BOOTIA32.EFI";
+                if is_efi_boot {
                     offset += record_len;
                     continue;
                 }
 
                 let dir_sector = dir_lba + s;
                 let dir_offset = offset as u32;
-                let mut name_buf = [0u8; 16];
-                let copy_len = eff_len.min(15);
-                for i in 0..copy_len {
-                    name_buf[i] = scratch[name_offset + i].to_ascii_uppercase();
-                }
-                return Some((dir_sector, dir_offset, name_buf, eff_len));
+                return Some((dir_sector, dir_offset, upper, eff_len));
             }
             offset += record_len;
         }

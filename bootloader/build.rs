@@ -742,8 +742,10 @@ fn build_efi_binary(out_dir: &PathBuf) -> Vec<u8> {
     let efi_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("efi");
     let efi_target = out_dir.join("efi-target");
 
-    // Clean standalone target dir so `cargo clean` at workspace root is enough
+    // Clean both the workspace EFI target dir and the out-dir cache so
+    // stale binaries are never embedded.
     let _ = fs::remove_dir_all(efi_dir.join("target"));
+    let _ = fs::remove_dir_all(&efi_target);
 
     println!("cargo:warning=Building EFI for x86_64-unknown-uefi...");
     let s = std::process::Command::new("cargo")
