@@ -203,6 +203,12 @@ pub fn create_virtual_cdrom(
     vbio.dir_entry_new_size = 0;
     vbio.dir_entry_patched = false;
 
+    // Initialize premount fields
+    vbio.premount_cpio_buf = core::ptr::null_mut();
+    vbio.premount_cpio_size = 0;
+    vbio.premount_squashfs_addr = 0;
+    vbio.premount_squashfs_size = 0;
+
     // ═════════════════════════════════════════════════════════════
     // 3. Install BlockIO protocol (creates the handle)
     // ═════════════════════════════════════════════════════════════
@@ -243,6 +249,7 @@ pub fn create_virtual_cdrom(
     // ═════════════════════════════════════════════════════════════
     let iso_fs_instance = crate::iso_fs::create_iso_fs(
         bs, st, real_bio_ptr, real_media_id, iso_lba, iso_size_bytes, iso_name, live_media_uuid,
+        core::ptr::null_mut(), 0, // premount set later via vbio
     );
     if !iso_fs_instance.is_null() {
         let sfs_status = unsafe {

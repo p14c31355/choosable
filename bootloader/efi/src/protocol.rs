@@ -310,6 +310,11 @@ pub struct VirtualBlockIo {
     pub dir_entry_new_size: u32,
     /// Whether directory entry patching is active
     pub dir_entry_patched: bool,
+    /// ── Premount cpio data (appended to initrd) ──────────────────
+    pub premount_cpio_buf: *mut u8,
+    pub premount_cpio_size: usize,
+    pub premount_squashfs_addr: u64,
+    pub premount_squashfs_size: u64,
 }
 
 pub const DEVICE_PATH_PROTOCOL_GUID: Guid = Guid {

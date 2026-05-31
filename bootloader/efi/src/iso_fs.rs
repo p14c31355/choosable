@@ -50,6 +50,10 @@ pub struct IsoFsCtx {
     pub iso_name_len: usize,
     /// FAT32 volume serial number of the real USB partition (formatted "XXXX-XXXX\0")
     pub live_media_uuid: [u8; 10],
+    /// Premount cpio buffer (appended to initrd reads)
+    pub premount_cpio_buf: *mut u8,
+    /// Premount cpio size in bytes
+    pub premount_cpio_size: usize,
 }
 
 #[repr(C)]
@@ -65,7 +69,7 @@ pub struct VirtualFile {
     ctx: *const IsoFsCtx,
     is_dir: bool,
     extent_lba: u32,   // ISO 2048-byte sector
-    extent_size: u32,  // bytes
+    extent_size: u32,  // bytes in ISO
     position: u64,      // current read offset
     /// If true, file_read_file will inject iso-scan/filename= into the buffer
     needs_grub_patch: bool,
@@ -75,13 +79,15 @@ pub struct VirtualFile {
     patched_size: u64,
     /// Whether the patch has been applied
     patched: bool,
+    /// If this is an initrd file, append premount cpio after the original data.
+    /// The effective file size becomes extent_size + premount_cpio_size.
+    is_initrd: bool,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  ISO9660 low-level read helpers
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Read one ISO 2048-byte sector (4 × 512-byte disk sectors) into buf.
 fn read_iso_sector(
     ctx: &IsoFsCtx,
     iso_sector: u32,
@@ -101,8 +107,6 @@ fn read_iso_sector(
     status == EFI_SUCCESS
 }
 
-/// Read raw bytes from an ISO extent into a buffer.
-/// `lba` is in ISO 2048-byte sectors. `offset` + `len` must be within `extent_size`.
 fn read_extent_data(
     ctx: &IsoFsCtx,
     lba: u32,
@@ -143,7 +147,6 @@ fn read_extent_data(
 //  ISO9660 directory lookup
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Strip ";1" version suffix from ISO9660 name, return effective length.
 fn iso_name_effective_len(name: &[u8], name_len: usize) -> usize {
     if name_len >= 2 && name[name_len - 2] == b';' {
         name_len - 2
@@ -152,18 +155,14 @@ fn iso_name_effective_len(name: &[u8], name_len: usize) -> usize {
     }
 }
 
-/// Case-insensitive UCS-2 to ISO9660 name comparison.
 fn match_iso_name(iso_name: &[u8], iso_name_len: usize, ucs2_name: &[u16]) -> bool {
     let eff_len = iso_name_effective_len(iso_name, iso_name_len);
-    // Convert UCS-2 to ASCII for comparison (dropping high byte)
     let name_bytes: [u8; 256] = {
         let mut arr = [0u8; 256];
         let mut i = 0;
         while i < ucs2_name.len() && i < 256 {
             let cp = ucs2_name[i];
-            if cp == 0 {
-                break;
-            }
+            if cp == 0 { break; }
             arr[i] = if cp < 0x80 { cp as u8 } else { b'?' };
             i += 1;
         }
@@ -171,10 +170,7 @@ fn match_iso_name(iso_name: &[u8], iso_name_len: usize, ucs2_name: &[u16]) -> bo
     };
     let name_len = ucs2_name.iter().position(|&c| c == 0).unwrap_or(ucs2_name.len());
     let name_slice = &name_bytes[..name_len.min(255)];
-
-    if eff_len != name_slice.len() {
-        return false;
-    }
+    if eff_len != name_slice.len() { return false; }
     for i in 0..eff_len {
         if iso_name[i].to_ascii_uppercase() != name_slice[i].to_ascii_uppercase() {
             return false;
@@ -183,8 +179,6 @@ fn match_iso_name(iso_name: &[u8], iso_name_len: usize, ucs2_name: &[u16]) -> bo
     true
 }
 
-/// Search an ISO9660 directory extent for a child entry.
-/// Returns (child_extent_lba, child_size_bytes, is_directory) or None.
 fn lookup_in_dir(
     ctx: &IsoFsCtx,
     dir_lba: u32,
@@ -193,86 +187,17 @@ fn lookup_in_dir(
 ) -> Option<(u32, u32, bool)> {
     let total_sectors = ((dir_size as u64 + 2047) / 2048) as u32;
     let mut scratch = [0u8; 2048];
-
-    // Print the search target once
-    if !ctx.st.is_null() {
-        let st_ref = unsafe { &mut *ctx.st };
-        print_raw(st_ref, b"[SFS]   lookup '");
-        let mut tmp = [0u8; 64];
-        let mut n = 0;
-        for &c in name {
-            if c == 0 || n >= 63 { break; }
-            tmp[n] = if c < 0x80 { c as u8 } else { b'?' };
-            n += 1;
-        }
-        print_raw(st_ref, &tmp[..n]);
-        print_raw(st_ref, b"' in dir LBA=\0");
-        // simple number print
-        let mut lbabuf = [b'0'; 10];
-        let mut val = dir_lba as u64;
-        let mut p = 9usize;
-        loop {
-            lbabuf[p] = b'0' + (val % 10) as u8;
-            val /= 10;
-            if val == 0 { break; }
-            if p == 0 { break; }
-            p -= 1;
-        }
-        print_raw(st_ref, &lbabuf[p..]);
-        print_raw(st_ref, b" size=\0");
-        let mut szbuf = [b'0'; 10];
-        val = dir_size as u64;
-        p = 9usize;
-        loop {
-            szbuf[p] = b'0' + (val % 10) as u8;
-            val /= 10;
-            if val == 0 { break; }
-            if p == 0 { break; }
-            p -= 1;
-        }
-        print_raw(st_ref, &szbuf[p..]);
-        print_raw(st_ref, b"\r\n\0");
-    }
-
     for s in 0..total_sectors {
-        if !read_iso_sector(ctx, dir_lba + s, &mut scratch) {
-            return None;
-        }
+        if !read_iso_sector(ctx, dir_lba + s, &mut scratch) { return None; }
         let mut offset: usize = 0;
         while offset + 34 <= 2048 {
             let record_len = scratch[offset] as usize;
-            if record_len == 0 {
-                // skip to next sector
-                break;
-            }
-            if record_len < 34 || offset + record_len > 2048 {
-                break;
-            }
+            if record_len == 0 { break; }
+            if record_len < 34 || offset + record_len > 2048 { break; }
             let name_len = scratch[offset + 32] as usize;
             let name_offset = offset + 33;
-            if 33 + name_len > record_len || name_offset + name_len > 2048 {
-                break;
-            }
+            if 33 + name_len > record_len || name_offset + name_len > 2048 { break; }
             let iso_name = &scratch[name_offset..name_offset + name_len];
-
-            // Log every entry name
-            if !ctx.st.is_null() {
-                let st_ref = unsafe { &mut *ctx.st };
-                print_raw(st_ref, b"[SFS]     entry '");
-                // Copy iso_name up to name_len, strip ;1 for display
-                let mut ebuf = [0u8; 64];
-                let mut elen = 0;
-                for j in 0..name_len.min(63) {
-                    let b = iso_name[j];
-                    if b == 0 { break; }
-                    ebuf[j] = if b < 0x80 { b } else { b'?' };
-                    elen += 1;
-                }
-                let eff = if elen >= 2 && ebuf[elen - 2] == b';' { elen - 2 } else { elen };
-                print_raw(st_ref, &ebuf[..eff]);
-                print_raw(st_ref, b"'\r\n\0");
-            }
-
             if match_iso_name(iso_name, name_len, name) {
                 let child_extent = u32::from_le_bytes(
                     scratch[offset + 2..offset + 6].try_into().unwrap(),
@@ -282,11 +207,6 @@ fn lookup_in_dir(
                 );
                 let flags = scratch[offset + 25];
                 let is_dir = flags & 0x02 != 0;
-
-                if !ctx.st.is_null() {
-                    let st_ref = unsafe { &mut *ctx.st };
-                    print_raw(st_ref, b"[SFS]     -> MATCH\r\n\0");
-                }
                 return Some((child_extent, child_size, is_dir));
             }
             offset += record_len;
@@ -295,18 +215,10 @@ fn lookup_in_dir(
     None
 }
 
-/// Parse Primary Volume Descriptor (ISO sector 16) to get root dir record.
 fn parse_pvd(ctx: &IsoFsCtx) -> Option<(u32, u32)> {
     let mut pvd = [0u8; 2048];
-    if !read_iso_sector(ctx, 16, &mut pvd) {
-        return None;
-    }
-    // Check descriptor type == 1 and identifier "CD001"
-    if pvd[0] != 1 || &pvd[1..6] != b"CD001" {
-        // Try UDF AVDP at sector 256 as fallback
-        // (Not fully implemented; return None for now)
-        return None;
-    }
+    if !read_iso_sector(ctx, 16, &mut pvd) { return None; }
+    if pvd[0] != 1 || &pvd[1..6] != b"CD001" { return None; }
     let root_extent = u32::from_le_bytes(pvd[158..162].try_into().unwrap());
     let root_size = u32::from_le_bytes(pvd[166..170].try_into().unwrap());
     Some((root_extent, root_size))
@@ -320,19 +232,9 @@ unsafe extern "efiapi" fn sfs_open_volume(
     this: *mut SimpleFileSystemProtocol,
     root: *mut *mut FileProtocol,
 ) -> usize {
-    if root.is_null() {
-        return EFI_INVALID_PARAMETER;
-    }
+    if root.is_null() { return EFI_INVALID_PARAMETER; }
     let instance = &*(this as *const IsoFsInstance);
     let ctx = &instance.ctx;
-
-    // Debug: log that SFS open_volume was called
-    if !ctx.st.is_null() {
-        let st_ref = unsafe { &mut *ctx.st };
-        print_raw(st_ref, b"[SFS] open_volume called\r\n\0");
-    }
-
-    // Allocate a VirtualFile for the root directory
     let bs = unsafe { &mut *ctx.bs };
     let mut ptr: *mut c_void = core::ptr::null_mut();
     let status = unsafe {
@@ -342,30 +244,25 @@ unsafe extern "efiapi" fn sfs_open_volume(
             &mut ptr,
         )
     };
-    if status != EFI_SUCCESS || ptr.is_null() {
-        return EFI_OUT_OF_RESOURCES;
-    }
-
+    if status != EFI_SUCCESS || ptr.is_null() { return EFI_OUT_OF_RESOURCES; }
     let vf = unsafe { &mut *(ptr as *mut VirtualFile) };
     vf.file = FileProtocol {
         revision: 0x0001_0000_0000_0001,
-        open: file_open,
-        close: file_close,
-        delete: file_delete,
-        read: file_read_dir,  // root is a directory
-        write: file_write_ro,
-        get_position: file_get_position,
-        set_position: file_set_position,
-        get_info: file_get_info,
-        set_info: file_set_info_ro,
-        flush: file_flush,
+        open: file_open, close: file_close, delete: file_delete,
+        read: file_read_dir, write: file_write_ro,
+        get_position: file_get_position, set_position: file_set_position,
+        get_info: file_get_info, set_info: file_set_info_ro, flush: file_flush,
     };
     vf.ctx = ctx as *const IsoFsCtx;
     vf.is_dir = true;
     vf.extent_lba = ctx.root_lba;
     vf.extent_size = ctx.root_size;
     vf.position = 0;
-
+    vf.needs_grub_patch = false;
+    vf.patched_buf = core::ptr::null_mut();
+    vf.patched_size = 0;
+    vf.patched = false;
+    vf.is_initrd = false;
     *root = ptr as *mut FileProtocol;
     EFI_SUCCESS
 }
@@ -374,9 +271,6 @@ unsafe extern "efiapi" fn sfs_open_volume(
 //  FileProtocol implementations
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Walk the ISO directory tree to resolve a multi-component UCS-2 path.
-/// Returns (extent_lba, extent_size, is_dir) for the final component.
-/// `start_lba` and `start_size` define the starting directory extent.
 fn resolve_path(
     ctx: &IsoFsCtx,
     start_lba: u32,
@@ -384,85 +278,44 @@ fn resolve_path(
     path: &[u16],
 ) -> Option<(u32, u32, bool)> {
     if path.is_empty() || (path.len() == 1 && path[0] == b'\\' as u16) {
-        // Empty path or just "\" → return the starting directory itself
         return Some((start_lba, start_size, true));
     }
-
-    // Strip DevicePath text prefix like "CDROM(0x0)\" or "HD(1,GPT,...)\"
-    // UEFI applications may pass the full DevicePath text as a file path.
-    // The device text ends with ")", followed by "\" and the filesystem path.
     let mut pos = 0usize;
     let mut last_paren_backslash: Option<usize> = None;
     let mut i = 0;
     while i + 1 < path.len() {
         if path[i] == b')' as u16 && path[i + 1] == b'\\' as u16 {
-            last_paren_backslash = Some(i + 1); // position of the backslash after )
+            last_paren_backslash = Some(i + 1);
         }
         i += 1;
     }
-    if let Some(start) = last_paren_backslash {
-        // Start from the backslash after the device prefix
-        pos = start;
-    }
-
-    // Skip leading backslash(es)
-    while pos < path.len() && path[pos] == b'\\' as u16 {
-        pos += 1;
-    }
-    if pos >= path.len() {
-        return Some((start_lba, start_size, true));
-    }
-
+    if let Some(start) = last_paren_backslash { pos = start; }
+    while pos < path.len() && path[pos] == b'\\' as u16 { pos += 1; }
+    if pos >= path.len() { return Some((start_lba, start_size, true)); }
     let mut cur_lba = start_lba;
     let mut cur_size = start_size;
-
-    // Walk component by component
     while pos < path.len() {
-        // Find the end of this component
         let comp_start = pos;
-        while pos < path.len() && path[pos] != b'\\' as u16 {
-            pos += 1;
-        }
+        while pos < path.len() && path[pos] != b'\\' as u16 { pos += 1; }
         let component = &path[comp_start..pos];
-
-        // Look up this component in the current directory
-        let (child_lba, child_size, is_dir) =
-            lookup_in_dir(ctx, cur_lba, cur_size, component)?;
-
-        // Skip the backslash after the component
-        if pos < path.len() && path[pos] == b'\\' as u16 {
-            pos += 1;
-        }
-
-        // If there are more components, this must be a directory
-        let has_more = pos < path.len() && {
-            // Check if remaining is non-empty (not just trailing backslash)
-            let rem = &path[pos..];
-            !rem.is_empty() && rem[0] != 0
-        };
-
-        if has_more && !is_dir {
-            return None; // intermediate component must be a directory
-        }
-
+        let (child_lba, child_size, is_dir) = lookup_in_dir(ctx, cur_lba, cur_size, component)?;
+        if pos < path.len() && path[pos] == b'\\' as u16 { pos += 1; }
+        let has_more = pos < path.len() && !(&path[pos..]).is_empty() && path[pos] != 0;
+        if has_more && !is_dir { return None; }
         cur_lba = child_lba;
         cur_size = child_size;
-
-        if !has_more {
-            return Some((cur_lba, cur_size, is_dir));
-        }
+        if !has_more { return Some((cur_lba, cur_size, is_dir)); }
     }
-
     Some((cur_lba, cur_size, false))
 }
 
-/// Allocate and initialize a VirtualFile from ISO extent info.
 fn alloc_virtual_file(
     ctx: &IsoFsCtx,
     lba: u32,
     size: u32,
     is_dir: bool,
     needs_grub_patch: bool,
+    is_initrd: bool,
 ) -> Option<*mut FileProtocol> {
     let bs = unsafe { &mut *ctx.bs };
     let mut ptr: *mut c_void = core::ptr::null_mut();
@@ -473,23 +326,15 @@ fn alloc_virtual_file(
             &mut ptr,
         )
     };
-    if status != EFI_SUCCESS || ptr.is_null() {
-        return None;
-    }
-
+    if status != EFI_SUCCESS || ptr.is_null() { return None; }
     let vf = unsafe { &mut *(ptr as *mut VirtualFile) };
     vf.file = FileProtocol {
         revision: 0x0001_0000_0000_0001,
-        open: file_open,
-        close: file_close,
-        delete: file_delete,
+        open: file_open, close: file_close, delete: file_delete,
         read: if is_dir { file_read_dir } else { file_read_file },
         write: file_write_ro,
-        get_position: file_get_position,
-        set_position: file_set_position,
-        get_info: file_get_info,
-        set_info: file_set_info_ro,
-        flush: file_flush,
+        get_position: file_get_position, set_position: file_set_position,
+        get_info: file_get_info, set_info: file_set_info_ro, flush: file_flush,
     };
     vf.ctx = ctx as *const IsoFsCtx;
     vf.is_dir = is_dir;
@@ -500,12 +345,43 @@ fn alloc_virtual_file(
     vf.patched_buf = core::ptr::null_mut();
     vf.patched_size = 0;
     vf.patched = false;
-
+    vf.is_initrd = is_initrd;
     Some(ptr as *mut FileProtocol)
 }
 
-/// Open a child file or subdirectory within a directory.
-/// Handles multi-component paths (e.g. `\EFI\BOOT\grubx64.efi`).
+/// Return the effective file size: original extent + premount cpio if initrd.
+fn effective_size(vf: &VirtualFile) -> u64 {
+    if vf.patched {
+        vf.patched_size
+    } else if vf.is_initrd {
+        let ctx = unsafe { &*vf.ctx };
+        vf.extent_size as u64 + ctx.premount_cpio_size as u64
+    } else {
+        vf.extent_size as u64
+    }
+}
+
+/// Check if a filename matches known initrd patterns.
+fn detect_initrd(name: &[u16]) -> bool {
+    let n = name.len();
+    // Match "initrd", "initrd.gz", "initrd.lz", "initrd.xz" etc.
+    // Also match "initrd" at the start (initrd, initrd.img, ...)
+    if n >= 6 {
+        let s: [u16; 6] = [name[0], name[1], name[2], name[3], name[4], name[5]];
+        let lower = |c: u16| if (b'A' as u16..=b'Z' as u16).contains(&c) { c | 0x20 } else { c };
+        if lower(s[0]) == b'i' as u16
+            && lower(s[1]) == b'n' as u16
+            && lower(s[2]) == b'i' as u16
+            && lower(s[3]) == b't' as u16
+            && lower(s[4]) == b'r' as u16
+            && lower(s[5]) == b'd' as u16
+        {
+            return true;
+        }
+    }
+    false
+}
+
 unsafe extern "efiapi" fn file_open(
     this: *mut FileProtocol,
     new_handle: *mut *mut FileProtocol,
@@ -513,103 +389,27 @@ unsafe extern "efiapi" fn file_open(
     open_mode: u64,
     _attributes: u64,
 ) -> usize {
-    if file_name.is_null() || new_handle.is_null() {
-        return EFI_INVALID_PARAMETER;
-    }
-
+    if file_name.is_null() || new_handle.is_null() { return EFI_INVALID_PARAMETER; }
     let vf = unsafe { &*(this as *const VirtualFile) };
-    if !vf.is_dir {
-        return EFI_UNSUPPORTED;
-    }
-
+    if !vf.is_dir { return EFI_UNSUPPORTED; }
     let ctx = unsafe { &*vf.ctx };
 
-    // Debug: log the OPEN request
-    if !ctx.st.is_null() {
-        let st_ref = unsafe { &mut *ctx.st };
-        print_raw(st_ref, b"[SFS] OPEN: \0");
-        // Print up to first 64 UCS-2 chars as ASCII
-        let mut name_buf = [0u8; 128];
-        let mut name_pos = 0usize;
-        let p = file_name;
-        while name_pos < 127 {
-            let ch = unsafe { *p.add(name_pos) };
-            if ch == 0 {
-                break;
-            }
-            name_buf[name_pos] = if ch < 0x80 { ch as u8 } else { b'?' };
-            name_pos += 1;
-        }
-        name_buf[name_pos] = b'\0';
-        if name_pos > 0 {
-            let msg_slice: &[u8] = &name_buf[..name_pos];
-            print_raw(st_ref, msg_slice);
-        }
-        print_raw(st_ref, b"\r\n\0");
-    }
-
-    // Convert UCS-2 file name to a slice (null-terminated)
     let name_slice = unsafe {
         let mut len = 0usize;
         while *file_name.add(len) != 0 {
             len += 1;
-            if len > 256 {
-                return EFI_INVALID_PARAMETER;
-            }
+            if len > 256 { return EFI_INVALID_PARAMETER; }
         }
         core::slice::from_raw_parts(file_name, len)
     };
 
-    // Resolve multi-component path
     let resolved = resolve_path(ctx, vf.extent_lba, vf.extent_size, name_slice);
     let (child_lba, child_size, is_dir) = match resolved {
-        Some(v) => {
-            let (lba, sz, dir) = v;
-            if !ctx.st.is_null() {
-                let st_ref = unsafe { &mut *ctx.st };
-                print_raw(st_ref, b"[SFS]   -> OK (LBA=\0");
-                let mut lbabuf = [b'0'; 16];
-                let mut lba_val = lba as u64;
-                let mut pos = 15usize;
-                loop {
-                    lbabuf[pos] = b'0' + (lba_val % 10) as u8;
-                    lba_val /= 10;
-                    if lba_val == 0 || pos == 0 {
-                        break;
-                    }
-                    pos -= 1;
-                }
-                print_raw(st_ref, &lbabuf[pos..]);
-                print_raw(st_ref, b", size=\0");
-                let mut szbuf = [b'0'; 16];
-                let mut sz_val = sz as u64;
-                pos = 15usize;
-                loop {
-                    szbuf[pos] = b'0' + (sz_val % 10) as u8;
-                    sz_val /= 10;
-                    if sz_val == 0 || pos == 0 {
-                        break;
-                    }
-                    pos -= 1;
-                }
-                print_raw(st_ref, &szbuf[pos..]);
-                print_raw(st_ref, b")\r\n\0");
-            }
-            (lba, sz, dir)
-        }
-        None => {
-            if !ctx.st.is_null() {
-                let st_ref = unsafe { &mut *ctx.st };
-                print_raw(st_ref, b"[SFS]   -> NOT FOUND\r\n\0");
-            }
-            return EFI_NOT_FOUND;
-        }
+        Some(v) => v,
+        None => return EFI_NOT_FOUND,
     };
 
-    // Determine if this is a .cfg file (needs iso-scan/filename patch).
-    // Match any file ending in .cfg (case-insensitive), not just grub.cfg —
-    // Ubuntu 22.04 puts the actual boot entries in loopback.cfg.
-    let is_cfg = if !is_dir && ctx.iso_name_len > 0 && name_slice.len() >= 4 {
+    let is_cfg = if !is_dir && name_slice.len() >= 4 {
         let n = name_slice.len();
         let s: [u8; 4] = [
             (name_slice[n - 4] as u8) | 0x20,
@@ -618,42 +418,26 @@ unsafe extern "efiapi" fn file_open(
             (name_slice[n - 1] as u8) | 0x20,
         ];
         s[0] == b'.' && s[1] == b'c' && s[2] == b'f' && s[3] == b'g'
-    } else {
-        false
-    };
+    } else { false };
 
-    if is_cfg && !ctx.st.is_null() {
-        let st_ref = unsafe { &mut *ctx.st };
-        print_raw(st_ref, b"[SFS]   -> .cfg file detected, will attempt patch with iso-scan/filename=");
-        print_raw(st_ref, &ctx.iso_name[..ctx.iso_name_len]);
-        print_raw(st_ref, b"\r\n\0");
-    }
+    let initrd_detect = !is_dir && detect_initrd(name_slice) && ctx.premount_cpio_size > 0;
 
-    // Allocate and initialize the VirtualFile
-    let fp = match alloc_virtual_file(ctx, child_lba, child_size, is_dir, is_cfg) {
+    let fp = match alloc_virtual_file(ctx, child_lba, child_size, is_dir, is_cfg, initrd_detect) {
         Some(p) => p,
         None => return EFI_OUT_OF_RESOURCES,
     };
 
-    // ── If this is a .cfg file, eagerly generate the patch now ───
-    // GRUB calls GetInfo before Read, so patched size must be known early.
+    // Eagerly patch .cfg files
     if is_cfg {
         let vf_patch = unsafe { &mut *(fp as *mut VirtualFile) };
         if !vf_patch.patched {
-            // Read original content
             let orig_size = vf_patch.extent_size as usize;
             let bs = unsafe { &mut *ctx.bs };
             let mut tmp_ptr: *mut c_void = core::ptr::null_mut();
             let tmp_status = unsafe {
-                (bs.allocate_pool)(
-                    crate::protocol::MemoryType::EfiLoaderData,
-                    orig_size,
-                    &mut tmp_ptr,
-                )
+                (bs.allocate_pool)(crate::protocol::MemoryType::EfiLoaderData, orig_size, &mut tmp_ptr)
             };
-            if tmp_status != EFI_SUCCESS || tmp_ptr.is_null() {
-                // Continue without patch
-            } else {
+            if tmp_status == EFI_SUCCESS && !tmp_ptr.is_null() {
                 let tmp_buf = unsafe { core::slice::from_raw_parts_mut(tmp_ptr as *mut u8, orig_size) };
                 let mut total_read = 0usize;
                 while total_read < orig_size {
@@ -663,28 +447,11 @@ unsafe extern "efiapi" fn file_open(
                     if r == 0 { break; }
                     total_read += r;
                 }
-
                 let patch = crate::strategy::patch_grub_cfg(ctx, &tmp_buf[..total_read], ctx.bs, None);
                 if let Some(p) = patch {
                     vf_patch.patched_buf = p.buf;
                     vf_patch.patched_size = p.size as u64;
                     vf_patch.patched = true;
-
-                    if !ctx.st.is_null() {
-                        let st_ref = unsafe { &mut *ctx.st };
-                        print_raw(st_ref, b"[SFS] grub.cfg patched eagerly: ");
-                        let mut nb = [0u8; 16];
-                        let mut nv = p.size as u64;
-                        let mut np = 15usize;
-                        loop {
-                            nb[np] = b'0' + (nv % 10) as u8;
-                            nv /= 10;
-                            if nv == 0 || np == 0 { break; }
-                            np -= 1;
-                        }
-                        print_raw(st_ref, &nb[np..]);
-                        print_raw(st_ref, b" bytes\r\n\0");
-                    }
                 }
                 unsafe { (bs.free_pool)(tmp_ptr); }
             }
@@ -696,12 +463,10 @@ unsafe extern "efiapi" fn file_open(
     EFI_SUCCESS
 }
 
-/// Close a file handle and free its pool allocation (and patched buffer if any).
 unsafe extern "efiapi" fn file_close(this: *mut FileProtocol) -> usize {
     let vf = unsafe { &mut *(this as *mut VirtualFile) };
     let ctx = unsafe { &*vf.ctx };
     let bs = unsafe { &mut *ctx.bs };
-    // Free patched buffer if allocated
     if !vf.patched_buf.is_null() {
         unsafe { (bs.free_pool)(vf.patched_buf as *mut c_void) };
         vf.patched_buf = core::ptr::null_mut();
@@ -710,35 +475,24 @@ unsafe extern "efiapi" fn file_close(this: *mut FileProtocol) -> usize {
     EFI_SUCCESS
 }
 
-/// Delete — not supported (read-only)
 unsafe extern "efiapi" fn file_delete(this: *mut FileProtocol) -> usize {
     let _ = file_close(this);
     EFI_WRITE_PROTECTED
 }
 
-/// Read from a regular file. For grub.cfg, injects iso-scan/filename= on the
-/// first read so initramfs can find the ISO on the real USB disk.
 unsafe extern "efiapi" fn file_read_file(
     this: *mut FileProtocol,
     buffer_size: *mut usize,
     buffer: *mut c_void,
 ) -> usize {
-    if buffer_size.is_null() || buffer.is_null() {
-        return EFI_INVALID_PARAMETER;
-    }
-
+    if buffer_size.is_null() || buffer.is_null() { return EFI_INVALID_PARAMETER; }
     let vf = unsafe { &mut *(this as *mut VirtualFile) };
-    if vf.is_dir {
-        return EFI_UNSUPPORTED;
-    }
-
+    if vf.is_dir { return EFI_UNSUPPORTED; }
     let ctx = unsafe { &*vf.ctx };
     let size = unsafe { *buffer_size };
-    if size == 0 {
-        return EFI_SUCCESS;
-    }
+    if size == 0 { return EFI_SUCCESS; }
 
-    // Serve from patched buffer if available (patched eagerly in file_open)
+    // Case 1: patched file (grub.cfg)
     if vf.patched && !vf.patched_buf.is_null() {
         let avail = (vf.patched_size - vf.position as u64) as usize;
         let to_copy = size.min(avail);
@@ -746,12 +500,7 @@ unsafe extern "efiapi" fn file_read_file(
             unsafe { *buffer_size = 0; }
             return EFI_SUCCESS;
         }
-        let src = unsafe {
-            core::slice::from_raw_parts(
-                vf.patched_buf.add(vf.position as usize),
-                to_copy,
-            )
-        };
+        let src = unsafe { core::slice::from_raw_parts(vf.patched_buf.add(vf.position as usize), to_copy) };
         let dst = unsafe { core::slice::from_raw_parts_mut(buffer as *mut u8, to_copy) };
         dst.copy_from_slice(src);
         vf.position += to_copy as u64;
@@ -759,7 +508,64 @@ unsafe extern "efiapi" fn file_read_file(
         return EFI_SUCCESS;
     }
 
-    // Normal read from ISO extent
+    // Case 2: initrd file with premount cpio appended
+    if vf.is_initrd && ctx.premount_cpio_size > 0 && !ctx.premount_cpio_buf.is_null() {
+        let orig_end = vf.extent_size as u64;
+        let combined_end = orig_end + ctx.premount_cpio_size as u64;
+
+        if vf.position >= combined_end {
+            unsafe { *buffer_size = 0; }
+            return EFI_SUCCESS;
+        }
+
+        // If position is past the original extent, serve from premount cpio
+        if vf.position >= orig_end {
+            let cpio_offset = (vf.position - orig_end) as usize;
+            let avail = ctx.premount_cpio_size - cpio_offset;
+            let to_copy = size.min(avail);
+            let src = unsafe {
+                core::slice::from_raw_parts(ctx.premount_cpio_buf.add(cpio_offset), to_copy)
+            };
+            let dst = unsafe { core::slice::from_raw_parts_mut(buffer as *mut u8, to_copy) };
+            dst.copy_from_slice(src);
+            vf.position += to_copy as u64;
+            unsafe { *buffer_size = to_copy; }
+            return EFI_SUCCESS;
+        }
+
+        // Normal read from ISO extent (max up to orig_end)
+        let max_from_orig = (orig_end - vf.position) as usize;
+        let from_orig = size.min(max_from_orig);
+        let dst = unsafe { core::slice::from_raw_parts_mut(buffer as *mut u8, from_orig) };
+        let read = read_extent_data(ctx, vf.extent_lba, vf.extent_size, vf.position, dst);
+        vf.position += read as u64;
+        let total_read = read;
+
+        // If we've reached the end of the original data and there's room,
+        // also include premount cpio data in this read
+        if read >= from_orig && from_orig < size && vf.position >= orig_end {
+            let cpio_max = (combined_end - vf.position) as usize;
+            let cpio_to_read = cpio_max.min(size - from_orig);
+            if cpio_to_read > 0 {
+                let cpio_offset = (vf.position - orig_end) as usize;
+                let src = unsafe {
+                    core::slice::from_raw_parts(ctx.premount_cpio_buf.add(cpio_offset), cpio_to_read)
+                };
+                let dst2 = unsafe {
+                    core::slice::from_raw_parts_mut(buffer as *mut u8, size)
+                };
+                dst2[from_orig..from_orig + cpio_to_read].copy_from_slice(src);
+                vf.position += cpio_to_read as u64;
+                unsafe { *buffer_size = from_orig + cpio_to_read; }
+                return EFI_SUCCESS;
+            }
+        }
+
+        unsafe { *buffer_size = total_read; }
+        return EFI_SUCCESS;
+    }
+
+    // Case 3: normal read from ISO extent
     let dst = unsafe { core::slice::from_raw_parts_mut(buffer as *mut u8, size) };
     let read = read_extent_data(ctx, vf.extent_lba, vf.extent_size, vf.position, dst);
     vf.position += read as u64;
@@ -767,120 +573,62 @@ unsafe extern "efiapi" fn file_read_file(
     EFI_SUCCESS
 }
 
-/// Read directory entries as EFI_FILE_INFO structures.
 unsafe extern "efiapi" fn file_read_dir(
     this: *mut FileProtocol,
     buffer_size: *mut usize,
     buffer: *mut c_void,
 ) -> usize {
-    if buffer_size.is_null() || buffer.is_null() {
-        return EFI_INVALID_PARAMETER;
-    }
-
+    if buffer_size.is_null() || buffer.is_null() { return EFI_INVALID_PARAMETER; }
     let vf = unsafe { &mut *(this as *mut VirtualFile) };
-    if !vf.is_dir {
-        return EFI_UNSUPPORTED;
-    }
-
+    if !vf.is_dir { return EFI_UNSUPPORTED; }
     let ctx = unsafe { &*vf.ctx };
     let buf_sz = unsafe { *buffer_size };
     let dst = unsafe { core::slice::from_raw_parts_mut(buffer as *mut u8, buf_sz) };
-
-    // We use `position` to track which ISO sector we're on (high 32 bits = sector offset within dir, low 32 bits = byte offset within sector)
     let dir_size = vf.extent_size;
     let total_sectors = ((dir_size as u64 + 2047) / 2048) as u32;
-
     let mut scratch = [0u8; 2048];
     let mut dst_off = 0usize;
     let mut finished = false;
-
-    // The position tracks: (sector_index << 16) | byte_offset_within_sector
     let mut sector_idx = (vf.position >> 16) as u32;
     let mut byte_offset = (vf.position & 0xFFFF) as usize;
-
-    if sector_idx >= total_sectors {
-        // End of directory
-        unsafe { *buffer_size = 0; }
-        return EFI_SUCCESS;
-    }
-
-    // Read the current sector
-    if !read_iso_sector(ctx, vf.extent_lba + sector_idx, &mut scratch) {
-        return EFI_DEVICE_ERROR;
-    }
-
+    if sector_idx >= total_sectors { unsafe { *buffer_size = 0; } return EFI_SUCCESS; }
+    if !read_iso_sector(ctx, vf.extent_lba + sector_idx, &mut scratch) { return EFI_DEVICE_ERROR; }
     while !finished && dst_off + core::mem::size_of::<EfiFileInfo>() + 2 <= buf_sz {
-        // If we've exhausted this sector, move to next
         if byte_offset + 34 > 2048 || (byte_offset > 0 && scratch[byte_offset] == 0) {
-            sector_idx += 1;
-            byte_offset = 0;
-            if sector_idx >= total_sectors {
-                finished = true;
-                break;
-            }
+            sector_idx += 1; byte_offset = 0;
+            if sector_idx >= total_sectors { finished = true; break; }
             if !read_iso_sector(ctx, vf.extent_lba + sector_idx, &mut scratch) {
-                // Save position before returning error
                 vf.position = ((sector_idx as u64) << 16) | (byte_offset as u64);
                 return EFI_DEVICE_ERROR;
             }
-            // If first byte of new sector is 0, directory ends
-            if scratch[0] == 0 {
-                finished = true;
-                break;
-            }
+            if scratch[0] == 0 { finished = true; break; }
         }
-
         let record_len = scratch[byte_offset] as usize;
         if record_len == 0 {
-            // Skip to next sector
-            sector_idx += 1;
-            byte_offset = 0;
-            if sector_idx >= total_sectors {
-                finished = true;
-                break;
-            }
+            sector_idx += 1; byte_offset = 0;
+            if sector_idx >= total_sectors { finished = true; break; }
             if !read_iso_sector(ctx, vf.extent_lba + sector_idx, &mut scratch) {
                 vf.position = ((sector_idx as u64) << 16) | (byte_offset as u64);
                 return EFI_DEVICE_ERROR;
             }
             continue;
         }
-
-        if record_len < 34 || byte_offset + record_len > 2048 {
-            finished = true;
-            break;
-        }
-
+        if record_len < 34 || byte_offset + record_len > 2048 { finished = true; break; }
         let name_len = scratch[byte_offset + 32] as usize;
         let name_offset = byte_offset + 33;
-        if 33 + name_len > record_len || name_offset + name_len > 2048 {
-            finished = true;
-            break;
-        }
-
-        // Build ISO name (ASCII, strip ;1 suffix)
+        if 33 + name_len > record_len || name_offset + name_len > 2048 { finished = true; break; }
         let iso_name = &scratch[name_offset..name_offset + name_len];
         let ef_len = iso_name_effective_len(iso_name, name_len);
-
-        // Get file info
-        let child_extent = u32::from_le_bytes(scratch[byte_offset + 2..byte_offset + 6].try_into().unwrap());
         let child_size = u32::from_le_bytes(scratch[byte_offset + 10..byte_offset + 14].try_into().unwrap());
         let flags = scratch[byte_offset + 25];
         let is_dir = flags & 0x02 != 0;
-
-        // Convert ISO name to UCS-2 for EFI_FILE_INFO
         let ucs2_name_len = ef_len;
         let raw_size = core::mem::size_of::<EfiFileInfo>() + (ucs2_name_len + 1) * 2;
         let required_size = (raw_size + 7) & !7;
         if dst_off + required_size > buf_sz {
-            if dst_off == 0 {
-                unsafe { *buffer_size = required_size; }
-                return crate::protocol::EFI_BUFFER_TOO_SMALL;
-            }
-            // Not enough space — return what we have
+            if dst_off == 0 { unsafe { *buffer_size = required_size; } return crate::protocol::EFI_BUFFER_TOO_SMALL; }
             break;
         }
-
         let ct: EfiTime = unsafe { core::mem::zeroed() };
         let lat: EfiTime = unsafe { core::mem::zeroed() };
         let mt: EfiTime = unsafe { core::mem::zeroed() };
@@ -888,197 +636,115 @@ unsafe extern "efiapi" fn file_read_dir(
             size: required_size as u64,
             file_size: child_size as u64,
             physical_size: child_size as u64,
-            create_time: ct,
-            last_access_time: lat,
-            modification_time: mt,
-            attribute: if is_dir { 1 } else { 0 }, // EFI_FILE_DIRECTORY = 1
+            create_time: ct, last_access_time: lat, modification_time: mt,
+            attribute: if is_dir { 1 } else { 0 },
         };
-
-        // Copy EfiFileInfo header
         let info_bytes = unsafe {
-            core::slice::from_raw_parts(
-                &info as *const EfiFileInfo as *const u8,
-                core::mem::size_of::<EfiFileInfo>(),
-            )
+            core::slice::from_raw_parts(&info as *const EfiFileInfo as *const u8, core::mem::size_of::<EfiFileInfo>())
         };
         dst[dst_off..dst_off + info_bytes.len()].copy_from_slice(info_bytes);
         dst_off += info_bytes.len();
-
-        // Write UCS-2 filename
         for j in 0..ef_len {
             let ch = iso_name[j] as u16;
-            dst[dst_off] = ch as u8;
-            dst[dst_off + 1] = (ch >> 8) as u8;
+            dst[dst_off] = ch as u8; dst[dst_off + 1] = (ch >> 8) as u8;
             dst_off += 2;
         }
-        // Null terminator
-        dst[dst_off] = 0;
-        dst[dst_off + 1] = 0;
-        dst_off += 2;
-
-        // Pad to 8-byte alignment
+        dst[dst_off] = 0; dst[dst_off + 1] = 0; dst_off += 2;
         let padding = required_size - raw_size;
-        for _ in 0..padding {
-            dst[dst_off] = 0;
-            dst_off += 1;
-        }
-
-        // Advance to next record
+        for _ in 0..padding { dst[dst_off] = 0; dst_off += 1; }
         byte_offset += record_len;
         vf.position = ((sector_idx as u64) << 16) | (byte_offset as u64);
     }
-
-    if finished {
-        // Mark position beyond end so next call returns 0
-        vf.position = ((total_sectors as u64) << 16) | 0x10000;
-    }
-
+    if finished { vf.position = ((total_sectors as u64) << 16) | 0x10000; }
     unsafe { *buffer_size = dst_off; }
     EFI_SUCCESS
 }
 
-/// Write — read-only media
 unsafe extern "efiapi" fn file_write_ro(
     _this: *mut FileProtocol,
     _buffer_size: *mut usize,
     _buffer: *mut c_void,
-) -> usize {
-    EFI_WRITE_PROTECTED
-}
+) -> usize { EFI_WRITE_PROTECTED }
 
-/// Get current file position.
 unsafe extern "efiapi" fn file_get_position(
     this: *mut FileProtocol,
     position: *mut u64,
 ) -> usize {
-    if position.is_null() {
-        return EFI_INVALID_PARAMETER;
-    }
+    if position.is_null() { return EFI_INVALID_PARAMETER; }
     let vf = unsafe { &*(this as *const VirtualFile) };
     unsafe { *position = vf.position; }
     EFI_SUCCESS
 }
 
-/// Set file position (seek).
 unsafe extern "efiapi" fn file_set_position(
     this: *mut FileProtocol,
     position: u64,
 ) -> usize {
     let vf = unsafe { &mut *(this as *mut VirtualFile) };
     if vf.is_dir {
-        if position != 0 {
-            return EFI_UNSUPPORTED;
-        }
+        if position != 0 { return EFI_UNSUPPORTED; }
         vf.position = 0;
         return EFI_SUCCESS;
     }
-    // Use patched size for grub.cfg, otherwise original extent size
-    let max_pos = if vf.patched { vf.patched_size } else { vf.extent_size as u64 };
-    if position > max_pos {
-        vf.position = max_pos;
-    } else {
-        vf.position = position;
-    }
+    let max_pos = effective_size(vf);
+    vf.position = if position > max_pos { max_pos } else { position };
     EFI_SUCCESS
 }
 
-/// Get file/directory information (EFI_FILE_INFO).
 unsafe extern "efiapi" fn file_get_info(
     this: *mut FileProtocol,
     information_type: *const Guid,
     buffer_size: *mut usize,
     buffer: *mut c_void,
 ) -> usize {
-    if information_type.is_null() || buffer_size.is_null() {
-        return EFI_INVALID_PARAMETER;
-    }
-
+    if information_type.is_null() || buffer_size.is_null() { return EFI_INVALID_PARAMETER; }
     let info_type = unsafe { &*information_type };
     if info_type.d1 != FILE_INFO_GUID.d1
         || info_type.d2 != FILE_INFO_GUID.d2
         || info_type.d3 != FILE_INFO_GUID.d3
         || info_type.d4 != FILE_INFO_GUID.d4
-    {
-        return EFI_UNSUPPORTED;
-    }
-
+    { return EFI_UNSUPPORTED; }
     let vf = unsafe { &*(this as *const VirtualFile) };
-    let file_name: [u16; 1] = [0]; // empty name for the file itself
-
-    // Calculate required size: EfiFileInfo header + UCS-2 null-terminated name
-    let required_size =
-        core::mem::size_of::<EfiFileInfo>() + file_name.len() * 2;
-
+    let file_name: [u16; 1] = [0];
+    let required_size = core::mem::size_of::<EfiFileInfo>() + file_name.len() * 2;
     let buf_sz = unsafe { *buffer_size };
-    if buf_sz < required_size {
-        unsafe { *buffer_size = required_size; }
-        return crate::protocol::EFI_BUFFER_TOO_SMALL;
-    }
-
-    // Allow NULL buffer for size-query pattern (standard UEFI convention)
-    if buffer.is_null() {
-        return EFI_SUCCESS;
-    }
-
-    // Zero-fill EfiTime (not Copy, so create three zeroed instances)
+    if buf_sz < required_size { unsafe { *buffer_size = required_size; } return crate::protocol::EFI_BUFFER_TOO_SMALL; }
+    if buffer.is_null() { return EFI_SUCCESS; }
     let create_time: EfiTime = unsafe { core::mem::zeroed() };
     let last_access_time: EfiTime = unsafe { core::mem::zeroed() };
     let modification_time: EfiTime = unsafe { core::mem::zeroed() };
-
-    // Report patched size for grub.cfg
-    let file_size = if vf.patched { vf.patched_size } else { vf.extent_size as u64 };
-
+    let file_size = effective_size(vf);
     let info = EfiFileInfo {
         size: required_size as u64,
         file_size,
         physical_size: file_size,
-        create_time,
-        last_access_time,
-        modification_time,
-        attribute: if vf.is_dir { 0x0000_0000_0000_0001 } else { 0 }, // EFI_FILE_DIRECTORY if dir
+        create_time, last_access_time, modification_time,
+        attribute: if vf.is_dir { 0x0000_0000_0000_0001 } else { 0 },
     };
-
     let dst = unsafe { core::slice::from_raw_parts_mut(buffer as *mut u8, buf_sz) };
-
-    // Copy EfiFileInfo header
     let info_bytes = unsafe {
-        core::slice::from_raw_parts(
-            &info as *const EfiFileInfo as *const u8,
-            core::mem::size_of::<EfiFileInfo>(),
-        )
+        core::slice::from_raw_parts(&info as *const EfiFileInfo as *const u8, core::mem::size_of::<EfiFileInfo>())
     };
     dst[..info_bytes.len()].copy_from_slice(info_bytes);
-
-    // Append UCS-2 file name (empty null-terminated string)
     let name_offset = core::mem::size_of::<EfiFileInfo>();
-    dst[name_offset] = 0;
-    dst[name_offset + 1] = 0;
-
+    dst[name_offset] = 0; dst[name_offset + 1] = 0;
     unsafe { *buffer_size = required_size; }
     EFI_SUCCESS
 }
 
-/// Set info — read-only
 unsafe extern "efiapi" fn file_set_info_ro(
     _this: *mut FileProtocol,
     _information_type: *const Guid,
     _buffer_size: usize,
     _buffer: *mut c_void,
-) -> usize {
-    EFI_WRITE_PROTECTED
-}
+) -> usize { EFI_WRITE_PROTECTED }
 
-/// Flush — noop for read-only
-unsafe extern "efiapi" fn file_flush(_this: *mut FileProtocol) -> usize {
-    EFI_SUCCESS
-}
+unsafe extern "efiapi" fn file_flush(_this: *mut FileProtocol) -> usize { EFI_SUCCESS }
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Public constructor
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Create an IsoFsInstance, parse the ISO9660 PVD, and return a pool-allocated
-/// pointer. Returns null on failure.
 pub fn create_iso_fs(
     bs: &mut BootServices,
     st: *mut SystemTable,
@@ -1088,8 +754,9 @@ pub fn create_iso_fs(
     iso_size_bytes: u64,
     iso_name: &[u8],
     live_media_uuid: &[u8; 10],
+    premount_cpio_buf: *mut u8,
+    premount_cpio_size: usize,
 ) -> *mut IsoFsInstance {
-    // ── Allocate IsoFsInstance ──────────────────────────────────────
     let mut ptr: *mut c_void = core::ptr::null_mut();
     let status = unsafe {
         (bs.allocate_pool)(
@@ -1098,49 +765,32 @@ pub fn create_iso_fs(
             &mut ptr,
         )
     };
-    if status != EFI_SUCCESS || ptr.is_null() {
-        return core::ptr::null_mut();
-    }
-
+    if status != EFI_SUCCESS || ptr.is_null() { return core::ptr::null_mut(); }
     let instance = unsafe { &mut *(ptr as *mut IsoFsInstance) };
-
-    // ── Copy ISO file name ────────────────────────────────────────
     let name_len = iso_name.len().min(127);
     let mut name_arr = [0u8; 128];
     name_arr[..name_len].copy_from_slice(&iso_name[..name_len]);
-
-    // ── Fill context ────────────────────────────────────────────────
     let mut uuid_arr = [0u8; 10];
     uuid_arr.copy_from_slice(&live_media_uuid[..10]);
     instance.ctx = IsoFsCtx {
-        real_bio_ptr,
-        real_media_id,
-        iso_lba,
-        iso_size_bytes,
-        root_lba: 0,
-        root_size: 0,
-        bs: bs as *mut BootServices,
-        st,
-        iso_name: name_arr,
-        iso_name_len: name_len,
+        real_bio_ptr, real_media_id, iso_lba, iso_size_bytes,
+        root_lba: 0, root_size: 0,
+        bs: bs as *mut BootServices, st,
+        iso_name: name_arr, iso_name_len: name_len,
         live_media_uuid: uuid_arr,
+        premount_cpio_buf,
+        premount_cpio_size,
     };
-
-    // ── Parse ISO9660 PVD ──────────────────────────────────────────
     if let Some((root_lba, root_size)) = parse_pvd(&instance.ctx) {
         instance.ctx.root_lba = root_lba;
         instance.ctx.root_size = root_size;
     } else {
-        // Failed to parse; free and return null
         unsafe { (bs.free_pool)(ptr); }
         return core::ptr::null_mut();
     }
-
-    // ── Fill SimpleFileSystemProtocol ───────────────────────────────
     instance.sfs = SimpleFileSystemProtocol {
         revision: 0x0001_0000_0000_0001,
         open_volume: sfs_open_volume,
     };
-
     ptr as *mut IsoFsInstance
 }
