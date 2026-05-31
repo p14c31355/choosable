@@ -64,7 +64,9 @@ for dev in /dev/sd[a-z][0-9]* /dev/nvme[0-9]*p[0-9]* /dev/mmcblk[0-9]*p[0-9]* /d
   losetup -o OFFSET /dev/loop0 \"$dev\" 2>/dev/null || continue
   if mount -t iso9660 -o ro /dev/loop0 /cdrom 2>/dev/null; then
     echo '[choosable] premount: ISO mounted at /cdrom via '$dev
-    ls /cdrom/casper/filesystem.squashfs 2>/dev/null && break
+    if [ -f /cdrom/casper/filesystem.squashfs ] || [ -f /cdrom/live/filesystem.squashfs ] || [ -f /cdrom/LiveOS/squashfs.img ] || [ -f /cdrom/images/install.img ]; then
+      break
+    fi
     umount /cdrom 2>/dev/null
     losetup -d /dev/loop0 2>/dev/null
   fi
