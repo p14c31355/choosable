@@ -222,10 +222,10 @@ fn find_first_file_in_dir(
 
                 // Skip .CFG files (grub.cfg, loopback.cfg etc.) — GRUB needs these.
                 let has_cfg_ext = eff_len >= 4
-                    && upper[eff_len - 4] == b'.'
-                    && upper[eff_len - 3] == b'C'
-                    && upper[eff_len - 2] == b'F'
-                    && upper[eff_len - 1] == b'G';
+                    && scratch[name_offset + eff_len - 4].to_ascii_uppercase() == b'.'
+                    && scratch[name_offset + eff_len - 3].to_ascii_uppercase() == b'C'
+                    && scratch[name_offset + eff_len - 2].to_ascii_uppercase() == b'F'
+                    && scratch[name_offset + eff_len - 1].to_ascii_uppercase() == b'G';
                 if has_cfg_ext {
                     offset += record_len;
                     continue;
