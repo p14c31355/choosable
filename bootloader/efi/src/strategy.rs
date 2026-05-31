@@ -42,10 +42,46 @@ fn allocate_output(bs: &mut BootServices, orig_len: usize, extra: usize) -> Opti
     Some((ptr as *mut u8, new_size))
 }
 
+/// Count matching linux/initrd lines in the original grub.cfg to determine
+/// how much extra space is needed for all injections.
+fn count_matching_lines(orig: &[u8]) -> (usize, usize) {
+    let mut linux_count = 0;
+    let mut initrd_count = 0;
+    let mut pos = 0;
+    while pos < orig.len() {
+        let start = pos;
+        while pos < orig.len() && orig[pos] != b'\n' {
+            pos += 1;
+        }
+        let line = &orig[start..pos];
+        let mut ts = 0;
+        while ts < line.len() && (line[ts] == b' ' || line[ts] == b'\t') {
+            ts += 1;
+        }
+        let t = &line[ts..];
+        if t.starts_with(b"linux ") || t.starts_with(b"linux\t")
+            || t.starts_with(b"linuxefi ") || t.starts_with(b"linuxefi\t")
+        {
+            linux_count += 1;
+        } else if t.starts_with(b"initrd ") || t.starts_with(b"initrd\t") {
+            initrd_count += 1;
+        }
+        if pos < orig.len() {
+            pos += 1; // skip \n
+        }
+    }
+    (linux_count, initrd_count)
+}
+
 fn patch_grub_cfg_impl(inp: &PatchInput, linux_extra: &[u8], initrd_extra: &[u8]) -> Option<PatchOutput> {
     let bs = unsafe { &mut *inp.bs };
     let orig = inp.original;
-    let (out_ptr, out_cap) = allocate_output(bs, orig.len(), linux_extra.len() + initrd_extra.len())?;
+
+    // Count matching lines first so the output buffer is large enough for
+    // all injections (typical grub.cfg has multiple menu entries).
+    let (linux_count, initrd_count) = count_matching_lines(orig);
+    let extra = linux_count * linux_extra.len() + initrd_count * initrd_extra.len();
+    let (out_ptr, out_cap) = allocate_output(bs, orig.len(), extra)?;
     let out = unsafe { core::slice::from_raw_parts_mut(out_ptr, out_cap) };
 
     let mut src = 0usize;

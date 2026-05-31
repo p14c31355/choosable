@@ -153,24 +153,31 @@ pub fn prepare_premount_initrd(
     let cpio = unsafe { core::slice::from_raw_parts_mut(cpio_ptr as *mut u8, cpio_estimate) };
     let mut off = 0usize;
 
-    let mut append_entry = |cpio: &mut [u8], off: &mut usize, name: &[u8], data: &[u8], mode: u32| {
-        let hdr_len = cpio_newc_header(&mut cpio[*off..], name, data.len() as u32, mode);
-        *off += hdr_len;
+    let mut append_entry = |cpio: &mut [u8], off: &mut usize, name: &[u8], data: &[u8], mode: u32| -> bool {
+        let name_len = name.len() + 1;
+        let padded_name_len = (name_len + 3) & !3;
+        let hdr_len = 110 + padded_name_len;
+        let pad = (4 - ((*off + hdr_len + data.len()) & 3)) & 3;
+        if *off + hdr_len + data.len() + pad > cpio.len() {
+            return false;
+        }
+        let actual_hdr_len = cpio_newc_header(&mut cpio[*off..], name, data.len() as u32, mode);
+        *off += actual_hdr_len;
         let data_start = *off;
         cpio[data_start..data_start + data.len()].copy_from_slice(data);
         *off += data.len();
-        let pad = (4 - (*off & 3)) & 3;
         for _ in 0..pad { cpio[*off] = 0; *off += 1; }
+        true
     };
 
     // Directory: scripts/
-    append_entry(cpio, &mut off, b"scripts", b"", 0o40755);
+    if !append_entry(cpio, &mut off, b"scripts", b"", 0o40755) { return None; }
     // Directory: scripts/casper-premount/
-    append_entry(cpio, &mut off, b"scripts/casper-premount", b"", 0o40755);
+    if !append_entry(cpio, &mut off, b"scripts/casper-premount", b"", 0o40755) { return None; }
     // File: scripts/casper-premount/choosable
-    append_entry(cpio, &mut off, b"scripts/casper-premount/choosable", &script[..script_len], 0o100755);
+    if !append_entry(cpio, &mut off, b"scripts/casper-premount/choosable", &script[..script_len], 0o100755) { return None; }
     // Trailer
-    append_entry(cpio, &mut off, b"TRAILER!!!", b"", 0);
+    if !append_entry(cpio, &mut off, b"TRAILER!!!", b"", 0) { return None; }
 
     Some(PremountBundle {
         cpio_buf: cpio_ptr as *mut u8,

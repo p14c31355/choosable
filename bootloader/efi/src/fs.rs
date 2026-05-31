@@ -438,7 +438,8 @@ fn scan_fat32_dir(
                 let is_dot = name_len == 1 && name_buf[0] == b'.';
                 let is_dotdot = name_len == 2 && name_buf[0] == b'.' && name_buf[1] == b'.';
 
-                if is_dir && !is_dot && !is_dotdot && *count < 64 {
+let depth = path_prefix.iter().filter(|&&c| c == b'/').count();
+                if is_dir && !is_dot && !is_dotdot && *count < 64 && depth < 12 {
                     let dir_cl = u32::from_le_bytes([
                         buf[off + 26],
                         buf[off + 27],
