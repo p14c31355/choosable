@@ -250,10 +250,10 @@ impl ChoosableApp {
             .spacing(4)
         };
 
-        let status_color = if self.loading {
-            iced::Color::from_rgb(0.2, 0.5, 0.8)
+        let status_text = if self.loading {
+            text(&self.status).color(iced::Color::from_rgb(0.2, 0.5, 0.8))
         } else {
-            iced::Color::from_rgba(0.0, 0.0, 0.0, 1.0)
+            text(&self.status)
         };
 
         let content = column![
