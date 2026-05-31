@@ -105,6 +105,7 @@ fn tool_exists(args: &[&str]) -> bool {
     let (cmd, rest) = args.split_first().unwrap();
     std::process::Command::new(cmd)
         .args(rest)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -113,7 +114,8 @@ fn tool_exists(args: &[&str]) -> bool {
 
 fn check_tool(cmd: &str, arg: Option<&str>) -> Result<()> {
     let mut c = std::process::Command::new(cmd);
-    c.stdout(std::process::Stdio::null())
+    c.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     if let Some(a) = arg {
         c.arg(a);
