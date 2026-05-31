@@ -53,8 +53,8 @@ fn format_decimal_u64(v: u64) -> [u8; 21] {
 /// Build the premount shell script.
 /// `OFFSET` is replaced with the decimal byte offset of the ISO on the
 /// real partition (iso_lba * 512).
-fn build_premount_script(offset_bytes: u64) -> [u8; 512] {
-    let mut script = [0u8; 512];
+fn build_premount_script(offset_bytes: u64) -> [u8; 1024] {
+    let mut script = [0u8; 1024];
     let src = b"\
 #!/bin/sh
 # Choosable premount: loop-mounts ISO from raw partition offset
@@ -85,11 +85,11 @@ done
             && bytes[i+3] == b'S' && bytes[i+4] == b'E' && bytes[i+5] == b'T'
         {
             for j in off_start..21 {
-                if pos < 511 { script[pos] = off_str[j]; pos += 1; }
+                if pos < 1023 { script[pos] = off_str[j]; pos += 1; }
             }
             i += 6;
         } else {
-            if pos < 511 { script[pos] = bytes[i]; pos += 1; }
+            if pos < 1023 { script[pos] = bytes[i]; pos += 1; }
             i += 1;
         }
     }

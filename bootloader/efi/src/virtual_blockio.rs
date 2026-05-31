@@ -73,17 +73,23 @@ unsafe extern "efiapi" fn vblock_read(
         }
         // Case 2a: Root directory sector — inject PREMOUNT.CPIO entry
         if vbio.premount_entry_patched && block_lba == vbio.premount_entry_sector as u64 {
-            let disk_lba = vbio.iso_lba + block_lba * 4;
-            let status = unsafe {
-                ((*vbio.real_bio_ptr).read_blocks)(
-                    vbio.real_bio_ptr,
-                    vbio.real_media_id,
-                    disk_lba,
-                    2048,
-                    dst.as_mut_ptr().add(block_offset) as *mut c_void,
-                )
-            };
-            if status != EFI_SUCCESS { return EFI_DEVICE_ERROR; }
+            // If Case 1 already read this sector, skip the disk read to avoid
+            // overwriting the grub.cfg patch.  This happens when grub.cfg and
+            // the PREMOUNT.CPIO injection target are in the same directory
+            // sector (the common case).
+            if !(vbio.dir_entry_patched && block_lba == vbio.dir_entry_sector as u64) {
+                let disk_lba = vbio.iso_lba + block_lba * 4;
+                let status = unsafe {
+                    ((*vbio.real_bio_ptr).read_blocks)(
+                        vbio.real_bio_ptr,
+                        vbio.real_media_id,
+                        disk_lba,
+                        2048,
+                        dst.as_mut_ptr().add(block_offset) as *mut c_void,
+                    )
+                };
+                if status != EFI_SUCCESS { return EFI_DEVICE_ERROR; }
+            }
             let entry = &mut dst[block_offset..block_offset + 2048];
             let off = vbio.premount_entry_offset as usize;
             let off = vbio.premount_entry_offset as usize;

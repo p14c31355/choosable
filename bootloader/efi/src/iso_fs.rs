@@ -403,7 +403,12 @@ unsafe extern "efiapi" fn file_read_file(this: *mut FileProtocol, buffer_size: *
 
     // Synthetic file (premount cpio from memory)
     if vf.is_synthetic && !vf.synthetic_buf.is_null() {
-        let avail = (vf.synthetic_size as u64 - vf.position as u64) as usize;
+        // Guard against position overflow (set_position may exceed size)
+        if vf.position >= vf.synthetic_size as u64 {
+            unsafe { *buffer_size = 0; }
+            return EFI_SUCCESS;
+        }
+        let avail = (vf.synthetic_size as u64 - vf.position) as usize;
         let to_copy = size.min(avail);
         if to_copy == 0 { unsafe { *buffer_size = 0; } return EFI_SUCCESS; }
         let src = unsafe { core::slice::from_raw_parts(vf.synthetic_buf.add(vf.position as usize), to_copy) };
@@ -416,7 +421,12 @@ unsafe extern "efiapi" fn file_read_file(this: *mut FileProtocol, buffer_size: *
 
     // Patched file (grub.cfg)
     if vf.patched && !vf.patched_buf.is_null() {
-        let avail = (vf.patched_size - vf.position as u64) as usize;
+        // Guard against position overflow (set_position may exceed size)
+        if vf.position >= vf.patched_size {
+            unsafe { *buffer_size = 0; }
+            return EFI_SUCCESS;
+        }
+        let avail = (vf.patched_size - vf.position) as usize;
         let to_copy = size.min(avail);
         if to_copy == 0 { unsafe { *buffer_size = 0; } return EFI_SUCCESS; }
         let src = unsafe { core::slice::from_raw_parts(vf.patched_buf.add(vf.position as usize), to_copy) };
