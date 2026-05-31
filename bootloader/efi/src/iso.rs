@@ -13,7 +13,7 @@ use core::ffi::c_void;
 
 use crate::disk::read_sector;
 use crate::fs::{IsoEntry, FsCtx};
-use crate::output::{format_u64_buf, halt_or_reboot, print_raw};
+use crate::output::{format_u64_buf, halt_or_reboot, print_dec, print_raw};
 use crate::protocol::{
     BlockIoProtocol, BootServices, LoadedImageProtocol, MemoryType, SystemTable,
     DevicePathProtocol, VirtualBlockIo, EFI_SUCCESS, LOADED_IMAGE_PROTOCOL_GUID,
@@ -396,14 +396,9 @@ fn try_patch_candidate(
     vb.media.bim_lb = orig_end_sector + vb.patched_file_sectors as u64 - 1;
 
     print_raw(st, b"[grub.cfg] PATCHED OK: orig=\0");
-    let mut nbuf = [0u8; 16];
-    let mut nv = orig_len as u64; let mut np = 15;
-    loop { nbuf[np] = b'0' + (nv % 10) as u8; nv /= 10; if nv == 0 || np == 0 { break; } np -= 1; }
-    print_raw(st, &nbuf[np..]);
+    print_dec(st, orig_len as u64);
     print_raw(st, b" -> new=\0");
-    let mut nv2 = patched_size as u64; let mut np2 = 15;
-    loop { nbuf[np2] = b'0' + (nv2 % 10) as u8; nv2 /= 10; if nv2 == 0 || np2 == 0 { break; } np2 -= 1; }
-    print_raw(st, &nbuf[np2..]);
+    print_dec(st, patched_size as u64);
     print_raw(st, b"\r\n\0");
     true
 }
@@ -673,18 +668,11 @@ fn uefi_chainload_iso(
                 print_raw(st, b"[premount] overwriting \0");
                 print_raw(st, &name_buf[..name_len.min(15)]);
                 print_raw(st, b" dir entry at sector=\0");
-                let mut nbuf = [0u8; 16];
-                let mut nv = dir_sector as u64; let mut np = 15;
-                loop { nbuf[np] = b'0' + (nv % 10) as u8; nv /= 10; if nv == 0 || np == 0 { break; } np -= 1; }
-                print_raw(st, &nbuf[np..]);
+                print_dec(st, dir_sector as u64);
                 print_raw(st, b" off=\0");
-                let mut nv2 = dir_offset as u64; let mut np2 = 15;
-                loop { nbuf[np2] = b'0' + (nv2 % 10) as u8; nv2 /= 10; if nv2 == 0 || np2 == 0 { break; } np2 -= 1; }
-                print_raw(st, &nbuf[np2..]);
+                print_dec(st, dir_offset as u64);
                 print_raw(st, b" size=\0");
-                let mut nv3 = bundle.cpio_size as u64; let mut np3 = 15;
-                loop { nbuf[np3] = b'0' + (nv3 % 10) as u8; nv3 /= 10; if nv3 == 0 || np3 == 0 { break; } np3 -= 1; }
-                print_raw(st, &nbuf[np3..]);
+                print_dec(st, bundle.cpio_size as u64);
                 print_raw(st, b" bytes\r\n\0");
             } else {
                 // Fallback: SFS-only via PREMOUNT.CPIO

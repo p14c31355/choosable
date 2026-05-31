@@ -4,7 +4,7 @@
 
 use crate::ata::ata_read_sector;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct Partition {
     pub start_lba: u32,
     pub sector_count: u32,
@@ -14,35 +14,12 @@ pub struct Partition {
 pub fn read_partitions() -> ([Partition; 4], usize) {
     let mut buf = [0u8; 512];
     if !ata_read_sector(0, &mut buf) {
-        return (
-            [
-                Partition {
-                    start_lba: 0,
-                    sector_count: 0,
-                    fs_type: 0,
-                };
-                4
-            ],
-            0,
-        );
+        return ([Partition::default(); 4], 0);
     }
-    let mut parts = [
-        Partition {
-            start_lba: 0,
-            sector_count: 0,
-            fs_type: 0,
-        };
-        4
-    ];
+    let mut parts = [Partition::default(); 4];
     let mut count = 0;
 
-    let mut has_gpt = false;
-    for i in 0..4 {
-        if buf[446 + i * 16 + 4] == 0xEE {
-            has_gpt = true;
-            break;
-        }
-    }
+    let has_gpt = (0..4).any(|i| buf[446 + i * 16 + 4] == 0xEE);
 
     if has_gpt {
         let mut hdr = [0u8; 512];
@@ -56,19 +33,15 @@ pub fn read_partitions() -> ([Partition; 4], usize) {
                     0x26, 0x99, 0xC7,
                 ];
                 let mut sec = [0u8; 512];
-                let mut current_lba: u64 = 0;
+                let mut current_lba = 0u64;
                 let mut loaded = false;
                 for i in 0..n.min(128) {
                     let eoff = i as usize * sz as usize;
                     let lba = entries_lba + (eoff / 512) as u64;
                     let boff = eoff % 512;
-                    if boff + 48 > 512 {
-                        continue;
-                    }
+                    if boff + 48 > 512 { continue; }
                     if !loaded || lba != current_lba {
-                        if !ata_read_sector(lba, &mut sec) {
-                            break;
-                        }
+                        if !ata_read_sector(lba, &mut sec) { break; }
                         current_lba = lba;
                         loaded = true;
                     }

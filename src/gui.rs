@@ -8,7 +8,7 @@ pub fn run_gui() -> crate::error::Result<()> {
         ChoosableApp::view,
     )
     .run_with(|| (ChoosableApp::default(), Task::none()))
-    .map_err(|e| crate::error::ChoosableError::Generic(format!("GUI error: {}", e)))
+    .map_err(|e| crate::error::ChoosableError::Generic(format!("GUI error: {e}")))
 }
 
 #[derive(Debug, Clone)]
@@ -42,11 +42,11 @@ impl FsType {
 
 impl std::fmt::Display for FsType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FsType::ExFat => write!(f, "exFAT"),
-            FsType::Ntfs => write!(f, "NTFS"),
-            FsType::Fat32 => write!(f, "FAT32"),
-        }
+        f.write_str(match self {
+            FsType::ExFat => "exFAT",
+            FsType::Ntfs => "NTFS",
+            FsType::Fat32 => "FAT32",
+        })
     }
 }
 
@@ -116,23 +116,16 @@ impl ChoosableApp {
                 self.disks = disks;
                 self.loading = false;
                 self.status = format!("{} disks found.", self.disks.len());
-                if let Some(index) = self.selected_disk_index {
-                    if index >= self.disks.len() {
-                        self.selected_disk_index =
-                            if self.disks.is_empty() { None } else { Some(0) };
-                    }
-                } else if !self.disks.is_empty() {
-                    self.selected_disk_index = Some(0);
-                }
+                self.selected_disk_index = self
+                    .selected_disk_index
+                    .filter(|&i| i < self.disks.len())
+                    .or_else(|| (!self.disks.is_empty()).then_some(0));
             }
             Message::SelectDisk(display) => {
-                // Find the index of the disk that matches this display string
-                for (i, d) in self.disks.iter().enumerate() {
-                    if d.to_string() == display {
-                        self.selected_disk_index = Some(i);
-                        break;
-                    }
-                }
+                self.selected_disk_index = self
+                    .disks
+                    .iter()
+                    .position(|d| d.to_string() == display);
             }
             Message::ToggleGpt(val) => self.use_gpt = val,
             Message::ToggleSecureBoot(val) => self.secure_boot = val,
@@ -144,26 +137,18 @@ impl ChoosableApp {
             Message::InstallClicked => {
                 if let Some(index) = self.selected_disk_index {
                     let disk_path = self.disks[index].path.clone();
-                    let gpt = self.use_gpt;
-                    let secure_boot = self.secure_boot;
-                    let force = self.force;
-                    let label = self.label.clone();
-                    let fs_type = self.fs_type;
-                    let non_destructive = self.non_destructive;
                     let reserve: u64 = self.reserve_space.parse().unwrap_or(0);
-
                     self.loading = true;
                     self.status = String::from("Installing...");
-
                     return Task::perform(
                         run_install(
                             disk_path,
-                            gpt,
-                            secure_boot,
-                            force,
-                            label,
-                            fs_type,
-                            non_destructive,
+                            self.use_gpt,
+                            self.secure_boot,
+                            self.force,
+                            self.label.clone(),
+                            self.fs_type,
+                            self.non_destructive,
                             reserve,
                         ),
                         Message::StatusMessage,
@@ -173,17 +158,11 @@ impl ChoosableApp {
             }
             Message::UpdateClicked => {
                 if let Some(index) = self.selected_disk_index {
-                    let disk_path = self.disks[index].path.clone();
-                    let secure_boot = if self.secure_boot {
-                        Some(true)
-                    } else {
-                        Some(false)
-                    };
+                    let secure_boot = Some(self.secure_boot);
                     self.loading = true;
                     self.status = String::from("Updating...");
-
                     return Task::perform(
-                        run_update(disk_path, secure_boot),
+                        run_update(self.disks[index].path.clone(), secure_boot),
                         Message::StatusMessage,
                     );
                 }
@@ -191,11 +170,12 @@ impl ChoosableApp {
             }
             Message::ListClicked => {
                 if let Some(index) = self.selected_disk_index {
-                    let disk_path = self.disks[index].path.clone();
                     self.loading = true;
                     self.status = String::from("Reading info...");
-
-                    return Task::perform(run_list(disk_path), Message::StatusMessage);
+                    return Task::perform(
+                        run_list(self.disks[index].path.clone()),
+                        Message::StatusMessage,
+                    );
                 }
             }
             Message::StatusMessage(msg) => {
@@ -295,19 +275,20 @@ impl ChoosableApp {
 // ── Async tasks (yes=true to avoid stdin prompts in GUI) ────────────────
 
 async fn refresh_disks() -> Vec<DiskEntry> {
-    match crate::disk::enumerate_disks() {
-        Ok(disks) => disks
-            .into_iter()
-            .map(|d| DiskEntry {
-                path: d.disk_path,
-                model: d.model,
-                size_gb: crate::disk::human_readable_gb(d.size_bytes),
-                is_usb: d.is_usb,
-                removable: d.removable,
-            })
-            .collect(),
-        Err(_) => Vec::new(),
-    }
+    crate::disk::enumerate_disks()
+        .map(|disks| {
+            disks
+                .into_iter()
+                .map(|d| DiskEntry {
+                    path: d.disk_path,
+                    model: d.model,
+                    size_gb: crate::disk::human_readable_gb(d.size_bytes),
+                    is_usb: d.is_usb,
+                    removable: d.removable,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 async fn run_install(
@@ -320,51 +301,45 @@ async fn run_install(
     non_destructive: bool,
     reserve: u64,
 ) -> String {
-    let ft = match fs_type {
-        FsType::ExFat => crate::installer::FilesystemType::ExFat,
-        FsType::Ntfs => crate::installer::FilesystemType::Ntfs,
-        FsType::Fat32 => crate::installer::FilesystemType::Fat32,
-    };
+    let ft = fs_type_to_installer(fs_type);
 
     let result = if non_destructive {
         crate::installer::non_destructive_install(&disk_path, &label, ft, secure_boot, true)
     } else {
-        crate::installer::install_choosable(
-            &disk_path,
-            gpt,
-            secure_boot,
-            reserve,
-            &label,
-            ft,
-            force,
-            true,
-        )
+        crate::installer::install_choosable(&disk_path, gpt, secure_boot, reserve, &label, ft, force, true)
     };
 
-    match result {
-        Ok(()) => String::from("Installation completed successfully!"),
-        Err(e) => {
-            let mut msg = format!("Installation failed: {}", e);
-            if format!("{}", e).contains("Permission denied") {
-                msg.push_str(
-                    "\nHint: Run Choosable with sudo (sudo choosable) to get disk access.",
-                );
-            }
-            msg
-        }
-    }
+    format_result(result, "Installation")
 }
 
 async fn run_update(disk_path: String, secure_boot: Option<bool>) -> String {
-    match crate::installer::update_choosable(&disk_path, secure_boot, true) {
-        Ok(()) => String::from("Update completed successfully!"),
-        Err(e) => format!("Update failed: {}", e),
-    }
+    format_result(crate::installer::update_choosable(&disk_path, secure_boot, true), "Update")
 }
 
 async fn run_list(disk_path: String) -> String {
     match crate::installer::list_choosable(&disk_path) {
         Ok(()) => String::from("Info displayed in terminal (stdout)."),
-        Err(e) => format!("List failed: {}", e),
+        Err(e) => format!("List failed: {e}"),
+    }
+}
+
+fn fs_type_to_installer(fs: FsType) -> crate::installer::FilesystemType {
+    match fs {
+        FsType::ExFat => crate::installer::FilesystemType::ExFat,
+        FsType::Ntfs => crate::installer::FilesystemType::Ntfs,
+        FsType::Fat32 => crate::installer::FilesystemType::Fat32,
+    }
+}
+
+fn format_result(result: crate::error::Result<()>, op: &str) -> String {
+    match result {
+        Ok(()) => format!("{op} completed successfully!"),
+        Err(e) => {
+            let mut msg = format!("{op} failed: {e}");
+            if e.to_string().contains("Permission denied") {
+                msg.push_str("\nHint: Run Choosable with sudo (sudo choosable) to get disk access.");
+            }
+            msg
+        }
     }
 }

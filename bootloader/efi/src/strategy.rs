@@ -190,16 +190,20 @@ fn shift_and_inject(out: &mut [u8], inject_at: usize, dst: &mut usize, data: &[u
 //  CasperStrategy
 // ═══════════════════════════════════════════════════════════════════════════
 
+fn matches_any_lower(name: &[u8], patterns: &[&[u8]]) -> bool {
+    patterns.iter().any(|pat| name.windows(pat.len()).any(|w| {
+        w.iter().zip(pat.iter()).all(|(&a, &b)| (a | 0x20) == b)
+    }))
+}
+
 pub struct CasperStrategy;
 
 impl BootStrategy for CasperStrategy {
     fn detect(&self, ctx: &IsoFsCtx) -> bool {
-        let name = &ctx.iso_name[..ctx.iso_name_len];
-        let lower = |b: u8| b | 0x20;
-        name.windows(6).any(|w| lower(w[0]) == b'u' && lower(w[1]) == b'b' && lower(w[2]) == b'u' && lower(w[3]) == b'n' && lower(w[4]) == b't' && lower(w[5]) == b'u')
-        || name.windows(4).any(|w| lower(w[0]) == b'm' && lower(w[1]) == b'i' && lower(w[2]) == b'n' && lower(w[3]) == b't')
-        || name.windows(6).any(|w| lower(w[0]) == b'd' && lower(w[1]) == b'e' && lower(w[2]) == b'b' && lower(w[3]) == b'i' && lower(w[4]) == b'a' && lower(w[5]) == b'n')
-        || name.windows(3).any(|w| lower(w[0]) == b'p' && lower(w[1]) == b'o' && lower(w[2]) == b'p')
+        matches_any_lower(
+            &ctx.iso_name[..ctx.iso_name_len],
+            &[b"ubuntu", b"mint", b"debian", b"pop"],
+        )
     }
 
     fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> {
@@ -221,11 +225,10 @@ pub struct LiveOSStrategy;
 
 impl BootStrategy for LiveOSStrategy {
     fn detect(&self, ctx: &IsoFsCtx) -> bool {
-        let name = &ctx.iso_name[..ctx.iso_name_len];
-        let lower = |b: u8| b | 0x20;
-        name.windows(6).any(|w| lower(w[0])==b'f'&&lower(w[1])==b'e'&&lower(w[2])==b'd'&&lower(w[3])==b'o'&&lower(w[4])==b'r'&&lower(w[5])==b'a')
-        || name.windows(4).any(|w| lower(w[0])==b'r'&&lower(w[1])==b'h'&&lower(w[2])==b'e'&&lower(w[3])==b'l')
-        || name.windows(6).any(|w| lower(w[0])==b'c'&&lower(w[1])==b'e'&&lower(w[2])==b'n'&&lower(w[3])==b't'&&lower(w[4])==b'o'&&lower(w[5])==b's')
+        matches_any_lower(
+            &ctx.iso_name[..ctx.iso_name_len],
+            &[b"fedora", b"rhel", b"centos"],
+        )
     }
 
     fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> {

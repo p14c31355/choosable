@@ -85,6 +85,11 @@ fn system_reset(st: &mut SystemTable) -> ! {
     }
 }
 
+pub fn print_dec(st: &mut SystemTable, v: u64) {
+    let (buf, len) = format_u64_buf(v);
+    print_raw(st, &buf[20 - len..]);
+}
+
 pub fn halt_or_reboot(st: &mut SystemTable) -> ! {
     let bs = unsafe { &mut *st.boot_services };
     if !st.con_in.is_null() {

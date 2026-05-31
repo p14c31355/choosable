@@ -1,9 +1,9 @@
 /// Size constants
 pub const SIZE_1KB: u64 = 1024;
-pub const SIZE_1MB: u64 = 1024 * 1024;
-pub const SIZE_2MB: u64 = 2048 * 1024;
-pub const SIZE_1GB: u64 = 1024 * 1024 * 1024;
-pub const SIZE_1TB: u64 = 1024 * 1024 * 1024 * 1024;
+pub const SIZE_1MB: u64 = 1024 * SIZE_1KB;
+pub const SIZE_2MB: u64 = 2048 * SIZE_1KB;
+pub const SIZE_1GB: u64 = SIZE_1MB * SIZE_1KB;
+pub const SIZE_1TB: u64 = SIZE_1GB * SIZE_1KB;
 
 /// 32 GiB - threshold for FAT32
 pub const FAT32_MAX_LIMIT: u64 = 32 * SIZE_1GB;
@@ -45,9 +45,14 @@ pub const CHOOSABLE_FILE_VERSION: &str = "choosable/version";
 pub const CHOOSABLE_FILE_LOG: &str = "log.txt";
 
 /// GPT partition names
-pub const GPT_PART1_NAME: &[u16] = &[
+pub const GPT_PART1_NAME: &[u16; 43] = &[
     'C' as u16, 'Z' as u16, 'B' as u16, 'L' as u16, 'E' as u16, 'F' as u16, 'I' as u16, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+/// CZBLEFI name as UTF-16
+pub const CZBLEFI_NAME: &[u16; 7] = &[
+    'C' as u16, 'Z' as u16, 'B' as u16, 'L' as u16, 'E' as u16, 'F' as u16, 'I' as u16,
 ];
 
 /// Well-known GPT partition type GUIDs
@@ -76,3 +81,16 @@ pub const GPT_SIGNATURE: &[u8; 8] = b"EFI PART";
 
 /// Default Choosable partition label
 pub const DEFAULT_CHOOSABLE_LABEL: &str = "Choosable";
+
+/// Fill a [u16; 36] array with the first N `u16` elements of a CZ name slice,
+/// leaving the rest as 0.
+pub const fn make_cz_name<const N: usize>(name: &[u16; N]) -> [u16; 36] {
+    let mut a = [0u16; 36];
+    let mut i = 0;
+    let limit = if N < 36 { N } else { 36 };
+    while i < limit {
+        a[i] = name[i];
+        i += 1;
+    }
+    a
+}

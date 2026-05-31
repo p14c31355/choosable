@@ -274,10 +274,7 @@ impl GptInfo {
         partitions[0].start_lba = CHOOSABLE_PART1_START_SECTOR;
         partitions[0].end_lba = part1_end - 1;
         partitions[0].attributes = 0;
-        let mut part1_name = [0u16; 36];
-        let len = GPT_PART1_NAME.len().min(36);
-        part1_name[..len].copy_from_slice(&GPT_PART1_NAME[..len]);
-        partitions[0].name = part1_name;
+        partitions[0].name = make_cz_name(GPT_PART1_NAME);
 
         // Partition 2: CZBLEFI
         partitions[1].part_type_guid = GPT_TYPE_EFI_SYSTEM;
@@ -285,16 +282,7 @@ impl GptInfo {
         partitions[1].start_lba = part1_end;
         partitions[1].end_lba = part1_end + efi_part_size_sectors - 1;
         partitions[1].attributes = GPT_ATTR_CZBLEFI;
-        // Name: "CZBLEFI"
-        let mut czblefi_name = [0u16; 36];
-        czblefi_name[0] = 'C' as u16;
-        czblefi_name[1] = 'Z' as u16;
-        czblefi_name[2] = 'B' as u16;
-        czblefi_name[3] = 'L' as u16;
-        czblefi_name[4] = 'E' as u16;
-        czblefi_name[5] = 'F' as u16;
-        czblefi_name[6] = 'I' as u16;
-        partitions[1].name = czblefi_name;
+        partitions[1].name = make_cz_name(CZBLEFI_NAME);
 
         GptInfo {
             protective_mbr,

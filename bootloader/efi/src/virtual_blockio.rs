@@ -24,6 +24,47 @@ use crate::protocol::{
 };
 
 /// ReadBlocks implementation for the virtual CD-ROM.
+/// Helper: patch ISO9660 directory entry extent + data length (LE + BE)
+fn patch_dir_entry(entry: &mut [u8], off: usize, new_extent: u32, new_size: u32) {
+    if off + 18 > entry.len() { return; }
+    entry[off + 2..off + 6].copy_from_slice(&new_extent.to_le_bytes());
+    entry[off + 6..off + 10].copy_from_slice(&new_extent.to_be_bytes());
+    entry[off + 10..off + 14].copy_from_slice(&new_size.to_le_bytes());
+    entry[off + 14..off + 18].copy_from_slice(&new_size.to_be_bytes());
+}
+
+/// Helper: read one ISO sector (4 × 512B) from real disk into dst at offset
+fn read_real_iso_sector(vbio: &VirtualBlockIo, iso_sector: u64, dst: &mut [u8], dst_off: usize) -> bool {
+    let disk_lba = vbio.iso_lba + iso_sector * 4;
+    unsafe {
+        ((*vbio.real_bio_ptr).read_blocks)(
+            vbio.real_bio_ptr,
+            vbio.real_media_id,
+            disk_lba,
+            2048,
+            dst.as_mut_ptr().add(dst_off) as *mut c_void,
+        ) == EFI_SUCCESS
+    }
+}
+
+/// Helper: serve sector from a memory buffer
+fn serve_memory_sector(
+    buf: *mut u8,
+    buf_sectors: u32,
+    buf_sector_start: u32,
+    block_lba: u64,
+    dst: &mut [u8],
+    block_offset: usize,
+) -> bool {
+    if buf.is_null() || buf_sectors == 0 { return false; }
+    let start = buf_sector_start as u64;
+    if block_lba < start || block_lba >= start + buf_sectors as u64 { return false; }
+    let off = (block_lba - start) as usize * 2048;
+    let src = unsafe { core::slice::from_raw_parts(buf.add(off), 2048) };
+    dst[block_offset..block_offset + 2048].copy_from_slice(src);
+    true
+}
+
 unsafe extern "efiapi" fn vblock_read(
     this: *mut BlockIoProtocol,
     _media_id: u32,
@@ -31,128 +72,40 @@ unsafe extern "efiapi" fn vblock_read(
     buffer_size: usize,
     buffer: *mut c_void,
 ) -> usize {
+    if buffer_size % 2048 != 0 { return EFI_BAD_BUFFER_SIZE; }
+
     let vbio = &*(this as *const VirtualBlockIo);
-
-    if buffer_size % 2048 != 0 {
-        return EFI_BAD_BUFFER_SIZE;
-    }
-
-    let num_blocks = buffer_size / 2048;
     let dst = core::slice::from_raw_parts_mut(buffer as *mut u8, buffer_size);
 
-    for b in 0..num_blocks {
+    for b in 0..(buffer_size / 2048) {
         let block_lba = lba + b as u64;
         let block_offset = b * 2048;
 
-        // Case 1: Directory entry sector — intercept and overwrite the entry
-        if vbio.dir_entry_patched && block_lba == vbio.dir_entry_sector as u64 {
-            // Read the real directory sector first
-            let disk_lba = vbio.iso_lba + block_lba * 4;
-            let status = unsafe {
-                ((*vbio.real_bio_ptr).read_blocks)(
-                    vbio.real_bio_ptr,
-                    vbio.real_media_id,
-                    disk_lba,
-                    2048,
-                    dst.as_mut_ptr().add(block_offset) as *mut c_void,
-                )
-            };
-            if status != EFI_SUCCESS {
-                return EFI_DEVICE_ERROR;
-            }
-            // Overwrite the Extent LBA (offset +2 LE, +6 BE) and Data Length (offset +10 LE, +14 BE)
-            // ISO9660 uses double-endian: both LE and BE must match for strict parsers.
-            let entry = &mut dst[block_offset..block_offset + 2048];
-            let off = vbio.dir_entry_offset as usize;
-            if off + 18 <= 2048 {
-                entry[off + 2..off + 6].copy_from_slice(&vbio.dir_entry_new_extent.to_le_bytes());
-                entry[off + 6..off + 10].copy_from_slice(&vbio.dir_entry_new_extent.to_be_bytes());
-                entry[off + 10..off + 14].copy_from_slice(&vbio.dir_entry_new_size.to_le_bytes());
-                entry[off + 14..off + 18].copy_from_slice(&vbio.dir_entry_new_size.to_be_bytes());
-            }
-        }
-        // Case 2a: Root directory sector — inject premount entry redirect,
-        //          OR guard against fall-through when Case 1 already handled
-        //          this sector (grub.cfg and premount target sharing a
-        //          directory sector, the common case).
-        if (vbio.premount_entry_patched && block_lba == vbio.premount_entry_sector as u64)
-            || (vbio.dir_entry_patched && block_lba == vbio.dir_entry_sector as u64)
-        {
-            if vbio.premount_entry_patched && block_lba == vbio.premount_entry_sector as u64 {
-                // If Case 1 already read this sector, skip the disk read to avoid
-                // overwriting the grub.cfg patch.
-                if !(vbio.dir_entry_patched && block_lba == vbio.dir_entry_sector as u64) {
-                    let disk_lba = vbio.iso_lba + block_lba * 4;
-                    let status = unsafe {
-                        ((*vbio.real_bio_ptr).read_blocks)(
-                            vbio.real_bio_ptr,
-                            vbio.real_media_id,
-                            disk_lba,
-                            2048,
-                            dst.as_mut_ptr().add(block_offset) as *mut c_void,
-                        )
-                    };
-                    if status != EFI_SUCCESS { return EFI_DEVICE_ERROR; }
-                }
-                let entry = &mut dst[block_offset..block_offset + 2048];
-                let off = vbio.premount_entry_offset as usize;
-                // Only overwrite extent LBA and data length — keep the original
-                // filename (MD5SUM.TXT) intact.  Changing the name to a longer
-                // one (PREMOUNT.CPIO;1: 15 bytes vs MD5SUM.TXT;1: 12 bytes)
-                // would overwrite the record_len of the next directory entry,
-                // corrupting the root directory and crashing GRUB/kernel parsers.
-                if off + 18 <= 2048 {
-                    // extent LBA LE + BE
-                    entry[off + 2..off + 6].copy_from_slice(&vbio.premount_entry_new_extent.to_le_bytes());
-                    entry[off + 6..off + 10].copy_from_slice(&vbio.premount_entry_new_extent.to_be_bytes());
-                    // data length LE + BE
-                    entry[off + 10..off + 14].copy_from_slice(&vbio.premount_entry_new_size.to_le_bytes());
-                    entry[off + 14..off + 18].copy_from_slice(&vbio.premount_entry_new_size.to_be_bytes());
-                }
-            }
+        let is_dir_patched = vbio.dir_entry_patched && block_lba == vbio.dir_entry_sector as u64;
+        let is_premount_sector = vbio.premount_entry_patched && block_lba == vbio.premount_entry_sector as u64;
+        let sect_handled = is_dir_patched || is_premount_sector;
+
+        if is_dir_patched {
+            if !read_real_iso_sector(vbio, block_lba, dst, block_offset) { return EFI_DEVICE_ERROR; }
+            patch_dir_entry(&mut dst[block_offset..block_offset + 2048],
+                vbio.dir_entry_offset as usize, vbio.dir_entry_new_extent, vbio.dir_entry_new_size);
         }
 
-        // Case 2b: Premount file sector — served from memory
-        else if vbio.premount_file_sectors > 0
-            && !vbio.premount_file_buf.is_null()
-            && block_lba >= vbio.premount_file_sector as u64
-            && block_lba < vbio.premount_file_sector as u64 + vbio.premount_file_sectors as u64
+        if is_premount_sector {
+            if !is_dir_patched && !read_real_iso_sector(vbio, block_lba, dst, block_offset) { return EFI_DEVICE_ERROR; }
+            patch_dir_entry(&mut dst[block_offset..block_offset + 2048],
+                vbio.premount_entry_offset as usize, vbio.premount_entry_new_extent, vbio.premount_entry_new_size);
+        }
+
+        if sect_handled { continue; }
+
+        if serve_memory_sector(vbio.premount_file_buf, vbio.premount_file_sectors, vbio.premount_file_sector, block_lba, dst, block_offset)
+            || serve_memory_sector(vbio.patched_file_buf, vbio.patched_file_sectors, vbio.patched_file_sector, block_lba, dst, block_offset)
         {
-            let p_off = ((block_lba - vbio.premount_file_sector as u64) as usize) * 2048;
-            let src = unsafe { core::slice::from_raw_parts(vbio.premount_file_buf.add(p_off), 2048) };
-            dst[block_offset..block_offset + 2048].copy_from_slice(src);
+            continue;
         }
-        // Case 2c: Patched file sector — served from appended data
-        else if vbio.patched_file_sectors > 0
-            && !vbio.patched_file_buf.is_null()
-            && block_lba >= vbio.patched_file_sector as u64
-            && block_lba < vbio.patched_file_sector as u64 + vbio.patched_file_sectors as u64
-        {
-            let patch_offset = ((block_lba - vbio.patched_file_sector as u64) as usize) * 2048;
-            let src = unsafe {
-                core::slice::from_raw_parts(
-                    vbio.patched_file_buf.add(patch_offset),
-                    2048,
-                )
-            };
-            dst[block_offset..block_offset + 2048].copy_from_slice(src);
-        }
-        // Case 3: Normal read from real ISO
-        else {
-            let disk_lba = vbio.iso_lba + block_lba * 4;
-            let status = unsafe {
-                ((*vbio.real_bio_ptr).read_blocks)(
-                    vbio.real_bio_ptr,
-                    vbio.real_media_id,
-                    disk_lba,
-                    2048,
-                    dst.as_mut_ptr().add(block_offset) as *mut c_void,
-                )
-            };
-            if status != EFI_SUCCESS {
-                return EFI_DEVICE_ERROR;
-            }
-        }
+
+        if !read_real_iso_sector(vbio, block_lba, dst, block_offset) { return EFI_DEVICE_ERROR; }
     }
 
     EFI_SUCCESS

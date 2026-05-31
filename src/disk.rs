@@ -1,5 +1,5 @@
 use crate::constants::*;
-use crate::disk_layout::{GptInfo, GptPartitionEntry, Mbr};
+use crate::disk_layout::{GptInfo, Mbr};
 use crate::error::{ChoosableError, Result};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -202,11 +202,8 @@ pub fn detect_choosable(
             return Ok((false, None, None, None, mbr));
         }
 
-        let expected = [
-            'C' as u16, 'Z' as u16, 'B' as u16, 'L' as u16, 'E' as u16, 'F' as u16, 'I' as u16,
-        ];
         let name_arr = gpt.partitions[1].name;
-        if name_arr[..7] != expected {
+        if name_arr[..CZBLEFI_NAME.len()] != *CZBLEFI_NAME {
             return Ok((false, None, None, None, mbr));
         }
 
@@ -500,4 +497,27 @@ pub fn human_readable_gb(size_bytes: u64) -> u64 {
 /// Read a file from disk (in the current working directory or installation directory)
 pub fn read_install_file(path: &str) -> Result<Vec<u8>> {
     std::fs::read(path).map_err(|e| ChoosableError::Generic(format!("Cannot read {}: {}", path, e)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_partition_name_standard() {
+        assert_eq!(get_partition_name("/dev/sda", 1), "/dev/sda1");
+        assert_eq!(get_partition_name("/dev/sdb", 2), "/dev/sdb2");
+    }
+
+    #[test]
+    fn test_get_partition_name_nvme() {
+        assert_eq!(get_partition_name("/dev/nvme0n1", 1), "/dev/nvme0n1p1");
+        assert_eq!(get_partition_name("/dev/mmcblk0", 2), "/dev/mmcblk0p2");
+    }
+
+    #[test]
+    fn test_human_readable_gb() {
+        assert_eq!(human_readable_gb(SIZE_1GB), 1);
+        assert_eq!(human_readable_gb(0), 0);
+    }
 }

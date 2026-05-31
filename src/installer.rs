@@ -551,15 +551,7 @@ fn update_gpt_partition_table_f(disk: &mut std::fs::File, part2_start_sector: u6
     gpt.partitions[slot].start_lba = part2_start_sector;
     gpt.partitions[slot].end_lba = part2_start_sector + efi_sectors - 1;
     gpt.partitions[slot].attributes = GPT_ATTR_CZBLEFI;
-    let mut name = [0u16; 36];
-    name[0] = 'C' as u16;
-    name[1] = 'Z' as u16;
-    name[2] = 'B' as u16;
-    name[3] = 'L' as u16;
-    name[4] = 'E' as u16;
-    name[5] = 'F' as u16;
-    name[6] = 'I' as u16;
-    gpt.partitions[slot].name = name;
+    gpt.partitions[slot].name = make_cz_name(CZBLEFI_NAME);
 
     finalize_gpt_crcs(&mut gpt);
     gpt.write_to_disk(disk)?;

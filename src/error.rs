@@ -11,9 +11,7 @@ pub enum ChoosableError {
     #[error("Disk is a partition, not a whole disk: {0}")]
     IsPartition(String),
 
-    #[error(
-        "Disk already contains Choosable (version {0}). Use -u to update or -I to force install"
-    )]
+    #[error("Disk already contains Choosable (version {0}). Use -u to update or -I to force install")]
     AlreadyInstalled(String),
 
     #[error("Disk does not contain Choosable. Use -i to install")]
@@ -44,18 +42,10 @@ pub enum ChoosableError {
     FormatFailed,
 
     #[error("Disk write failed at offset {offset}: {source}")]
-    WriteError {
-        offset: u64,
-        #[source]
-        source: std::io::Error,
-    },
+    WriteError { offset: u64, #[source] source: std::io::Error },
 
     #[error("Disk read failed at offset {offset}: {source}")]
-    ReadError {
-        offset: u64,
-        #[source]
-        source: std::io::Error,
-    },
+    ReadError { offset: u64, #[source] source: std::io::Error },
 
     #[error("Unsupported filesystem in partition 1: {0}")]
     UnsupportedFilesystem(String),
@@ -68,3 +58,28 @@ pub enum ChoosableError {
 }
 
 pub type Result<T> = std::result::Result<T, ChoosableError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_display() {
+        let e = ChoosableError::DiskNotFound("sda".into());
+        assert!(e.to_string().contains("Disk not found"));
+        assert!(e.to_string().contains("sda"));
+    }
+
+    #[test]
+    fn test_generic_error() {
+        let e = ChoosableError::Generic("test".into());
+        assert_eq!(e.to_string(), "test");
+    }
+
+    #[test]
+    fn test_io_conversion() {
+        let io = std::io::Error::new(std::io::ErrorKind::NotFound, "nope");
+        let e: ChoosableError = io.into();
+        assert!(matches!(e, ChoosableError::Io(_)));
+    }
+}
