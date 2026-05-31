@@ -82,8 +82,9 @@ unsafe extern "efiapi" fn vblock_read(
         let block_offset = b * 2048;
 
         let is_dir_patched = vbio.dir_entry_patched && block_lba == vbio.dir_entry_sector as u64;
-        let is_premount_sector = vbio.premount_entry_patched && block_lba == vbio.premount_entry_sector as u64;
-        let sect_handled = is_dir_patched || is_premount_sector;
+        let is_premount_patched = vbio.premount_entry_patched && block_lba == vbio.premount_entry_sector as u64;
+        let is_premount_injected = vbio.premount_entry_injected && block_lba == vbio.premount_entry_sector as u64;
+        let sect_handled = is_dir_patched || is_premount_patched || is_premount_injected;
 
         if is_dir_patched {
             if !read_real_iso_sector(vbio, block_lba, dst, block_offset) { return EFI_DEVICE_ERROR; }
@@ -91,10 +92,21 @@ unsafe extern "efiapi" fn vblock_read(
                 vbio.dir_entry_offset as usize, vbio.dir_entry_new_extent, vbio.dir_entry_new_size);
         }
 
-        if is_premount_sector {
+        if is_premount_patched {
             if !is_dir_patched && !read_real_iso_sector(vbio, block_lba, dst, block_offset) { return EFI_DEVICE_ERROR; }
             patch_dir_entry(&mut dst[block_offset..block_offset + 2048],
                 vbio.premount_entry_offset as usize, vbio.premount_entry_new_extent, vbio.premount_entry_new_size);
+        }
+
+        if is_premount_injected {
+            if !is_dir_patched && !is_premount_patched && !read_real_iso_sector(vbio, block_lba, dst, block_offset) { return EFI_DEVICE_ERROR; }
+            // Overwrite with the pre-built synthetic directory record
+            let off = vbio.premount_entry_offset as usize;
+            let sz = vbio.premount_entry_injected_size as usize;
+            if off + sz <= dst[block_offset..block_offset + 2048].len() {
+                dst[block_offset + off..block_offset + off + sz]
+                    .copy_from_slice(&vbio.premount_entry_injected_blob[..sz]);
+            }
         }
 
         if sect_handled { continue; }
@@ -232,6 +244,9 @@ pub fn create_virtual_cdrom(
     vbio.premount_file_sector = 0;
     vbio.premount_file_sectors = 0;
     vbio.premount_file_buf = core::ptr::null_mut();
+    vbio.premount_entry_injected = false;
+    vbio.premount_entry_injected_blob = [0u8; 128];
+    vbio.premount_entry_injected_size = 0;
 
     // ═════════════════════════════════════════════════════════════
     // 3. Install BlockIO protocol (creates the handle)

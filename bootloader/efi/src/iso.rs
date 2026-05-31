@@ -277,6 +277,96 @@ fn find_first_file_in_dir(
     None
 }
 
+/// Find the first EOD marker (byte 0x00) in a directory extent.
+/// Returns (sector, offset) or None.
+fn find_eod_in_dir(
+    bio_ref: &BlockIoProtocol,
+    bio_ptr: *mut BlockIoProtocol,
+    mid: u32,
+    iso_lba: u64,
+    dir_lba: u32,
+    dir_size: u32,
+    scratch: &mut [u8; 2048],
+) -> Option<(u32, u32)> {
+    let total_sectors = ((dir_size as u64 + 2047) / 2048) as u32;
+    for s in 0..total_sectors {
+        if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, dir_lba + s, scratch) {
+            return None;
+        }
+        // Scan for the first byte that is 0x00, signalling end of directory.
+        let limit = (dir_size as usize).saturating_sub(s as usize * 2048).min(2048);
+        for off in 0..limit {
+            if scratch[off] == 0 {
+                // Check enough room for a directory record (minimum 34 bytes)
+                if off + 34 <= 2048 {
+                    return Some((dir_lba + s, off as u32));
+                }
+                // Not enough room in this sector; try next sector
+                break;
+            }
+        }
+    }
+    None
+}
+
+/// Build a complete ISO9660 directory record for "PREMOUNT.CPIO;1".
+/// Returns the number of bytes written to `blob`.
+fn build_premount_cpio_entry(
+    blob: &mut [u8; 128],
+    extent_lba: u32,
+    file_size: u32,
+) -> u32 {
+    // ISO9660 directory record layout:
+    //  0     : record length (1 byte)
+    //  1     : extended attribute record length (1 byte, 0)
+    //  2-5   : extent LBA (LE)
+    //  6-9   : extent LBA (BE)
+    //  10-13 : data length (LE)
+    //  14-17 : data length (BE)
+    //  18-24 : recording date/time (7 bytes, zeroed = 1970-01-01)
+    //  25    : file flags (1 byte, 0 = plain file)
+    //  26    : file unit size (1 byte, 0)
+    //  27    : interleave gap size (1 byte, 0)
+    //  28-31 : volume sequence number (LE, 1)
+    //  32    : name length (1 byte)
+    //  33+   : name bytes + optional padding + optional system use
+
+    let name = b"PREMOUNT.CPIO;1";
+    let name_len = name.len() as u8; // 14
+    // Record must be even length; pad name to even
+    let record_len = if 33 + name_len as usize % 2 == 0 {
+        33 + name_len as usize
+    } else {
+        34 + name_len as usize
+    } as u8;
+
+    blob[0] = record_len;
+    blob[1] = 0; // extended attr record len
+    blob[2..6].copy_from_slice(&extent_lba.to_le_bytes());
+    blob[6..10].copy_from_slice(&extent_lba.to_be_bytes());
+    blob[10..14].copy_from_slice(&file_size.to_le_bytes());
+    blob[14..18].copy_from_slice(&file_size.to_be_bytes());
+    // Recording date: all zeros = 1900-01-01 (valid ISO9660)
+    blob[18] = 0; blob[19] = 0; blob[20] = 0;
+    blob[21] = 0; blob[22] = 0; blob[23] = 0; blob[24] = 0;
+    blob[25] = 0; // flags: plain file
+    blob[26] = 0; // file unit size
+    blob[27] = 0; // interleave gap size
+    blob[28..32].copy_from_slice(&1u32.to_le_bytes()); // volume seq number (LE)
+    blob[32] = name_len;
+    blob[33..33 + name.len()].copy_from_slice(name);
+    // Pad name to even boundary
+    let end = 33 + name.len();
+    if record_len as usize > end {
+        blob[end] = 0;
+    }
+
+    // Append a new EOD marker byte right after this record
+    blob[record_len as usize] = 0;
+
+    (record_len as u32) + 1 // record + EOD
+}
+
 fn find_efi_boot(
     st: &mut SystemTable,
     bio_ref: &BlockIoProtocol,
@@ -698,13 +788,50 @@ fn uefi_chainload_iso(
                 print_dec(st, bundle.cpio_size as u64);
                 print_raw(st, b" bytes\r\n\0");
             } else {
-                // Fallback: SFS-only via PREMOUNT.CPIO
-                if !sfs_instance.is_null() {
-                    let sfs = unsafe { &mut *sfs_instance };
-                    sfs.ctx.premount_cpio_buf = bundle.cpio_buf;
-                    sfs.ctx.premount_cpio_size = bundle.cpio_size;
+                // Fallback: inject a complete synthetic PREMOUNT.CPIO
+                // directory record at the first EOD byte of the root directory.
+                // GRUB reads ISO9660 directly from Block I/O, not via SFS, so
+                // merely setting SFS premount fields is insufficient.
+                //
+                // Strategy: scan root dir for the EOD marker byte 0x00,
+                // and overwrite it + subsequent bytes with a complete
+                // ISO9660 directory record naming "PREMOUNT.CPIO;1".
+                if let Some((eod_sector, eod_offset)) =
+                    find_eod_in_dir(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, &mut scratch)
+                {
+                    let mut blob = [0u8; 128];
+                    let blob_len = build_premount_cpio_entry(
+                        &mut blob,
+                        vb.premount_file_sector,
+                        bundle.cpio_size as u32,
+                    );
+                    vb.premount_entry_sector = eod_sector;
+                    vb.premount_entry_offset = eod_offset;
+                    vb.premount_entry_injected_blob = blob;
+                    vb.premount_entry_injected_size = blob_len;
+                    vb.premount_entry_injected = true;
+
+                    if !sfs_instance.is_null() {
+                        let sfs = unsafe { &mut *sfs_instance };
+                        sfs.ctx.premount_cpio_buf = bundle.cpio_buf;
+                        sfs.ctx.premount_cpio_size = bundle.cpio_size;
+                        sfs.ctx.premount_target_name = *b"PREMOUNT.CPIO___";
+                        sfs.ctx.premount_target_name_len = 12;
+                    }
+
+                    print_raw(st, b"[premount] injected synthetic PREMOUNT.CPIO entry at sector=\0");
+                    print_dec(st, eod_sector as u64);
+                    print_raw(st, b" off=\0");
+                    print_dec(st, eod_offset as u64);
+                    print_raw(st, b"\r\n\0");
+                } else {
+                    if !sfs_instance.is_null() {
+                        let sfs = unsafe { &mut *sfs_instance };
+                        sfs.ctx.premount_cpio_buf = bundle.cpio_buf;
+                        sfs.ctx.premount_cpio_size = bundle.cpio_size;
+                    }
+                    print_raw(st, b"[premount] WARNING: no EOD marker in root dir (SFS-only)\r\n\0");
                 }
-                print_raw(st, b"[premount] WARNING: no safe file in root dir (SFS-only)\r\n\0");
             }
         }
     }
