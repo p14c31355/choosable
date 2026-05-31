@@ -82,8 +82,8 @@ fn parse_varlen_le(data: &[u8], n: usize) -> u64 {
 fn parse_varlen_le_signed(data: &[u8], n: usize) -> i64 {
     if n == 0 || n > 8 { return 0; }
     let val = parse_varlen_le(data, n);
-    let bits = (n * 8) as u64;
-    (val as i64).wrapping_sub(if n < 8 && (val & (1u64 << (bits - 1))) != 0 { 1i64 << bits } else { 0 })
+    let shift = 64 - (n * 8);
+    ((val << shift) as i64) >> shift
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

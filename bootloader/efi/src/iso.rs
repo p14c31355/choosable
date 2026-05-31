@@ -396,11 +396,9 @@ fn try_patch_candidate(
     vb.media.bim_lb = orig_end_sector + vb.patched_file_sectors as u64 - 1;
 
     print_raw(st, b"[grub.cfg] PATCHED OK: orig=\0");
-    let (b1, l1) = format_u64_buf(orig_len as u64);
-    print_raw(st, &b1[20 - l1..]);
+    print_dec(st, orig_len as u64);
     print_raw(st, b" -> new=\0");
-    let (b2, l2) = format_u64_buf(patched_size as u64);
-    print_raw(st, &b2[20 - l2..]);
+    print_dec(st, patched_size as u64);
     print_raw(st, b"\r\n\0");
     true
 }
