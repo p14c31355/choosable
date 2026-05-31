@@ -217,8 +217,8 @@ fn find_first_file_in_dir(
 
                 // Skip El Torito boot catalog files — GRUB reads these on boot.
                 let is_boot_catalog =
-                    &upper[..cl.min(12)] == b"BOOT.CATALOG"
-                    || &upper[..cl.min(8)] == b"BOOT.CAT";
+                    &upper[..cl] == b"BOOT.CATALOG"
+                    || &upper[..cl] == b"BOOT.CAT";
                 if is_boot_catalog {
                     offset += record_len;
                     continue;
