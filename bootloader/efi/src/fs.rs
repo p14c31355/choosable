@@ -215,7 +215,8 @@ fn scan_exfat_dir(
                         name_pos += to_copy;
                     }
 
-                    if is_dir && start_cl >= 2 && *count < 64 {
+let depth = path_prefix.iter().filter(|&&c| c == b'/').count();
+                    if is_dir && start_cl >= 2 && *count < 64 && depth < 12 {
                         // Build sub-path and recurse
                         let prefix_len = path_prefix.len();
                         let mut sub_path = [0u8; 256];
