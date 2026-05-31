@@ -155,7 +155,7 @@ pub fn prepare_premount_initrd(
 
     let mut append_entry = |cpio: &mut [u8], off: &mut usize, name: &[u8], data: &[u8], mode: u32| -> bool {
         let name_len = name.len() + 1;
-        let padded_name_len = (name_len + 3) & !3;
+        let padded_name_len = ((110 + name_len + 3) & !3) - 110;
         let hdr_len = 110 + padded_name_len;
         let pad = (4 - ((*off + hdr_len + data.len()) & 3)) & 3;
         if *off + hdr_len + data.len() + pad > cpio.len() {
