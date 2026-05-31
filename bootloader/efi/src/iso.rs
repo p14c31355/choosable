@@ -651,35 +651,7 @@ fn uefi_chainload_iso(
     // ── ISO file name (for grub.cfg iso-scan/filename injection)
     let iso_name = &files[idx].name[..files[idx].name_len.min(files[idx].name.len())];
 
-    // ── Read volume serial from real USB partition VBR ───────
-    // exFAT: serial at 0x64, NTFS: 0x48, FAT32: 0x43.
-    let mut live_uuid = [0u8; 10];
-    {
-        let mut vbr = [0u8; 512];
-        if read_sector(bio_ref, bio_ptr, mid, part1_lba, &mut vbr) {
-            let serial: u32 = if &vbr[3..11] == b"EXFAT   " {
-                u32::from_le_bytes([vbr[0x64], vbr[0x65], vbr[0x66], vbr[0x67]])
-            } else if &vbr[3..11] == b"NTFS    " {
-                u64::from_le_bytes(vbr[0x48..0x50].try_into().unwrap_or([0; 8])) as u32
-            } else {
-                // FAT32 / fallback
-                u32::from_le_bytes([vbr[0x43], vbr[0x44], vbr[0x45], vbr[0x46]])
-            };
-            let hex = |b: u8| -> u8 {
-                if b < 10 { b'0' + b } else { b'A' + (b - 10) }
-            };
-            live_uuid[0] = hex(((serial >> 28) & 0xF) as u8);
-            live_uuid[1] = hex(((serial >> 24) & 0xF) as u8);
-            live_uuid[2] = hex(((serial >> 20) & 0xF) as u8);
-            live_uuid[3] = hex(((serial >> 16) & 0xF) as u8);
-            live_uuid[4] = b'-';
-            live_uuid[5] = hex(((serial >> 12) & 0xF) as u8);
-            live_uuid[6] = hex(((serial >> 8) & 0xF) as u8);
-            live_uuid[7] = hex(((serial >> 4) & 0xF) as u8);
-            live_uuid[8] = hex((serial & 0xF) as u8);
-            live_uuid[9] = 0;
-        }
-    }
+    let live_uuid = [0u8; 10];
 
     // ── Create virtual CD-ROM from the ISO file ──────────────────────
     let cdrom_tuple = crate::virtual_blockio::create_virtual_cdrom(
