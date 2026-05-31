@@ -38,7 +38,7 @@ pub struct IsoFsCtx {
     pub iso_name: [u8; 128],
     pub iso_name_len: usize,
     pub live_media_uuid: [u8; 10],
-    /// Premount cpio data (served as /CHOOSABLE/PREMOUNT.CPIO synthetic file)
+    /// Premount cpio data (served as synthetic file)
     pub premount_cpio_buf: *mut u8,
     pub premount_cpio_size: usize,
     /// ISO9660 name used as premount injection target (e.g. "MD5SUM.TXT")
@@ -68,6 +68,9 @@ pub struct VirtualFile {
     is_synthetic: bool,
     synthetic_buf: *mut u8,
     synthetic_size: usize,
+    /// When this directory handle serves as root, this flag tracks whether
+    /// the synthetic premount entry has already been injected into readdir.
+    synthetic_injected: bool,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -167,19 +170,11 @@ fn parse_pvd(ctx: &IsoFsCtx) -> Option<(u32, u32)> {
 
 // ── Synthetic premount file detection ──
 
-/// Check if the UCS-2 path ends with "/PREMOUNT.CPIO" (case-insensitive).
-///
-/// Only matches when the last path component is exactly "premount.cpio",
-/// avoiding false positives like "not_premount.cpio.txt".
-fn is_premount_path(path: &[u16]) -> bool {
-    let lower = |c: u16| if (b'A' as u16..=b'Z' as u16).contains(&c) { c | 0x20 } else { c };
-    const NEEDLE: [u16; 13] = [
-        b'p' as u16, b'r' as u16, b'e' as u16, b'm' as u16, b'o' as u16, b'u' as u16,
-        b'n' as u16, b't' as u16, b'.' as u16, b'c' as u16, b'p' as u16, b'i' as u16,
-        b'o' as u16,
-    ];
-
-    // Find the last path separator.
+/// Check if the UCS-2 path component matches a target byte string case-insensitively.
+/// Handles ISO9660 version suffix (e.g. ";1") by stripping it from the component
+/// before comparison.
+fn path_component_matches(path: &[u16], target: &[u8]) -> bool {
+    // Find the last path separator to extract filename component.
     let mut start = 0usize;
     for i in (0..path.len()).rev() {
         if path[i] == b'\\' as u16 || path[i] == b'/' as u16 {
@@ -187,13 +182,25 @@ fn is_premount_path(path: &[u16]) -> bool {
             break;
         }
     }
-
     let component = &path[start..];
-    if component.len() != 13 {
+    if component.is_empty() {
         return false;
     }
-    for i in 0..13 {
-        if lower(component[i]) != NEEDLE[i] {
+
+    // Strip ISO9660 version suffix ";" + digits from component, e.g. "MD5SUM.TXT;1" → "MD5SUM.TXT"
+    let comp_len = if component.len() >= 2 && component[component.len() - 2] == b';' as u16 {
+        component.len() - 2
+    } else {
+        component.len()
+    };
+
+    if comp_len != target.len() {
+        return false;
+    }
+    let lower = |c: u16| if (b'A' as u16..=b'Z' as u16).contains(&c) { c | 0x20 } else { c };
+    let target_lower = |b: u8| b | 0x20;
+    for i in 0..target.len() {
+        if lower(component[i]) != target_lower(target[i]) as u16 {
             return false;
         }
     }
@@ -231,6 +238,7 @@ unsafe extern "efiapi" fn sfs_open_volume(this: *mut SimpleFileSystemProtocol, r
     vf.is_synthetic = false;
     vf.synthetic_buf = core::ptr::null_mut();
     vf.synthetic_size = 0;
+    vf.synthetic_injected = false;
     *root = ptr as *mut FileProtocol;
     EFI_SUCCESS
 }
@@ -283,7 +291,11 @@ unsafe extern "efiapi" fn file_open(
     };
 
     // ── Synthetic premount cpio file (served at root level) ──
-    if ctx.premount_cpio_size > 0 && !ctx.premount_cpio_buf.is_null() && is_premount_path(name_slice) {
+    let is_synthetic = ctx.premount_cpio_size > 0
+        && !ctx.premount_cpio_buf.is_null()
+        && (path_component_matches(name_slice, &ctx.premount_target_name[..ctx.premount_target_name_len])
+            || path_component_matches(name_slice, b"PREMOUNT.CPIO"));
+    if is_synthetic {
         let bs = unsafe { &mut *ctx.bs };
         let mut ptr: *mut c_void = core::ptr::null_mut();
         let status = unsafe { (bs.allocate_pool)(crate::protocol::MemoryType::EfiLoaderData, core::mem::size_of::<VirtualFile>(), &mut ptr) };
@@ -307,6 +319,7 @@ unsafe extern "efiapi" fn file_open(
         svf.is_synthetic = true;
         svf.synthetic_buf = ctx.premount_cpio_buf;
         svf.synthetic_size = ctx.premount_cpio_size;
+        svf.synthetic_injected = false;
         *new_handle = ptr as *mut FileProtocol;
         let _ = open_mode;
         return EFI_SUCCESS;
@@ -383,6 +396,7 @@ fn alloc_virtual_file_internal(ctx: &IsoFsCtx, lba: u32, size: u32, is_dir: bool
     vf.patched_buf = core::ptr::null_mut(); vf.patched_size = 0; vf.patched = false;
     vf.is_synthetic = false;
     vf.synthetic_buf = core::ptr::null_mut(); vf.synthetic_size = 0;
+    vf.synthetic_injected = false;
     Some(ptr as *mut FileProtocol)
 }
 
@@ -458,7 +472,64 @@ unsafe extern "efiapi" fn file_read_dir(this: *mut FileProtocol, buffer_size: *m
     let dir_size = vf.extent_size;
     let total_sectors = ((dir_size as u64 + 2047) / 2048) as u32;
     let mut scratch = [0u8; 2048]; let mut dst_off = 0usize; let mut finished = false;
+    if vf.position == 0 {
+        vf.synthetic_injected = false;
+    }
     let mut sector_idx = (vf.position >> 16) as u32; let mut byte_offset = (vf.position & 0xFFFF) as usize;
+
+    // Phase 2: after all real directory entries, inject synthetic premount entry.
+    let phase2 = sector_idx >= total_sectors && (vf.position & 0x10000) != 0 && !vf.synthetic_injected;
+    if phase2 {
+        let have_cpio = ctx.premount_cpio_size > 0 && !ctx.premount_cpio_buf.is_null();
+        if have_cpio {
+            let synthetic_name: &[u8] = if ctx.premount_target_name_len > 0 {
+                &ctx.premount_target_name[..ctx.premount_target_name_len]
+            } else {
+                b"PREMOUNT.CPIO"
+            };
+            let raw_size = core::mem::size_of::<EfiFileInfo>() + (synthetic_name.len() + 1) * 2;
+            let required_size = (raw_size + 7) & !7;
+            if dst_off + required_size <= buf_sz {
+                let info = EfiFileInfo {
+                    size: required_size as u64,
+                    file_size: ctx.premount_cpio_size as u64,
+                    physical_size: ctx.premount_cpio_size as u64,
+                    create_time: unsafe { core::mem::zeroed() },
+                    last_access_time: unsafe { core::mem::zeroed() },
+                    modification_time: unsafe { core::mem::zeroed() },
+                    attribute: 0,
+                };
+                let ib = unsafe {
+                    core::slice::from_raw_parts(&info as *const EfiFileInfo as *const u8, core::mem::size_of::<EfiFileInfo>())
+                };
+                dst[dst_off..dst_off + ib.len()].copy_from_slice(ib);
+                dst_off += ib.len();
+                for j in 0..synthetic_name.len() {
+                    let ch = synthetic_name[j] as u16;
+                    dst[dst_off] = ch as u8;
+                    dst[dst_off + 1] = (ch >> 8) as u8;
+                    dst_off += 2;
+                }
+                dst[dst_off] = 0; dst[dst_off + 1] = 0; dst_off += 2;
+                for _ in 0..(required_size - raw_size) { dst[dst_off] = 0; dst_off += 1; }
+                vf.synthetic_injected = true;
+                vf.position = ((total_sectors as u64) << 16) | 0x20000;
+                unsafe { *buffer_size = dst_off; }
+                return EFI_SUCCESS;
+            } else if dst_off == 0 {
+                unsafe { *buffer_size = required_size; }
+                return crate::protocol::EFI_BUFFER_TOO_SMALL;
+            }
+            // buffer full, retry next call
+            unsafe { *buffer_size = dst_off; }
+            return EFI_SUCCESS;
+        }
+        // no cpio; mark EOD
+        vf.position = ((total_sectors as u64) << 16) | 0x20000;
+        unsafe { *buffer_size = 0; }
+        return EFI_SUCCESS;
+    }
+
     if sector_idx >= total_sectors { unsafe { *buffer_size = 0; } return EFI_SUCCESS; }
     if !read_iso_sector(ctx, vf.extent_lba + sector_idx, &mut scratch) { return EFI_DEVICE_ERROR; }
     while !finished && dst_off + core::mem::size_of::<EfiFileInfo>() + 2 <= buf_sz {
@@ -493,7 +564,12 @@ unsafe extern "efiapi" fn file_read_dir(this: *mut FileProtocol, buffer_size: *m
         for _ in 0..(required_size - raw_size) { dst[dst_off] = 0; dst_off += 1; }
         byte_offset += record_len;
     }
-    if finished { vf.position = ((total_sectors as u64) << 16) | 0x10000; } else { vf.position = ((sector_idx as u64) << 16) | (byte_offset as u64); }
+    if finished {
+        // Transition to phase 2: inject synthetic entry on next call
+        vf.position = ((total_sectors as u64) << 16) | 0x10000;
+    } else {
+        vf.position = ((sector_idx as u64) << 16) | (byte_offset as u64);
+    }
     unsafe { *buffer_size = dst_off; }
     EFI_SUCCESS
 }
