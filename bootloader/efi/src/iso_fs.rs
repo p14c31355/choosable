@@ -472,6 +472,9 @@ unsafe extern "efiapi" fn file_read_dir(this: *mut FileProtocol, buffer_size: *m
     let dir_size = vf.extent_size;
     let total_sectors = ((dir_size as u64 + 2047) / 2048) as u32;
     let mut scratch = [0u8; 2048]; let mut dst_off = 0usize; let mut finished = false;
+    if vf.position == 0 {
+        vf.synthetic_injected = false;
+    }
     let mut sector_idx = (vf.position >> 16) as u32; let mut byte_offset = (vf.position & 0xFFFF) as usize;
 
     // Phase 2: after all real directory entries, inject synthetic premount entry.
