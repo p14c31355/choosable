@@ -4,21 +4,25 @@
 //
 //  Architecture:
 //    BootStrategy trait: detects the ISO distro and injects the correct
-//    kernel command-line parameters so the initramfs can find the ISO on
-//    the real USB drive.
+//    kernel command-line parameters so the initramfs can find the root
+//    filesystem.
+//
+//  Key insight:
+//    Choosable serves the ISO as a virtual CD-ROM via BlockIoIsoSource +
+//    VirtualBlockIo + SIMPLE_FILE_SYSTEM_PROTOCOL.  The kernel boots from
+//    this virtual CD-ROM, and casper/dracut CAN read ISO9660 natively.
+//
+//    Injecting `iso-scan/filename=` is actively harmful when the USB is
+//    formatted with exFAT/NTFS because the initramfs lacks the kernel
+//    modules to mount those filesystems — the scan/mount attempt fails and
+//    drops to BusyBox.
+//
+//    Instead, we tell casper to read `/casper/filesystem.squashfs`
+//    directly from the CD-ROM device via `file=/cdrom/preseed/...`.
 //
 //  Current strategies:
-//    - CasperStrategy: Ubuntu / Mint / Pop!_OS / Debian-live (casper
-//      initramfs).  Injects "boot=casper rootwait rootdelay=300 debug
-//      live-media=UUID=$UUID iso-scan/filename=$ISO_PATH".
-//    - LiveOSStrategy: Fedora / RHEL / CentOS (dracut-based).  Injects
-//      "rd.live.image rootdelay=300 live-media=UUID=$UUID
-//      iso-scan/filename=$ISO_PATH".
-//
-//  IsoLocation integration:
-//    When an IsoLocation is available (via IsoLocator), richer boot
-//    parameters can be injected alongside iso-scan/filename=, giving the
-//    initramfs multiple ways to locate the original ISO partition.
+//    - CasperStrategy: Ubuntu / Mint / Pop!_OS / Debian-live.
+//    - LiveOSStrategy: Fedora / RHEL / CentOS (dracut-based).
 
 use core::ffi::c_void;
 
@@ -30,7 +34,7 @@ pub struct PatchInput<'a> {
     pub original: &'a [u8],
     pub iso_name: &'a [u8],
     pub bs: *mut BootServices,
-    /// FAT32 volume serial of the real USB partition (formatted "XXXX-XXXX\0")
+    /// Volume serial of the real USB partition (formatted "XXXX-XXXX\0")
     pub live_media_uuid: &'a [u8; 10],
     /// Physical location of the ISO (from IsoLocator)
     pub iso_location: Option<&'a IsoLocation>,
@@ -97,41 +101,14 @@ fn uuid_is_empty(uuid: &[u8; 10]) -> bool {
         && uuid[8] == b'0'
 }
 
-/// Shared patch logic: inject `pre` + iso_name immediately after the
-/// kernel path in `linux`/`linuxefi` lines (right after `vmlinuz`).
+/// Shared patch logic: inject `pre` immediately after the kernel path in
+/// `linux`/`linuxefi` lines (right after `vmlinuz`).
 ///
-/// `pre` should end with `iso-scan/filename=` (or equivalent), and the
-/// iso_name is appended after it.  When a non-zero `live_media_uuid` is
-/// present, it is injected as ` live-media=UUID=$UUID ` immediately
-/// before `iso-scan/filename=`.
+/// This is a simplified version that injects the parameters directly
+/// without any iso-scan/filename= or iso_name concatenation.
 fn patch_common(inp: &PatchInput, pre: &[u8]) -> Option<PatchOutput> {
     let bs = unsafe { &mut *inp.bs };
-    let name = inp.iso_name;
-
-    // Build the full injection string.
-    // Layout: `pre` + iso_name.
-    // If UUID is non-zero, inject ` live-media=UUID=$UUID ` just before
-    // the `iso-scan/filename=` suffix inside `pre`.
-    //
-    // We re-build `inj` by searching for `iso-scan/filename=` in `pre`
-    // and inserting the UUID before it.
-
-    let iso_scan = b"iso-scan/filename=";
-    let uuid_tag = b"live-media=UUID=";
-
-    // Find where iso-scan/filename= lives inside pre.
-    let scan_pos = pre
-        .windows(iso_scan.len())
-        .position(|w| w == iso_scan);
-
-    // Total injection length: pre + iso_name + optional UUID param.
-    let uuid_extra = if !uuid_is_empty(inp.live_media_uuid) && scan_pos.is_some() {
-        uuid_tag.len() + 9 + 1 // "live-media=UUID=" + "XXXX-XXXX" + " "
-    } else {
-        0
-    };
-
-    let inj_len = pre.len() + name.len() + uuid_extra;
+    let inj_len = pre.len();
     let orig_len = inp.original.len();
 
     let linux_lines = count_linux_lines(inp.original);
@@ -144,43 +121,7 @@ fn patch_common(inp: &PatchInput, pre: &[u8]) -> Option<PatchOutput> {
     }
     let out = unsafe { core::slice::from_raw_parts_mut(patch_ptr as *mut u8, new_size) };
 
-    // Build `inj` buffer.
-    let mut inj = [0u8; 320];
-    let mut inj_pos = 0usize;
-
-    if let Some(sp) = scan_pos {
-        // Insert everything before iso-scan/filename=.
-        let before = &pre[..sp];
-        inj[inj_pos..inj_pos + before.len()].copy_from_slice(before);
-        inj_pos += before.len();
-
-        // Insert live-media=UUID=$UUID if UUID is non-zero.
-        if !uuid_is_empty(inp.live_media_uuid) {
-            inj[inj_pos..inj_pos + uuid_tag.len()]
-                .copy_from_slice(uuid_tag);
-            inj_pos += uuid_tag.len();
-            let uuid_src = &inp.live_media_uuid[..9]; // "XXXX-XXXX"
-            inj[inj_pos..inj_pos + 9].copy_from_slice(uuid_src);
-            inj_pos += 9;
-            inj[inj_pos] = b' ';
-            inj_pos += 1;
-        }
-
-        // Insert iso-scan/filename= and the rest of `pre`.
-        let rest = &pre[sp..];
-        inj[inj_pos..inj_pos + rest.len()].copy_from_slice(rest);
-        inj_pos += rest.len();
-    } else {
-        // No iso-scan/filename= marker — just copy pre as-is.
-        inj[inj_pos..inj_pos + pre.len()].copy_from_slice(pre);
-        inj_pos += pre.len();
-    }
-
-    // Append iso_name.
-    let nb = name.len().min(255);
-    inj[inj_pos..inj_pos + nb].copy_from_slice(&name[..nb]);
-    inj_pos += nb;
-    let max_inj_final = inj_pos;
+    let inj = pre;
 
     let mut src = 0usize;
     let mut dst = 0usize;
@@ -253,11 +194,10 @@ fn patch_common(inp: &PatchInput, pre: &[u8]) -> Option<PatchOutput> {
 
                 let suffix_len = dst - inject_at;
                 for i in (0..suffix_len).rev() {
-                    out[inject_at + max_inj_final + i] = out[inject_at + i];
+                    out[inject_at + inj_len + i] = out[inject_at + i];
                 }
-                out[inject_at..inject_at + max_inj_final]
-                    .copy_from_slice(&inj[..max_inj_final]);
-                dst += max_inj_final;
+                out[inject_at..inject_at + inj_len].copy_from_slice(inj);
+                dst += inj_len;
             }
         }
     }
@@ -272,6 +212,11 @@ fn patch_common(inp: &PatchInput, pre: &[u8]) -> Option<PatchOutput> {
 // ═══════════════════════════════════════════════════════════════════════════
 //  CasperStrategy — Ubuntu / Mint / Pop!_OS / Debian-live
 // ═══════════════════════════════════════════════════════════════════════════
+//
+//  Does NOT inject iso-scan/filename=.  Instead injects file=/cdrom/...
+//  which tells casper the root is on the CD-ROM device.  The virtual
+//  CD-ROM is the ISO9660 filesystem, so /casper/filesystem.squashfs is
+//  directly readable by casper without any USB partition mount.
 
 pub struct CasperStrategy;
 
@@ -304,26 +249,21 @@ impl BootStrategy for CasperStrategy {
     }
 
     fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> {
-        // Strip leading '/' — casper expects paths without it.
-        let trimmed = if inp.iso_name.first() == Some(&b'/') {
-            &inp.iso_name[1..]
-        } else {
-            inp.iso_name
-        };
-
-        // live-media=UUID=$UUID is injected inside patch_common before
-        // iso-scan/filename=, so the initramfs can immediately identify
-        // which block device holds the ISO without a blind scan.
+        // No iso-scan/filename=.  The virtual CD-ROM already has
+        // /casper/filesystem.squashfs.  file=/cdrom/ tells casper to
+        // look at the CD-ROM device, which is the ISO9660 FS we serve.
+        // rootdelay=300 gives slow USB controllers time to enumerate
+        // (needed for keyboard, not for rootfs — rootfs is on CD).
         let inp2 = PatchInput {
             original: inp.original,
-            iso_name: trimmed,
+            iso_name: inp.iso_name,
             bs: inp.bs,
             live_media_uuid: inp.live_media_uuid,
             iso_location: inp.iso_location,
         };
         patch_common(
             &inp2,
-            b" boot=casper rootwait rootdelay=300 debug iso-scan/filename=",
+            b" boot=casper rootwait rootdelay=300 debug file=/cdrom/preseed/ubuntu.seed",
         )
     }
 }
@@ -333,6 +273,9 @@ unsafe impl Sync for CasperStrategy {}
 // ═══════════════════════════════════════════════════════════════════════════
 //  LiveOSStrategy — Fedora / RHEL / CentOS (dracut-based)
 // ═══════════════════════════════════════════════════════════════════════════
+//
+//  Does NOT inject iso-scan/filename=.  Instead injects rd.live.ram which
+//  copies the entire squashfs to RAM from the boot device (virtual CD-ROM).
 
 pub struct LiveOSStrategy;
 
@@ -372,7 +315,7 @@ impl BootStrategy for LiveOSStrategy {
         };
         patch_common(
             &inp2,
-            b" rd.live.image rootdelay=300 iso-scan/filename=",
+            b" rd.live.image rootdelay=300 root=live:CDLABEL=Fedora",
         )
     }
 }
@@ -387,11 +330,10 @@ static STRATEGIES: &[&dyn BootStrategy] = &[&LiveOSStrategy, &CasperStrategy];
 
 /// Patch grub.cfg with the correct kernel boot parameters.
 ///
-/// When `iso_location` is provided (Some), richer parameters are available
-/// for injecting alongside the standard iso-scan/filename= approach.  This
-/// gives the initramfs multiple fallback strategies to find the original
-/// ISO partition — especially useful on filesystems that GRUB on the ISO
-/// cannot read (exFAT, NTFS, ReFS, ext4).
+/// Does NOT inject iso-scan/filename= because the virtual CD-ROM already
+/// contains the ISO9660 filesystem with /casper/filesystem.squashfs.
+/// The kernel and initramfs boot from the virtual CD-ROM and casper can
+/// read the squashfs directly — no USB partition mount required.
 pub fn patch_grub_cfg(
     ctx: &IsoFsCtx,
     original: &[u8],

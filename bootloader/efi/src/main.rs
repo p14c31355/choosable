@@ -8,6 +8,7 @@ mod iso_fs;
 mod iso_source;
 mod locator;
 mod output;
+mod premount;
 mod protocol;
 mod strategy;
 mod virtual_blockio;

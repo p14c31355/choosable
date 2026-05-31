@@ -235,6 +235,7 @@ pub enum LocateSearchType {
 #[repr(u32)]
 pub enum AllocateType {
     AllocateAnyPages = 0,
+    AllocateMaxAddress = 1,
     AllocateAddress = 2,
 }
 
