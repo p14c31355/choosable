@@ -102,13 +102,44 @@ impl IsoSource for BlockIoIsoSource {
         }
 
         let bio_ref = unsafe { &*self.bio_ptr };
+        let mut bytes_read = 0;
+        let mut cur_offset = offset;
 
-        // Convert ISO-internal byte offset to disk LBA (512-byte sectors).
-        let disk_lba = self.iso_lba + (offset / 512);
-        let byte_offset_in_sector = (offset % 512) as usize;
+        while bytes_read < buf.len() && cur_offset < self.iso_size {
+            let disk_lba = self.iso_lba + (cur_offset / 512);
+            let byte_offset_in_sector = (cur_offset % 512) as usize;
+            let remaining_in_sector = 512 - byte_offset_in_sector;
+            let to_copy = (buf.len() - bytes_read)
+                .min(remaining_in_sector)
+                .min((self.iso_size - cur_offset) as usize);
 
-        // Handle unaligned reads by first reading the partial sector.
-        if byte_offset_in_sector != 0 {
+            // Fast path: aligned, full-sector read via batched pass-through.
+            if byte_offset_in_sector == 0 && to_copy == 512 {
+                let blocks_to_read = (buf.len() - bytes_read) / 512;
+                let max_blocks_possible = ((self.iso_size - cur_offset) / 512) as usize;
+                let blocks = blocks_to_read.min(max_blocks_possible);
+                if blocks > 0 {
+                    let bytes_to_read = blocks * 512;
+                    let status = unsafe {
+                        (bio_ref.read_blocks)(
+                            self.bio_ptr,
+                            self.media_id,
+                            disk_lba,
+                            bytes_to_read,
+                            buf[bytes_read..bytes_read + bytes_to_read].as_mut_ptr() as *mut c_void,
+                        )
+                    };
+                    if status != EFI_SUCCESS {
+                        return bytes_read;
+                    }
+                    bytes_read += bytes_to_read;
+                    cur_offset += bytes_to_read as u64;
+                    continue;
+                }
+            }
+
+            // Slow path: read a single sector via bounce buffer for unaligned
+            // or partial reads.  read_blocks always receives a 512-byte buffer.
             let mut sector = [0u8; 512];
             let status = unsafe {
                 (bio_ref.read_blocks)(
@@ -120,50 +151,15 @@ impl IsoSource for BlockIoIsoSource {
                 )
             };
             if status != EFI_SUCCESS {
-                return 0;
+                return bytes_read;
             }
-            let from_sector = byte_offset_in_sector.min(512);
-            let to_copy = buf.len().min(512 - from_sector);
-            buf[..to_copy]
-                .copy_from_slice(&sector[from_sector..from_sector + to_copy]);
-
-            // If more data is needed, read the remainder aligned.
-            if to_copy < buf.len() {
-                let remaining = &mut buf[to_copy..];
-                let next_offset = offset + to_copy as u64;
-                let next_lba = self.iso_lba + (next_offset / 512);
-                let status2 = unsafe {
-                    (bio_ref.read_blocks)(
-                        self.bio_ptr,
-                        self.media_id,
-                        next_lba,
-                        remaining.len(),
-                        remaining.as_mut_ptr() as *mut c_void,
-                    )
-                };
-                if status2 != EFI_SUCCESS {
-                    return to_copy;
-                }
-                return buf.len();
-            }
-            return to_copy;
+            buf[bytes_read..bytes_read + to_copy]
+                .copy_from_slice(&sector[byte_offset_in_sector..byte_offset_in_sector + to_copy]);
+            bytes_read += to_copy;
+            cur_offset += to_copy as u64;
         }
 
-        // Aligned read — straight pass-through to Block I/O.
-        let read_len = buf.len().min((self.iso_size - offset) as usize);
-        let status = unsafe {
-            (bio_ref.read_blocks)(
-                self.bio_ptr,
-                self.media_id,
-                disk_lba,
-                read_len,
-                buf.as_mut_ptr() as *mut c_void,
-            )
-        };
-        if status != EFI_SUCCESS {
-            return 0;
-        }
-        read_len
+        bytes_read
     }
 
     fn size(&self) -> u64 {

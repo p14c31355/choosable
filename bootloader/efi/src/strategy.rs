@@ -82,8 +82,16 @@ fn patch_grub_cfg_impl(inp: &PatchInput, linux_extra: &[u8], initrd_extra: &[u8]
             else if (t.starts_with(b"initrd ") || t.starts_with(b"initrd\t"))
                 && !line.windows(28).any(|w| w == b"/choosable/premount.cpio")
             {
-                // Inject BEFORE the newline: "initrd /path\n" → "initrd /path /choosable/premount.cpio\n"
-                let inject_at = dst - 1; // back over the trailing \n
+                // Inject before the line ending: "initrd /path\N\n" → "initrd /path /premount.cpio\N\n"
+                let mut inject_at = dst;
+                // Step back over \n
+                if dst > 0 && out[dst - 1] == b'\n' {
+                    inject_at -= 1;
+                    // Step back over \r if present (\r\n)
+                    if dst > 1 && out[dst - 2] == b'\r' {
+                        inject_at -= 1;
+                    }
+                }
                 shift_and_inject(out, inject_at, &mut dst, initrd_extra);
             }
         }
