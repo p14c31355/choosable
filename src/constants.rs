@@ -87,7 +87,8 @@ pub const DEFAULT_CHOOSABLE_LABEL: &str = "Choosable";
 pub const fn make_cz_name<const N: usize>(name: &[u16; N]) -> [u16; 36] {
     let mut a = [0u16; 36];
     let mut i = 0;
-    while i < N {
+    let limit = if N < 36 { N } else { 36 };
+    while i < limit {
         a[i] = name[i];
         i += 1;
     }
