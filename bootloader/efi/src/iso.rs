@@ -203,6 +203,10 @@ fn find_first_file_in_dir(
                 } else {
                     name_len
                 };
+                if eff_len > 15 {
+                    offset += record_len;
+                    continue;
+                }
 
                 // Build uppercase name buffer for pattern matching
                 let cl = eff_len.min(16);
