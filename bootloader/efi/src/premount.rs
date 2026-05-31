@@ -106,7 +106,7 @@ fn cpio_newc_header(
 ) -> usize {
     let magic = b"070701";
     let name_len = name.len() as u32 + 1;
-    let padded_name_len = (name_len as usize + 3) & !3;
+    let padded_name_len = ((110 + name_len as usize + 3) & !3) - 110;
     let header_fields: [u32; 13] = [
         1, mode, 0, 0, 1, 0, file_size, 0, 0, 0, 0, name_len, 0,
     ];
