@@ -474,6 +474,65 @@ fn patch_grub_cfg_blockio(
     print_raw(st, b"[grub.cfg] No patchable .CFG found (none have 'linux' line).\r\n\0");
 }
 
+/// Scan an ISO9660 directory for the first non-directory entry whose
+/// ISO9660 name (excluding version suffix) is <= 12 bytes — small enough
+/// to safely overwrite without corrupting adjacent directory entries.
+/// Returns (dir_entry_sector, dir_entry_offset, name_bytes, name_len).
+fn find_small_file_in_dir(
+    bio_ref: &BlockIoProtocol,
+    bio_ptr: *mut BlockIoProtocol,
+    mid: u32,
+    iso_lba: u64,
+    dir_lba: u32,
+    dir_size: u32,
+    scratch: &mut [u8; 2048],
+) -> Option<(u32, u32, [u8; 16], usize)> {
+    let total_sectors = ((dir_size as u64 + 2047) / 2048) as u32;
+    for s in 0..total_sectors {
+        if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, dir_lba + s, scratch) {
+            return None;
+        }
+        let mut offset: usize = 0;
+        while offset + 34 <= 2048 && offset < (dir_size as usize).saturating_sub(s as usize * 2048) {
+            let record_len = scratch[offset] as usize;
+            if record_len == 0 { break; }
+            if offset + record_len > 2048 { break; }
+            let name_len = scratch[offset + 32] as usize;
+            let name_offset = offset + 33;
+            if name_offset + name_len > 2048 { break; }
+            let flags = scratch[offset + 25];
+            let is_dir = flags & 0x02 != 0;
+
+            // Skip . and ..
+            let skip = if name_len == 1 && scratch[name_offset] == 0 { true }
+                else if name_len == 1 && scratch[name_offset] == 1 { true }
+                else { false };
+
+            if !skip && !is_dir {
+                let eff_len = if name_len >= 2 && scratch[name_offset + name_len - 2] == b';' {
+                    name_len - 2
+                } else {
+                    name_len
+                };
+                // Only use files whose ISO9660 name is short enough to be
+                // overwritten without corrupting adjacent entries.
+                if eff_len <= 12 {
+                    let dir_sector = dir_lba + s;
+                    let dir_offset = offset as u32;
+                    let mut name_buf = [0u8; 16];
+                    let copy_len = eff_len.min(15);
+                    for i in 0..copy_len {
+                        name_buf[i] = scratch[name_offset + i].to_ascii_uppercase();
+                    }
+                    return Some((dir_sector, dir_offset, name_buf, eff_len));
+                }
+            }
+            offset += record_len;
+        }
+    }
+    None
+}
+
 /// Recursively walk ISO9660 directories collecting ALL .CFG file entries
 /// with their full location info (extent_lba, extent_size, dir_sector, dir_offset).
 fn recursive_find_cfg_with_loc(
@@ -709,7 +768,11 @@ fn uefi_chainload_iso(
         vb.premount_file_buf = bundle.cpio_buf;
         vb.media.bim_lb = orig_end;
 
-        // 3. Find an existing file in root dir to overwrite
+        // 3. Find an existing file in root dir to overwrite.
+        //    Ubuntu ISOs have MD5SUMS (no .TXT), README.diskdefines, etc.
+        //    If none of the known targets exist, scan the root directory for
+        //    the first non-directory entry with a name <= 12 bytes (so we can
+        //    safely overwrite it without corrupting adjacent entries).
         let mut pvd = [0u8; 2048];
         if read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, 16, &mut pvd)
             && pvd[0] == 1 && &pvd[1..6] == b"CD001"
@@ -717,8 +780,17 @@ fn uefi_chainload_iso(
             let root_lba = u32::from_le_bytes(pvd[158..162].try_into().unwrap());
             let root_size = u32::from_le_bytes(pvd[166..170].try_into().unwrap());
 
-            // Look for md5sum.txt or any .txt file to overwrite
-            let targets: [&[u8]; 2] = [b"MD5SUM.TXT", b"UBUNTU"];
+            let mut found_target = false;
+
+            // Phase A: try known file names common in Ubuntu/Debian/Fedora ISOs
+            let targets: [&[u8]; 6] = [
+                b"MD5SUMS",             // Ubuntu 22.04+
+                b"MD5SUM.TXT",          // older ISOs
+                b"README.DISKDEFINES",  // Ubuntu
+                b"UBUNTU",              // some variants
+                b"README.TXT",          // generic
+                b"TRANS.TBL",           // ISO9660 TRANS.TBL (common)
+            ];
             for &target_name in &targets {
                 if let Some((_ext, _size, dir_sector, dir_offset)) =
                     find_in_dir_with_loc(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, target_name, &mut [0u8; 2048])
@@ -729,12 +801,10 @@ fn uefi_chainload_iso(
                     vb.premount_entry_new_size = bundle.cpio_size as u32;
                     vb.premount_entry_patched = true;
 
-                    // Also inject into SFS for root-level synthetic file
                     if !sfs_instance.is_null() {
                         let sfs = unsafe { &mut *sfs_instance };
                         sfs.ctx.premount_cpio_buf = bundle.cpio_buf;
                         sfs.ctx.premount_cpio_size = bundle.cpio_size;
-                        // Record which file was chosen as the premount target
                         let tlen = target_name.len().min(15);
                         sfs.ctx.premount_target_name[..tlen].copy_from_slice(&target_name[..tlen]);
                         sfs.ctx.premount_target_name_len = tlen;
@@ -756,7 +826,51 @@ fn uefi_chainload_iso(
                     loop { nbuf[np3] = b'0' + (nv3 % 10) as u8; nv3 /= 10; if nv3 == 0 || np3 == 0 { break; } np3 -= 1; }
                     print_raw(st, &nbuf[np3..]);
                     print_raw(st, b" bytes\r\n\0");
+                    found_target = true;
                     break;
+                }
+            }
+
+            // Phase B: fallback — scan the root directory for any non-directory
+            // file whose ISO9660 name is short enough to safely overwrite.
+            if !found_target {
+                let mut scratch = [0u8; 2048];
+                if let Some((dir_sector, dir_offset, name_buf, name_len)) =
+                    find_small_file_in_dir(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, &mut scratch)
+                {
+                    vb.premount_entry_sector = dir_sector;
+                    vb.premount_entry_offset = dir_offset;
+                    vb.premount_entry_new_extent = vb.premount_file_sector;
+                    vb.premount_entry_new_size = bundle.cpio_size as u32;
+                    vb.premount_entry_patched = true;
+
+                    if !sfs_instance.is_null() {
+                        let sfs = unsafe { &mut *sfs_instance };
+                        sfs.ctx.premount_cpio_buf = bundle.cpio_buf;
+                        sfs.ctx.premount_cpio_size = bundle.cpio_size;
+                        let tlen = name_len.min(15);
+                        sfs.ctx.premount_target_name[..tlen].copy_from_slice(&name_buf[..tlen]);
+                        sfs.ctx.premount_target_name_len = tlen;
+                    }
+
+                    print_raw(st, b"[premount] overwriting (fallback) \0");
+                    print_raw(st, &name_buf[..name_len.min(15)]);
+                    print_raw(st, b" dir entry at sector=\0");
+                    let mut nbuf = [0u8; 16];
+                    let mut nv = dir_sector as u64; let mut np = 15;
+                    loop { nbuf[np] = b'0' + (nv % 10) as u8; nv /= 10; if nv == 0 || np == 0 { break; } np -= 1; }
+                    print_raw(st, &nbuf[np..]);
+                    print_raw(st, b" off=\0");
+                    let mut nv2 = dir_offset as u64; let mut np2 = 15;
+                    loop { nbuf[np2] = b'0' + (nv2 % 10) as u8; nv2 /= 10; if nv2 == 0 || np2 == 0 { break; } np2 -= 1; }
+                    print_raw(st, &nbuf[np2..]);
+                    print_raw(st, b", cpio=\0");
+                    let mut nv3 = bundle.cpio_size as u64; let mut np3 = 15;
+                    loop { nbuf[np3] = b'0' + (nv3 % 10) as u8; nv3 /= 10; if nv3 == 0 || np3 == 0 { break; } np3 -= 1; }
+                    print_raw(st, &nbuf[np3..]);
+                    print_raw(st, b" bytes\r\n\0");
+                } else {
+                    print_raw(st, b"[premount] WARNING: no suitable file found in root dir to overwrite\r\n\0");
                 }
             }
         }
