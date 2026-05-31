@@ -88,7 +88,6 @@ unsafe extern "efiapi" fn vblock_read(
             let off = vbio.premount_entry_offset as usize;
             if off + 34 <= 2048 {
                 // ISO9660 directory entry layout (big-endian for extent/size too)
-                entry[off] = 34; // record length
                 entry[off + 1] = 0; // ext attr
                 // extent LBA LE + BE
                 entry[off + 2..off + 6].copy_from_slice(&vbio.premount_entry_new_extent.to_le_bytes());
@@ -102,12 +101,11 @@ unsafe extern "efiapi" fn vblock_read(
                 entry[off + 26] = 0; // file unit size
                 entry[off + 27] = 0; // interleave
                 // volume seq LE+BE
-                entry[off + 28..off + 32].copy_from_slice(&1u16.to_le_bytes());
-                entry[off + 30..off + 34].copy_from_slice(&1u16.to_be_bytes());
-                entry[off + 32] = 13; // name length
-                // "PREMOUNT.CPIO;1" = 14 chars
+                entry[off + 28..off + 30].copy_from_slice(&1u16.to_le_bytes());
+                entry[off + 30..off + 32].copy_from_slice(&1u16.to_be_bytes());
+                entry[off + 32] = 15; // name length
                 let name = b"PREMOUNT.CPIO;1";
-                for j in 0..14 { entry[off + 33 + j] = name[j]; }
+                entry[off + 33..off + 33 + 15].copy_from_slice(name);
             }
         }
 
