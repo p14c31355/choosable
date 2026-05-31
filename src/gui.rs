@@ -263,7 +263,7 @@ impl ChoosableApp {
                 .align_y(iced::Alignment::Center),
             options,
             row![actions].spacing(8),
-            text(&self.status).color(status_color),
+            status_text,
         ]
         .spacing(12)
         .padding(16);
