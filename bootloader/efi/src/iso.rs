@@ -19,6 +19,7 @@ use crate::protocol::{
     DevicePathProtocol, VirtualBlockIo, EFI_SUCCESS, LOADED_IMAGE_PROTOCOL_GUID,
 };
 
+use crate::locator::FileBackedIsoLocator;
 use crate::strategy;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -251,6 +252,7 @@ fn try_patch_candidate(
     iso_lba: u64,
     iso_name: &[u8],
     ext_lba: u32, ext_size: u32, dir_sector: u32, dir_offset: u32,
+    iso_location: Option<&crate::locator::IsoLocation>,
 ) -> bool {
     let (orig_ptr, orig_len) = match read_extent(bs, bio_ref, bio_ptr, mid, iso_lba, ext_lba, ext_size) {
         Some(v) => v,
@@ -279,9 +281,10 @@ fn try_patch_candidate(
         bs: bs as *mut BootServices,
         st: core::ptr::null_mut(),
         iso_name: iso_name_arr, iso_name_len: nlen,
+        live_media_uuid: [0u8; 10],
     };
 
-    let patch = strategy::patch_grub_cfg(&ctx, orig, bs as *mut BootServices);
+    let patch = strategy::patch_grub_cfg(&ctx, orig, bs as *mut BootServices, iso_location);
     unsafe { (bs.free_pool)(orig_ptr as *mut c_void); }
 
     let (patched_buf, patched_size) = match patch {
@@ -444,7 +447,7 @@ fn patch_grub_cfg_blockio(
         print_raw(st, b"...\r\n\0");
 
         if try_patch_candidate(st, bs, vb, sfs_instance, bio_ref, bio_ptr, mid, iso_lba, iso_name,
-            ext_lba, ext_size, dir_sector, dir_offset) {
+            ext_lba, ext_size, dir_sector, dir_offset, None) {
             return;
         }
     }
@@ -643,9 +646,32 @@ fn uefi_chainload_iso(
     // ── ISO file name (for grub.cfg iso-scan/filename injection)
     let iso_name = &files[idx].name[..files[idx].name_len.min(files[idx].name.len())];
 
+    // ── Read FAT32 volume serial from real USB partition VBR ───────
+    // FAT32 stores the volume serial at VBR offset 0x43 (little-endian 4 bytes).
+    let mut live_uuid = [0u8; 10];
+    {
+        let mut vbr = [0u8; 512];
+        if read_sector(bio_ref, bio_ptr, mid, part1_lba, &mut vbr) {
+            let serial = u32::from_le_bytes([vbr[0x43], vbr[0x44], vbr[0x45], vbr[0x46]]);
+            let hex = |b: u8| -> u8 {
+                if b < 10 { b'0' + b } else { b'A' + (b - 10) }
+            };
+            live_uuid[0] = hex(((serial >> 28) & 0xF) as u8);
+            live_uuid[1] = hex(((serial >> 24) & 0xF) as u8);
+            live_uuid[2] = hex(((serial >> 20) & 0xF) as u8);
+            live_uuid[3] = hex(((serial >> 16) & 0xF) as u8);
+            live_uuid[4] = b'-';
+            live_uuid[5] = hex(((serial >> 12) & 0xF) as u8);
+            live_uuid[6] = hex(((serial >> 8) & 0xF) as u8);
+            live_uuid[7] = hex(((serial >> 4) & 0xF) as u8);
+            live_uuid[8] = hex((serial & 0xF) as u8);
+            live_uuid[9] = 0;
+        }
+    }
+
     // ── Create virtual CD-ROM from the ISO file ──────────────────────
     let cdrom_tuple = crate::virtual_blockio::create_virtual_cdrom(
-        bs, st as *mut SystemTable, iso_lba, bio_ptr, mid, iso_size, iso_name,
+        bs, st as *mut SystemTable, iso_lba, bio_ptr, mid, iso_size, iso_name, &live_uuid,
     );
     let (device_handle, cdrom_dp, vbio_ptr, sfs_instance) = match cdrom_tuple {
         Some((h, dp, vb, sfs)) => (h, dp, vb, sfs),

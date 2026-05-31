@@ -118,6 +118,7 @@ pub fn create_virtual_cdrom(
     real_media_id: u32,
     iso_size_bytes: u64,
     iso_name: &[u8],
+    live_media_uuid: &[u8; 10],
 ) -> Option<(*mut c_void, *mut c_void, *mut VirtualBlockIo, *mut IsoFsInstance)> {
     // ═════════════════════════════════════════════════════════════
     // 1. Build CD-ROM DevicePath
@@ -241,7 +242,7 @@ pub fn create_virtual_cdrom(
     // 5. Install ISO9660 SimpleFileSystem protocol on the same handle
     // ═════════════════════════════════════════════════════════════
     let iso_fs_instance = crate::iso_fs::create_iso_fs(
-        bs, st, real_bio_ptr, real_media_id, iso_lba, iso_size_bytes, iso_name,
+        bs, st, real_bio_ptr, real_media_id, iso_lba, iso_size_bytes, iso_name, live_media_uuid,
     );
     if !iso_fs_instance.is_null() {
         let sfs_status = unsafe {

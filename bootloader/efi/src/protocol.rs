@@ -199,6 +199,7 @@ pub struct BlockIoMedia {
     pub bim_lb: u64,
 }
 
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct Guid {
     pub d1: u32,

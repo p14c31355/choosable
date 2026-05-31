@@ -48,6 +48,8 @@ pub struct IsoFsCtx {
     /// ISO file name on the real USB drive (e.g. "ubuntu-24.04.iso")
     pub iso_name: [u8; 128],
     pub iso_name_len: usize,
+    /// FAT32 volume serial number of the real USB partition (formatted "XXXX-XXXX\0")
+    pub live_media_uuid: [u8; 10],
 }
 
 #[repr(C)]
@@ -662,7 +664,7 @@ unsafe extern "efiapi" fn file_open(
                     total_read += r;
                 }
 
-                let patch = crate::strategy::patch_grub_cfg(ctx, &tmp_buf[..total_read], ctx.bs);
+                let patch = crate::strategy::patch_grub_cfg(ctx, &tmp_buf[..total_read], ctx.bs, None);
                 if let Some(p) = patch {
                     vf_patch.patched_buf = p.buf;
                     vf_patch.patched_size = p.size as u64;
@@ -1085,6 +1087,7 @@ pub fn create_iso_fs(
     iso_lba: u64,
     iso_size_bytes: u64,
     iso_name: &[u8],
+    live_media_uuid: &[u8; 10],
 ) -> *mut IsoFsInstance {
     // ── Allocate IsoFsInstance ──────────────────────────────────────
     let mut ptr: *mut c_void = core::ptr::null_mut();
@@ -1107,6 +1110,8 @@ pub fn create_iso_fs(
     name_arr[..name_len].copy_from_slice(&iso_name[..name_len]);
 
     // ── Fill context ────────────────────────────────────────────────
+    let mut uuid_arr = [0u8; 10];
+    uuid_arr.copy_from_slice(&live_media_uuid[..10]);
     instance.ctx = IsoFsCtx {
         real_bio_ptr,
         real_media_id,
@@ -1118,6 +1123,7 @@ pub fn create_iso_fs(
         st,
         iso_name: name_arr,
         iso_name_len: name_len,
+        live_media_uuid: uuid_arr,
     };
 
     // ── Parse ISO9660 PVD ──────────────────────────────────────────
