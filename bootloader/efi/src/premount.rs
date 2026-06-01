@@ -63,14 +63,17 @@ fn build_premount_script(offset_bytes: u64) -> [u8; 2048] {
 #!/bin/sh
 echo 'start OFFSET' >/tmp/choosable.log
 mkdir -p /cdrom
-for dev in sdb1 sda1 sda2 sdb2 sdc1 sdc2; do
+for dev in sda1 sda2 sdb1 sdb2 sdc1 sdc2 sdd1 sdd2 sde1 sde2 nvme0n1p1 nvme0n1p2 nvme1n1p1 nvme1n1p2 mmcblk0p1 mmcblk0p2 vda1 vda2; do
   [ -b /dev/$dev ] || continue
   echo \"try $dev\" >>/tmp/choosable.log
   losetup -o OFFSET /dev/loop0 /dev/$dev 2>>/tmp/choosable.log || continue
   echo \"loopok $dev\" >>/tmp/choosable.log
   mount -t iso9660 -o ro /dev/loop0 /cdrom 2>>/tmp/choosable.log || continue
   echo \"mntok $dev\" >>/tmp/choosable.log
-  [ -f /cdrom/casper/filesystem.squashfs ] && { echo \"squashfs found on $dev\" >>/tmp/choosable.log; exit 0; }
+  if [ -f /cdrom/casper/filesystem.squashfs ] || [ -f /cdrom/live/filesystem.squashfs ] || [ -f /cdrom/LiveOS/squashfs.img ] || [ -f /cdrom/images/install.img ]; then
+    echo \"squashfs found on $dev\" >>/tmp/choosable.log
+    exit 0
+  fi
   echo \"nosquash $dev\" >>/tmp/choosable.log
   umount /cdrom 2>/dev/null
   losetup -d /dev/loop0 2>/dev/null
