@@ -55,57 +55,27 @@ fn format_decimal_u64(v: u64) -> [u8; 21] {
 /// real partition (iso_lba * 512).
 fn build_premount_script(offset_bytes: u64) -> [u8; 2048] {
     let mut script = [0u8; 2048];
+    // BusyBox ash has no glob in for-loop.  Use fixed candidate list.
+    // CRITICAL: Rust b\"...\" byte strings do NOT escape \\\":
+    //          \" produces literal backslash-quote in the output.
+    //          Avoid escaped quotes — use /dev/$dev directly.
     let src = b"\
 #!/bin/sh
-# Choosable premount: loop-mounts ISO from raw partition offset
-echo '[choosable] premount starting, offset=OFFSET'
-
-# Wait up to 30 seconds for block devices to settle
-for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
-  found=0
-  for dev in /dev/sd[a-z] /dev/nvme[0-9]* /dev/mmcblk[0-9]* /dev/vd[a-z]; do
-    [ -b \"$dev\" ] || continue
-    # Try the whole disk (USB without partition table)
-    losetup -o OFFSET /dev/loop0 \"$dev\" 2>/dev/null || continue
-    if mount -t iso9660 -o ro /dev/loop0 /cdrom 2>/dev/null; then
-      echo \"[choosable] premount: ISO mounted at /cdrom via $dev\"
-      if [ -f /cdrom/casper/filesystem.squashfs ] || \
-         [ -f /cdrom/live/filesystem.squashfs ] || \
-         [ -f /cdrom/LiveOS/squashfs.img ] || \
-         [ -f /cdrom/images/install.img ]; then
-        found=1
-        break 2
-      fi
-      umount /cdrom 2>/dev/null
-      losetup -d /dev/loop0 2>/dev/null
-    fi
-  done
-
-  # Try partition devices (sdX1, nvme0n1p1 etc.)
-  for dev in /dev/sd[a-z][0-9]* /dev/nvme[0-9]*p[0-9]* /dev/mmcblk[0-9]*p[0-9]* /dev/vd[a-z][0-9]*; do
-    [ -b \"$dev\" ] || continue
-    losetup -o OFFSET /dev/loop0 \"$dev\" 2>/dev/null || continue
-    if mount -t iso9660 -o ro /dev/loop0 /cdrom 2>/dev/null; then
-      echo \"[choosable] premount: ISO mounted at /cdrom via $dev\"
-      if [ -f /cdrom/casper/filesystem.squashfs ] || \
-         [ -f /cdrom/live/filesystem.squashfs ] || \
-         [ -f /cdrom/LiveOS/squashfs.img ] || \
-         [ -f /cdrom/images/install.img ]; then
-        found=1
-        break 2
-      fi
-      umount /cdrom 2>/dev/null
-      losetup -d /dev/loop0 2>/dev/null
-    fi
-  done
-
-  [ \"$found\" = 1 ] && break
-  sleep 1
+echo 'start OFFSET' >/tmp/choosable.log
+mkdir -p /cdrom
+for dev in sdb1 sda1 sda2 sdb2 sdc1 sdc2; do
+  [ -b /dev/$dev ] || continue
+  echo \"try $dev\" >>/tmp/choosable.log
+  losetup -o OFFSET /dev/loop0 /dev/$dev 2>>/tmp/choosable.log || continue
+  echo \"loopok $dev\" >>/tmp/choosable.log
+  mount -t iso9660 -o ro /dev/loop0 /cdrom 2>>/tmp/choosable.log || continue
+  echo \"mntok $dev\" >>/tmp/choosable.log
+  [ -f /cdrom/casper/filesystem.squashfs ] && { echo \"squashfs found on $dev\" >>/tmp/choosable.log; exit 0; }
+  echo \"nosquash $dev\" >>/tmp/choosable.log
+  umount /cdrom 2>/dev/null
+  losetup -d /dev/loop0 2>/dev/null
 done
-
-if [ \"$found\" != 1 ]; then
-  echo '[choosable] premount: could not locate ISO on any block device'
-fi
+echo 'gaveup' >>/tmp/choosable.log
 ";
 
     let off_str = format_decimal_u64(offset_bytes);
@@ -184,7 +154,8 @@ pub fn prepare_premount_initrd(
     let script = build_premount_script(offset_bytes);
     let script_len = script.iter().position(|&c| c == 0).unwrap_or(2047);
 
-    let cpio_estimate = 4096usize;
+    // cpio grows with multiple entries — safe margin
+    let cpio_estimate = 8192usize;
     let mut cpio_ptr: *mut c_void = core::ptr::null_mut();
     let status = unsafe {
         (bs.allocate_pool)(MemoryType::EfiLoaderData, cpio_estimate, &mut cpio_ptr)
@@ -210,18 +181,20 @@ pub fn prepare_premount_initrd(
         true
     };
 
-    // Directory: scripts/
-    if !append_entry(cpio, &mut off, b"scripts", b"", 0o40755) {
+    // CRITICAL: Do NOT inject empty directory entries — cpio
+    // concatenation replaces existing directories, which would
+    // delete the ISO's original scripts like 20iso_scan.
+    // Only add the file entries; directories already exist.
+    //
+    // File: scripts/live-premount/00choosable (runs BEFORE 20iso_scan)
+    if !append_entry(cpio, &mut off, b"scripts/live-premount/00choosable", &script[..script_len], 0o100755) {
         unsafe { (bs.free_pool)(cpio_ptr); }
         return None;
     }
-    // Directory: scripts/casper-premount/
-    if !append_entry(cpio, &mut off, b"scripts/casper-premount", b"", 0o40755) {
-        unsafe { (bs.free_pool)(cpio_ptr); }
-        return None;
-    }
-    // File: scripts/casper-premount/choosable
-    if !append_entry(cpio, &mut off, b"scripts/casper-premount/choosable", &script[..script_len], 0o100755) {
+    // Override 20iso_scan — our premount handles the mount, so
+    // the original ISO scan (which needs iso-scan/filename=) is
+    // unnecessary and would fail.
+    if !append_entry(cpio, &mut off, b"scripts/live-premount/20iso_scan", b"#!/bin/sh\nexit 0\n", 0o100755) {
         unsafe { (bs.free_pool)(cpio_ptr); }
         return None;
     }

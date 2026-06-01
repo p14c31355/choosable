@@ -209,7 +209,7 @@ impl BootStrategy for CasperStrategy {
     fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> {
         patch_grub_cfg_impl(
             inp,
-            b" boot=casper rootwait rootdelay=30 debug",
+            b" boot=casper break=bottom",
             inp.premount_target_name,
         )
     }
