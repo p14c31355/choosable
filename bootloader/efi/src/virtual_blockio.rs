@@ -99,11 +99,16 @@ unsafe extern "efiapi" fn vblock_read(
         }
 
         if is_premount_injected {
-            if !is_dir_patched && !is_premount_patched && !read_real_iso_sector(vbio, block_lba, dst, block_offset) { return EFI_DEVICE_ERROR; }
+            // The sector may already have been read by is_dir_patched
+            // or is_premount_patched above; only read it if neither
+            // of them has populated the buffer yet.
+            if !is_dir_patched && !is_premount_patched {
+                if !read_real_iso_sector(vbio, block_lba, dst, block_offset) { return EFI_DEVICE_ERROR; }
+            }
             // Overwrite with the pre-built synthetic directory record
             let off = vbio.premount_entry_offset as usize;
             let sz = vbio.premount_entry_injected_size as usize;
-            if off + sz <= dst[block_offset..block_offset + 2048].len() {
+            if off + sz <= 2048 {
                 dst[block_offset + off..block_offset + off + sz]
                     .copy_from_slice(&vbio.premount_entry_injected_blob[..sz]);
             }

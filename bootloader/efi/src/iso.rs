@@ -299,25 +299,29 @@ fn find_eod_in_dir(
         }
         let sector_base = s * 2048;
         let mut off = 0usize;
-        while off < 2048 && (walked + off as u32) < dir_size {
+        // walked already equals sector_base + off because both are
+        // incremented by record_len in lockstep within each sector.
+        // Using `walked + off` double-counts and inflates the root
+        // directory size, causing GRUB to fail to find injected entries.
+        while off < 2048 && walked < dir_size {
             let record_len = scratch[off] as usize;
             if record_len == 0 {
-                // EOD found
+                // EOD found.
                 // Check enough room: PREMOUNT.CPIO;1 record = 48 bytes + 1 byte EOD
                 if off + 49 <= 2048 {
-                    *dir_size_out = walked + off as u32;
+                    *dir_size_out = walked;
                     return Some((dir_lba + s, off as u32));
                 }
                 // Not enough room in this sector; the synthetic entry
                 // would cross the sector boundary.  Move EOD to the
                 // start of the next sector.
                 if s + 1 < total_sectors {
-                    *dir_size_out = walked + (2048 - sector_base as u32);
+                    *dir_size_out = (s + 1) as u32 * 2048;
                     return Some((dir_lba + s + 1, 0));
                 }
                 // Last sector and no room: still return EOD here
                 // but the caller will handle the tight fit.
-                *dir_size_out = walked + off as u32;
+                *dir_size_out = walked;
                 return Some((dir_lba + s, off as u32));
             }
             if record_len < 34 || off + record_len > 2048 {
