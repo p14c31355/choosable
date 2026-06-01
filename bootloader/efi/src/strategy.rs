@@ -186,15 +186,15 @@ fn shift_and_inject(out: &mut [u8], inject_at: usize, dst: &mut usize, data: &[u
     *dst += data.len();
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  CasperStrategy
-// ═══════════════════════════════════════════════════════════════════════════
-
 fn matches_any_lower(name: &[u8], patterns: &[&[u8]]) -> bool {
     patterns.iter().any(|pat| name.windows(pat.len()).any(|w| {
         w.iter().zip(pat.iter()).all(|(&a, &b)| (a | 0x20) == b)
     }))
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  CasperStrategy (Ubuntu, Mint, Pop!_OS)
+// ═══════════════════════════════════════════════════════════════════════════
 
 pub struct CasperStrategy;
 
@@ -202,7 +202,7 @@ impl BootStrategy for CasperStrategy {
     fn detect(&self, ctx: &IsoFsCtx) -> bool {
         matches_any_lower(
             &ctx.iso_name[..ctx.iso_name_len],
-            &[b"ubuntu", b"mint", b"debian", b"pop"],
+            &[b"ubuntu", b"mint", b"pop"],
         )
     }
 
@@ -216,6 +216,31 @@ impl BootStrategy for CasperStrategy {
 }
 
 unsafe impl Sync for CasperStrategy {}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  LiveBootStrategy (Debian Live — uses boot=live, NOT boot=casper)
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub struct LiveBootStrategy;
+
+impl BootStrategy for LiveBootStrategy {
+    fn detect(&self, ctx: &IsoFsCtx) -> bool {
+        matches_any_lower(
+            &ctx.iso_name[..ctx.iso_name_len],
+            &[b"debian"],
+        )
+    }
+
+    fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> {
+        patch_grub_cfg_impl(
+            inp,
+            b" boot=live",
+            inp.premount_target_name,
+        )
+    }
+}
+
+unsafe impl Sync for LiveBootStrategy {}
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  LiveOSStrategy
@@ -246,7 +271,7 @@ unsafe impl Sync for LiveOSStrategy {}
 //  Registry
 // ═══════════════════════════════════════════════════════════════════════════
 
-static STRATEGIES: &[&dyn BootStrategy] = &[&LiveOSStrategy, &CasperStrategy];
+static STRATEGIES: &[&dyn BootStrategy] = &[&LiveOSStrategy, &CasperStrategy, &LiveBootStrategy];
 
 pub fn patch_grub_cfg(ctx: &IsoFsCtx, original: &[u8], bs: *mut BootServices, iso_location: Option<&IsoLocation>) -> Option<PatchOutput> {
     let strategy: &dyn BootStrategy = STRATEGIES.iter().find(|s| s.detect(ctx)).copied().unwrap_or(&CasperStrategy);

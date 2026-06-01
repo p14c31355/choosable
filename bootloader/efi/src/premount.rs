@@ -63,6 +63,8 @@ fn build_premount_script(offset_bytes: u64) -> [u8; 2048] {
     // /dev/loop0, which may already be in use (e.g. by snap packages).
     let src = b"\
 #!/bin/sh
+# IMPORTANT: This script is sourced by initramfs-tools/casper/live-boot.
+# Use 'return' NOT 'exit' -- exit kills the hook runner process.
 echo 'start OFFSET' >/tmp/choosable.log
 mkdir -p /cdrom
 while read -r major minor blocks name; do
@@ -82,7 +84,7 @@ while read -r major minor blocks name; do
   echo \"mntok $name\" >>/tmp/choosable.log
   if [ -f /cdrom/casper/filesystem.squashfs ] || [ -f /cdrom/live/filesystem.squashfs ] || [ -f /cdrom/LiveOS/squashfs.img ] || [ -f /cdrom/images/install.img ] || [ -f /cdrom/casper/filesystem.squashfs.gpg ] || [ -f /cdrom/.disk/info ]; then
     echo \"squashfs found on $name\" >>/tmp/choosable.log
-    exit 0
+    return 0
   fi
   echo \"nosquash $name\" >>/tmp/choosable.log
   umount /cdrom 2>/dev/null
@@ -216,8 +218,8 @@ pub fn prepare_premount_initrd(
         unsafe { (bs.free_pool)(cpio_ptr); }
         return None;
     }
-    // Override 20iso_scan for live-boot
-    if !append_entry(cpio, &mut off, b"scripts/live/20iso_scan", b"#!/bin/sh\nexit 0\n", 0o100755) {
+    // Override 20iso_scan for live-boot (return, not exit — sourced)
+    if !append_entry(cpio, &mut off, b"scripts/live/20iso_scan", b"#!/bin/sh\nreturn 0\n", 0o100755) {
         unsafe { (bs.free_pool)(cpio_ptr); }
         return None;
     }
@@ -227,7 +229,7 @@ pub fn prepare_premount_initrd(
         return None;
     }
     // Override 20iso_scan for live-premount
-    if !append_entry(cpio, &mut off, b"scripts/live-premount/20iso_scan", b"#!/bin/sh\nexit 0\n", 0o100755) {
+    if !append_entry(cpio, &mut off, b"scripts/live-premount/20iso_scan", b"#!/bin/sh\nreturn 0\n", 0o100755) {
         unsafe { (bs.free_pool)(cpio_ptr); }
         return None;
     }
@@ -237,7 +239,7 @@ pub fn prepare_premount_initrd(
         return None;
     }
     // Override 20iso_scan for casper-premount
-    if !append_entry(cpio, &mut off, b"scripts/casper-premount/20iso_scan", b"#!/bin/sh\nexit 0\n", 0o100755) {
+    if !append_entry(cpio, &mut off, b"scripts/casper-premount/20iso_scan", b"#!/bin/sh\nreturn 0\n", 0o100755) {
         unsafe { (bs.free_pool)(cpio_ptr); }
         return None;
     }
@@ -247,7 +249,7 @@ pub fn prepare_premount_initrd(
         return None;
     }
     // Override 20iso_scan for casper-bottom (if present)
-    if !append_entry(cpio, &mut off, b"scripts/casper-bottom/20iso_scan", b"#!/bin/sh\nexit 0\n", 0o100755) {
+    if !append_entry(cpio, &mut off, b"scripts/casper-bottom/20iso_scan", b"#!/bin/sh\nreturn 0\n", 0o100755) {
         unsafe { (bs.free_pool)(cpio_ptr); }
         return None;
     }
