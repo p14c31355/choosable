@@ -333,6 +333,10 @@ pub struct VirtualBlockIo {
     pub premount_entry_injected_blob: [u8; 128],
     /// Length of the injected blob in bytes.
     pub premount_entry_injected_size: u32,
+    /// When premount_entry_injected is true, this is the updated root
+    /// directory size (original EOD position + injected record size).
+    /// PVD sector 16 root dir record size is patched to this value.
+    pub premount_new_root_size: u32,
 }
 
 pub const DEVICE_PATH_PROTOCOL_GUID: Guid = Guid {

@@ -277,8 +277,10 @@ fn find_first_file_in_dir(
     None
 }
 
-/// Find the first EOD marker (byte 0x00) in a directory extent.
-/// Returns (sector, offset) or None.
+/// Walk directory records using record_len to find the EOD byte position
+/// (where record_len == 0 or the first byte after the last valid record).
+/// Returns the EOD position as (absolute_iso_sector, byte_offset_within_sector)
+/// and also writes the current root directory size (in bytes) into `dir_size_out`.
 fn find_eod_in_dir(
     bio_ref: &BlockIoProtocol,
     bio_ptr: *mut BlockIoProtocol,
@@ -287,24 +289,44 @@ fn find_eod_in_dir(
     dir_lba: u32,
     dir_size: u32,
     scratch: &mut [u8; 2048],
+    dir_size_out: &mut u32,
 ) -> Option<(u32, u32)> {
     let total_sectors = ((dir_size as u64 + 2047) / 2048) as u32;
+    let mut walked = 0u32;
     for s in 0..total_sectors {
         if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, dir_lba + s, scratch) {
             return None;
         }
-        // Scan for the first byte that is 0x00, signalling end of directory.
-        let limit = (dir_size as usize).saturating_sub(s as usize * 2048).min(2048);
-        for off in 0..limit {
-            if scratch[off] == 0 {
-                // Check enough room for a directory record (minimum 34 bytes)
-                if off + 34 <= 2048 {
+        let sector_base = s * 2048;
+        let mut off = 0usize;
+        while off < 2048 && (walked + off as u32) < dir_size {
+            let record_len = scratch[off] as usize;
+            if record_len == 0 {
+                // EOD found
+                // Check enough room: PREMOUNT.CPIO;1 record = 48 bytes + 1 byte EOD
+                if off + 49 <= 2048 {
+                    *dir_size_out = walked + off as u32;
                     return Some((dir_lba + s, off as u32));
                 }
-                // Not enough room in this sector; try next sector
-                break;
+                // Not enough room in this sector; the synthetic entry
+                // would cross the sector boundary.  Move EOD to the
+                // start of the next sector.
+                if s + 1 < total_sectors {
+                    *dir_size_out = walked + (2048 - sector_base as u32);
+                    return Some((dir_lba + s + 1, 0));
+                }
+                // Last sector and no room: still return EOD here
+                // but the caller will handle the tight fit.
+                *dir_size_out = walked + off as u32;
+                return Some((dir_lba + s, off as u32));
             }
+            if record_len < 34 || off + record_len > 2048 {
+                break; // malformed record, bail
+            }
+            walked += record_len as u32;
+            off += record_len;
         }
+        walked = (s + 1) * 2048;
     }
     None
 }
@@ -796,8 +818,9 @@ fn uefi_chainload_iso(
                 // Strategy: scan root dir for the EOD marker byte 0x00,
                 // and overwrite it + subsequent bytes with a complete
                 // ISO9660 directory record naming "PREMOUNT.CPIO;1".
+                let mut new_root_size: u32 = 0;
                 if let Some((eod_sector, eod_offset)) =
-                    find_eod_in_dir(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, &mut scratch)
+                    find_eod_in_dir(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, &mut scratch, &mut new_root_size)
                 {
                     let mut blob = [0u8; 128];
                     let blob_len = build_premount_cpio_entry(
@@ -810,6 +833,7 @@ fn uefi_chainload_iso(
                     vb.premount_entry_injected_blob = blob;
                     vb.premount_entry_injected_size = blob_len;
                     vb.premount_entry_injected = true;
+                    vb.premount_new_root_size = new_root_size + blob_len;
 
                     if !sfs_instance.is_null() {
                         let sfs = unsafe { &mut *sfs_instance };

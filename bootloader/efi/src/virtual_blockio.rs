@@ -119,16 +119,24 @@ unsafe extern "efiapi" fn vblock_read(
 
         if !read_real_iso_sector(vbio, block_lba, dst, block_offset) { return EFI_DEVICE_ERROR; }
 
-        // Patch PVD Volume Space Size at sector 16 so GRUB's ISO9660
-        // driver accepts extent references that point to appended
-        // premount cpio / patched grub.cfg sectors.
+        // Patch PVD at sector 16 so GRUB's ISO9660 driver accepts
+        // extent references that point to appended sectors and sees
+        // the updated root directory size after synthetic injection.
         if block_lba == 16 {
-            let new_size = (vbio.media.bim_lb + 1) as u32;
-            // ISO9660 PVD bytes 80-83: Volume Space Size (Little-Endian)
-            //                 84-87: Volume Space Size (Big-Endian)
+            let new_vol_size = (vbio.media.bim_lb + 1) as u32;
             let off = block_offset;
-            dst[off + 80..off + 84].copy_from_slice(&new_size.to_le_bytes());
-            dst[off + 84..off + 88].copy_from_slice(&new_size.to_be_bytes());
+            // Volume Space Size: bytes 80-83 (LE), 84-87 (BE)
+            dst[off + 80..off + 84].copy_from_slice(&new_vol_size.to_le_bytes());
+            dst[off + 84..off + 88].copy_from_slice(&new_vol_size.to_be_bytes());
+
+            // If premount entry was injected (not patched over existing),
+            // also update the root directory record data length in PVD
+            // so GRUB walks past the synthetic PREMOUNT.CPIO record.
+            if vbio.premount_entry_injected && vbio.premount_new_root_size > 0 {
+                // Root Dir Record Data Length: bytes 166-169 (LE), 170-173 (BE)
+                dst[off + 166..off + 170].copy_from_slice(&vbio.premount_new_root_size.to_le_bytes());
+                dst[off + 170..off + 174].copy_from_slice(&vbio.premount_new_root_size.to_be_bytes());
+            }
         }
     }
 
@@ -247,6 +255,7 @@ pub fn create_virtual_cdrom(
     vbio.premount_entry_injected = false;
     vbio.premount_entry_injected_blob = [0u8; 128];
     vbio.premount_entry_injected_size = 0;
+    vbio.premount_new_root_size = 0;
 
     // ═════════════════════════════════════════════════════════════
     // 3. Install BlockIO protocol (creates the handle)
