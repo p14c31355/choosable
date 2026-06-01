@@ -306,29 +306,34 @@ fn find_eod_in_dir(
         while off < 2048 && walked < dir_size {
             let record_len = scratch[off] as usize;
             if record_len == 0 {
-                // EOD found.
-                // Check enough room: PREMOUNT.CPIO record = 46 bytes + 1 byte EOD = 47
-                if off + 47 <= 2048 {
+                // In ISO9660, record_len == 0 is also used as padding
+                // at the end of a sector when the next record would
+                // not fit.  Only treat it as the real EOD if this is
+                // the last sector of the directory.
+                if s + 1 == total_sectors {
+                    // Actual EOD in the last sector.
+                    // Check enough room: PREMOUNT.CPIO record = 46 bytes + 1 byte EOD = 47
+                    if off + 47 <= 2048 {
+                        *dir_size_out = walked;
+                        return Some((dir_lba + s, off as u32));
+                    }
+                    // Not enough room in the last sector.
                     *dir_size_out = walked;
                     return Some((dir_lba + s, off as u32));
                 }
-                // Not enough room in this sector; the synthetic entry
-                // would cross the sector boundary.  Move EOD to the
-                // start of the next sector.
-                if s + 1 < total_sectors {
-                    *dir_size_out = (s + 1) as u32 * 2048;
-                    return Some((dir_lba + s + 1, 0));
-                }
-                // Last sector and no room: still return EOD here
-                // but the caller will handle the tight fit.
-                *dir_size_out = walked;
-                return Some((dir_lba + s, off as u32));
+                // Not the last sector — this is sector-end padding.
+                // Skip to the next sector.
+                break;
             }
             if record_len < 34 || off + record_len > 2048 {
                 break; // malformed record, bail
             }
             walked += record_len as u32;
             off += record_len;
+        }
+        if s + 1 == total_sectors {
+            *dir_size_out = walked;
+            return Some((dir_lba + s, off as u32));
         }
         walked = (s + 1) * 2048;
     }

@@ -189,15 +189,27 @@ pub fn prepare_premount_initrd(
     // delete the ISO's original scripts like 20iso_scan.
     // Only add the file entries; directories already exist.
     //
+    // Inject into both live-premount (Debian live-boot) and
+    // casper-premount (Ubuntu/casper) so the premount script
+    // runs regardless of which initramfs variant is used.
+    //
     // File: scripts/live-premount/00choosable (runs BEFORE 20iso_scan)
     if !append_entry(cpio, &mut off, b"scripts/live-premount/00choosable", &script[..script_len], 0o100755) {
         unsafe { (bs.free_pool)(cpio_ptr); }
         return None;
     }
-    // Override 20iso_scan — our premount handles the mount, so
-    // the original ISO scan (which needs iso-scan/filename=) is
-    // unnecessary and would fail.
+    // Override 20iso_scan for live-boot
     if !append_entry(cpio, &mut off, b"scripts/live-premount/20iso_scan", b"#!/bin/sh\nexit 0\n", 0o100755) {
+        unsafe { (bs.free_pool)(cpio_ptr); }
+        return None;
+    }
+    // File: scripts/casper-premount/00choosable (runs BEFORE 20iso_scan)
+    if !append_entry(cpio, &mut off, b"scripts/casper-premount/00choosable", &script[..script_len], 0o100755) {
+        unsafe { (bs.free_pool)(cpio_ptr); }
+        return None;
+    }
+    // Override 20iso_scan for casper
+    if !append_entry(cpio, &mut off, b"scripts/casper-premount/20iso_scan", b"#!/bin/sh\nexit 0\n", 0o100755) {
         unsafe { (bs.free_pool)(cpio_ptr); }
         return None;
     }
