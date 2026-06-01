@@ -53,24 +53,59 @@ fn format_decimal_u64(v: u64) -> [u8; 21] {
 /// Build the premount shell script.
 /// `OFFSET` is replaced with the decimal byte offset of the ISO on the
 /// real partition (iso_lba * 512).
-fn build_premount_script(offset_bytes: u64) -> [u8; 1024] {
-    let mut script = [0u8; 1024];
+fn build_premount_script(offset_bytes: u64) -> [u8; 2048] {
+    let mut script = [0u8; 2048];
     let src = b"\
 #!/bin/sh
 # Choosable premount: loop-mounts ISO from raw partition offset
 echo '[choosable] premount starting, offset=OFFSET'
-for dev in /dev/sd[a-z][0-9]* /dev/nvme[0-9]*p[0-9]* /dev/mmcblk[0-9]*p[0-9]* /dev/vd[a-z][0-9]*; do
-  [ -b \"$dev\" ] || continue
-  losetup -o OFFSET /dev/loop0 \"$dev\" 2>/dev/null || continue
-  if mount -t iso9660 -o ro /dev/loop0 /cdrom 2>/dev/null; then
-    echo '[choosable] premount: ISO mounted at /cdrom via '$dev
-    if [ -f /cdrom/casper/filesystem.squashfs ] || [ -f /cdrom/live/filesystem.squashfs ] || [ -f /cdrom/LiveOS/squashfs.img ] || [ -f /cdrom/images/install.img ]; then
-      break
+
+# Wait up to 30 seconds for block devices to settle
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+  found=0
+  for dev in /dev/sd[a-z] /dev/nvme[0-9]* /dev/mmcblk[0-9]* /dev/vd[a-z]; do
+    [ -b \"$dev\" ] || continue
+    # Try the whole disk (USB without partition table)
+    losetup -o OFFSET /dev/loop0 \"$dev\" 2>/dev/null || continue
+    if mount -t iso9660 -o ro /dev/loop0 /cdrom 2>/dev/null; then
+      echo \"[choosable] premount: ISO mounted at /cdrom via $dev\"
+      if [ -f /cdrom/casper/filesystem.squashfs ] || \
+         [ -f /cdrom/live/filesystem.squashfs ] || \
+         [ -f /cdrom/LiveOS/squashfs.img ] || \
+         [ -f /cdrom/images/install.img ]; then
+        found=1
+        break 2
+      fi
+      umount /cdrom 2>/dev/null
+      losetup -d /dev/loop0 2>/dev/null
     fi
-    umount /cdrom 2>/dev/null
-    losetup -d /dev/loop0 2>/dev/null
-  fi
+  done
+
+  # Try partition devices (sdX1, nvme0n1p1 etc.)
+  for dev in /dev/sd[a-z][0-9]* /dev/nvme[0-9]*p[0-9]* /dev/mmcblk[0-9]*p[0-9]* /dev/vd[a-z][0-9]*; do
+    [ -b \"$dev\" ] || continue
+    losetup -o OFFSET /dev/loop0 \"$dev\" 2>/dev/null || continue
+    if mount -t iso9660 -o ro /dev/loop0 /cdrom 2>/dev/null; then
+      echo \"[choosable] premount: ISO mounted at /cdrom via $dev\"
+      if [ -f /cdrom/casper/filesystem.squashfs ] || \
+         [ -f /cdrom/live/filesystem.squashfs ] || \
+         [ -f /cdrom/LiveOS/squashfs.img ] || \
+         [ -f /cdrom/images/install.img ]; then
+        found=1
+        break 2
+      fi
+      umount /cdrom 2>/dev/null
+      losetup -d /dev/loop0 2>/dev/null
+    fi
+  done
+
+  [ \"$found\" = 1 ] && break
+  sleep 1
 done
+
+if [ \"$found\" != 1 ]; then
+  echo '[choosable] premount: could not locate ISO on any block device'
+fi
 ";
 
     let off_str = format_decimal_u64(offset_bytes);
@@ -87,11 +122,11 @@ done
             && bytes[i+3] == b'S' && bytes[i+4] == b'E' && bytes[i+5] == b'T'
         {
             for j in off_start..21 {
-                if pos < 1023 { script[pos] = off_str[j]; pos += 1; }
+                if pos < 2047 { script[pos] = off_str[j]; pos += 1; }
             }
             i += 6;
         } else {
-            if pos < 1023 { script[pos] = bytes[i]; pos += 1; }
+            if pos < 2047 { script[pos] = bytes[i]; pos += 1; }
             i += 1;
         }
     }
@@ -147,9 +182,9 @@ pub fn prepare_premount_initrd(
     let offset_bytes = relative_sector_offset * 512;
 
     let script = build_premount_script(offset_bytes);
-    let script_len = script.iter().position(|&c| c == 0).unwrap_or(1023);
+    let script_len = script.iter().position(|&c| c == 0).unwrap_or(2047);
 
-    let cpio_estimate = 2048usize;
+    let cpio_estimate = 4096usize;
     let mut cpio_ptr: *mut c_void = core::ptr::null_mut();
     let status = unsafe {
         (bs.allocate_pool)(MemoryType::EfiLoaderData, cpio_estimate, &mut cpio_ptr)

@@ -307,8 +307,8 @@ fn find_eod_in_dir(
             let record_len = scratch[off] as usize;
             if record_len == 0 {
                 // EOD found.
-                // Check enough room: PREMOUNT.CPIO;1 record = 48 bytes + 1 byte EOD
-                if off + 49 <= 2048 {
+                // Check enough room: PREMOUNT.CPIO record = 46 bytes + 1 byte EOD = 47
+                if off + 47 <= 2048 {
                     *dir_size_out = walked;
                     return Some((dir_lba + s, off as u32));
                 }
@@ -357,14 +357,13 @@ fn build_premount_cpio_entry(
     //  32    : name length (1 byte)
     //  33+   : name bytes + optional padding + optional system use
 
-    let name = b"PREMOUNT.CPIO;1";
-    let name_len = name.len() as u8; // 14
-    // Record must be even length; pad name to even
-    let record_len = if 33 + name_len as usize % 2 == 0 {
-        33 + name_len as usize
-    } else {
-        34 + name_len as usize
-    } as u8;
+    // Use "PREMOUNT.CPIO" without ";1" version suffix so GRUB's
+    // ISO9660 driver matches the name exactly as it appears in the
+    // patched grub.cfg initrd line.
+    // "PREMOUNT.CPIO" = 13 bytes.  33 + 13 = 46 → already even, no padding needed.
+    let name = b"PREMOUNT.CPIO";
+    let name_len = name.len() as u8; // 13
+    let record_len: u8 = 46;
 
     blob[0] = record_len;
     blob[1] = 0; // extended attr record len
@@ -379,18 +378,13 @@ fn build_premount_cpio_entry(
     blob[26] = 0; // file unit size
     blob[27] = 0; // interleave gap size
     blob[28..32].copy_from_slice(&1u32.to_le_bytes()); // volume seq number (LE)
-    blob[32] = name_len;
-    blob[33..33 + name.len()].copy_from_slice(name);
-    // Pad name to even boundary
-    let end = 33 + name.len();
-    if record_len as usize > end {
-        blob[end] = 0;
-    }
+    blob[32] = name_len; // 13
+    blob[33..33 + name.len()].copy_from_slice(name); // bytes 33–45
 
     // Append a new EOD marker byte right after this record
     blob[record_len as usize] = 0;
 
-    (record_len as u32) + 1 // record + EOD
+    (record_len as u32) + 1 // record (46) + EOD (1) = 47
 }
 
 fn find_efi_boot(
@@ -768,15 +762,17 @@ fn uefi_chainload_iso(
     if !vbio_ptr.is_null() && premount_bundle.is_some() {
         let vb = unsafe { &mut *vbio_ptr };
         let bundle = premount_bundle.as_ref().unwrap();
+        // cpio may need up to 4096 bytes → allocate 2 sectors
+        let premount_cpio_sectors = ((bundle.cpio_size as u64 + 2047) / 2048) as u32;
         {
-            let dst = unsafe { core::slice::from_raw_parts_mut(bundle.cpio_buf, 2048) };
-            for i in bundle.cpio_size..2048 { dst[i] = 0; }
+            let dst = unsafe { core::slice::from_raw_parts_mut(bundle.cpio_buf, premount_cpio_sectors as usize * 2048) };
+            for i in bundle.cpio_size..dst.len() { dst[i] = 0; }
         }
         let orig_end = vb.media.bim_lb + 1;
         vb.premount_file_sector = orig_end as u32;
-        vb.premount_file_sectors = 1;
+        vb.premount_file_sectors = premount_cpio_sectors;
         vb.premount_file_buf = bundle.cpio_buf;
-        vb.media.bim_lb = orig_end;
+        vb.media.bim_lb = orig_end + premount_cpio_sectors as u64 - 1;
 
         let mut pvd = [0u8; 2048];
         if read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, 16, &mut pvd)
@@ -844,7 +840,7 @@ fn uefi_chainload_iso(
                         sfs.ctx.premount_cpio_buf = bundle.cpio_buf;
                         sfs.ctx.premount_cpio_size = bundle.cpio_size;
                         sfs.ctx.premount_target_name = *b"PREMOUNT.CPIO___";
-                        sfs.ctx.premount_target_name_len = 12;
+                        sfs.ctx.premount_target_name_len = 13;
                     }
 
                     print_raw(st, b"[premount] injected synthetic PREMOUNT.CPIO entry at sector=\0");
