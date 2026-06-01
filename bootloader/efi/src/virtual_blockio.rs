@@ -82,8 +82,9 @@ unsafe extern "efiapi" fn vblock_read(
         let block_offset = b * 2048;
 
         let is_dir_patched = vbio.dir_entry_patched && block_lba == vbio.dir_entry_sector as u64;
-        let is_premount_sector = vbio.premount_entry_patched && block_lba == vbio.premount_entry_sector as u64;
-        let sect_handled = is_dir_patched || is_premount_sector;
+        let is_premount_patched = vbio.premount_entry_patched && block_lba == vbio.premount_entry_sector as u64;
+        let is_premount_injected = vbio.premount_entry_injected && block_lba == vbio.premount_entry_sector as u64;
+        let sect_handled = is_dir_patched || is_premount_patched || is_premount_injected;
 
         if is_dir_patched {
             if !read_real_iso_sector(vbio, block_lba, dst, block_offset) { return EFI_DEVICE_ERROR; }
@@ -91,10 +92,26 @@ unsafe extern "efiapi" fn vblock_read(
                 vbio.dir_entry_offset as usize, vbio.dir_entry_new_extent, vbio.dir_entry_new_size);
         }
 
-        if is_premount_sector {
+        if is_premount_patched {
             if !is_dir_patched && !read_real_iso_sector(vbio, block_lba, dst, block_offset) { return EFI_DEVICE_ERROR; }
             patch_dir_entry(&mut dst[block_offset..block_offset + 2048],
                 vbio.premount_entry_offset as usize, vbio.premount_entry_new_extent, vbio.premount_entry_new_size);
+        }
+
+        if is_premount_injected {
+            // The sector may already have been read by is_dir_patched
+            // or is_premount_patched above; only read it if neither
+            // of them has populated the buffer yet.
+            if !is_dir_patched && !is_premount_patched {
+                if !read_real_iso_sector(vbio, block_lba, dst, block_offset) { return EFI_DEVICE_ERROR; }
+            }
+            // Overwrite with the pre-built synthetic directory record
+            let off = vbio.premount_entry_offset as usize;
+            let sz = vbio.premount_entry_injected_size as usize;
+            if off + sz <= 2048 {
+                dst[block_offset + off..block_offset + off + sz]
+                    .copy_from_slice(&vbio.premount_entry_injected_blob[..sz]);
+            }
         }
 
         if sect_handled { continue; }
@@ -106,6 +123,26 @@ unsafe extern "efiapi" fn vblock_read(
         }
 
         if !read_real_iso_sector(vbio, block_lba, dst, block_offset) { return EFI_DEVICE_ERROR; }
+
+        // Patch PVD at sector 16 so GRUB's ISO9660 driver accepts
+        // extent references that point to appended sectors and sees
+        // the updated root directory size after synthetic injection.
+        if block_lba == 16 {
+            let new_vol_size = (vbio.media.bim_lb + 1) as u32;
+            let off = block_offset;
+            // Volume Space Size: bytes 80-83 (LE), 84-87 (BE)
+            dst[off + 80..off + 84].copy_from_slice(&new_vol_size.to_le_bytes());
+            dst[off + 84..off + 88].copy_from_slice(&new_vol_size.to_be_bytes());
+
+            // If premount entry was injected (not patched over existing),
+            // also update the root directory record data length in PVD
+            // so GRUB walks past the synthetic PREMOUNT.CPIO record.
+            if vbio.premount_entry_injected && vbio.premount_new_root_size > 0 {
+                // Root Dir Record Data Length: bytes 166-169 (LE), 170-173 (BE)
+                dst[off + 166..off + 170].copy_from_slice(&vbio.premount_new_root_size.to_le_bytes());
+                dst[off + 170..off + 174].copy_from_slice(&vbio.premount_new_root_size.to_be_bytes());
+            }
+        }
     }
 
     EFI_SUCCESS
@@ -220,6 +257,10 @@ pub fn create_virtual_cdrom(
     vbio.premount_file_sector = 0;
     vbio.premount_file_sectors = 0;
     vbio.premount_file_buf = core::ptr::null_mut();
+    vbio.premount_entry_injected = false;
+    vbio.premount_entry_injected_blob = [0u8; 128];
+    vbio.premount_entry_injected_size = 0;
+    vbio.premount_new_root_size = 0;
 
     // ═════════════════════════════════════════════════════════════
     // 3. Install BlockIO protocol (creates the handle)

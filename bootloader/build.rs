@@ -37,8 +37,10 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=efi/src/");
     println!("cargo:rerun-if-changed=efi/Cargo.toml");
+    println!("cargo:rerun-if-changed=efi/build.rs");
     println!("cargo:rerun-if-changed=kernel/src/");
     println!("cargo:rerun-if-changed=kernel/Cargo.toml");
+    println!("cargo:rerun-if-changed=../.czblignore");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
