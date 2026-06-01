@@ -786,8 +786,7 @@ fn uefi_chainload_iso(
         let premount_cpio_sectors = ((bundle.cpio_size as u64 + 2047) / 2048) as u32;
         {
             let dst = unsafe { core::slice::from_raw_parts_mut(bundle.cpio_buf, premount_cpio_sectors as usize * 2048) };
-            for i in bundle.cpio_size..dst.len() { dst[i] = 0; }
-        }
+            dst[bundle.cpio_size..].fill(0);
         let orig_end = vb.media.bim_lb + 1;
         vb.premount_file_sector = orig_end as u32;
         vb.premount_file_sectors = premount_cpio_sectors;
