@@ -209,7 +209,7 @@ impl BootStrategy for CasperStrategy {
     fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> {
         patch_grub_cfg_impl(
             inp,
-            b" boot=casper break=bottom",
+            b" boot=casper",
             inp.premount_target_name,
         )
     }
