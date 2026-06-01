@@ -62,7 +62,7 @@ fn build_premount_script(offset_bytes: u64) -> [u8; 2048] {
 #!/bin/sh
 echo 'start OFFSET' >/tmp/choosable.log
 mkdir -p /cdrom
-while read major minor blocks name; do
+while read -r major minor blocks name; do
   case \"$name\" in
     loop*|ram*|dm-*) continue ;;
     sd[a-z][0-9]*|nvme[0-9]*n[0-9]*p[0-9]*|mmcblk[0-9]*p[0-9]*|vd[a-z][0-9]*) ;;
