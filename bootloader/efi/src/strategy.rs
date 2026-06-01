@@ -78,7 +78,12 @@ fn count_matching_lines(orig: &[u8]) -> (usize, usize) {
     (linux_count, initrd_count)
 }
 
-fn patch_grub_cfg_impl(inp: &PatchInput, linux_extra: &[u8], premount_target_name: &[u8]) -> Option<PatchOutput> {
+fn patch_grub_cfg_impl(
+    inp: &PatchInput,
+    linux_extra: &[u8],
+    linux_eol_extra: &[u8],   // injected at END of linux line (overrides earlier params)
+    premount_target_name: &[u8],
+) -> Option<PatchOutput> {
     let bs = unsafe { &mut *inp.bs };
     let orig = inp.original;
 
@@ -108,7 +113,8 @@ fn patch_grub_cfg_impl(inp: &PatchInput, linux_extra: &[u8], premount_target_nam
     // Count matching lines first so the output buffer is large enough for
     // all injections (typical grub.cfg has multiple menu entries).
     let (linux_count, initrd_count) = count_matching_lines(orig);
-    let extra = linux_count * linux_extra.len() + initrd_count * initrd_extra.len();
+    let extra = linux_count * (linux_extra.len() + linux_eol_extra.len())
+        + initrd_count * initrd_extra.len();
     let (out_ptr, out_cap) = allocate_output(bs, orig.len(), extra)?;
     let out = unsafe { core::slice::from_raw_parts_mut(out_ptr, out_cap) };
 
@@ -137,10 +143,24 @@ fn patch_grub_cfg_impl(inp: &PatchInput, linux_extra: &[u8], premount_target_nam
             // ── linux / linuxefi lines ──
             if (t.starts_with(b"linux ") || t.starts_with(b"linux\t")
                 || t.starts_with(b"linuxefi ") || t.starts_with(b"linuxefi\t"))
-                && !line.windows(18).any(|w| w == b"iso-scan/filename=")
+                && !line.windows(linux_extra.len()).any(|w| w == linux_extra)
             {
+                // EOL extra ALWAYS needs injection — it overrides earlier
+                // params via kernel last-wins rule even if a similar string
+                // appears earlier (e.g. findiso= overrides findiso=${isopath}).
+                let needs_eol = !linux_eol_extra.is_empty();
                 let inject_at = find_second_arg_end(line_start, out, dst);
                 shift_and_inject(out, inject_at, &mut dst, linux_extra);
+                // Also inject eol_extra at end of line (overrides earlier
+                // values like iso-scan/filename=/path via kernel's last-wins rule).
+                if needs_eol {
+                    if dst > 0 && out[dst - 1] == b'\n' {
+                        shift_and_inject(out, dst - 1, &mut dst, linux_eol_extra);
+                    } else {
+                        out[dst..dst + linux_eol_extra.len()].copy_from_slice(linux_eol_extra);
+                        dst += linux_eol_extra.len();
+                    }
+                }
             }
             // ── initrd lines ──
             else if (t.starts_with(b"initrd ") || t.starts_with(b"initrd\t"))
@@ -209,7 +229,8 @@ impl BootStrategy for CasperStrategy {
     fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> {
         patch_grub_cfg_impl(
             inp,
-            b" boot=casper",
+            b" boot=casper",             // inject after vmlinuz
+            b" iso-scan/filename=",      // inject at END to override original iso-scan/filename=...
             inp.premount_target_name,
         )
     }
@@ -234,7 +255,8 @@ impl BootStrategy for LiveBootStrategy {
     fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> {
         patch_grub_cfg_impl(
             inp,
-            b" boot=live",
+            b" boot=live",               // inject after vmlinuz
+            b" findiso=",                // inject at END to override original findiso=${iso_path}
             inp.premount_target_name,
         )
     }
@@ -260,6 +282,7 @@ impl BootStrategy for LiveOSStrategy {
         patch_grub_cfg_impl(
             inp,
             b" rd.live.image rootdelay=300",
+            b"",                         // no eol override needed
             inp.premount_target_name,
         )
     }
