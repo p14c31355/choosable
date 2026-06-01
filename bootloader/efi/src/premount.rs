@@ -19,6 +19,7 @@
 //  instantly.  The kernel reads squashfs from the loop device on demand.
 
 use core::ffi::c_void;
+use crate::boot_context::BootContext;
 use crate::protocol::{BootServices, MemoryType, EFI_SUCCESS};
 
 pub struct PremountBundle {
@@ -28,6 +29,62 @@ pub struct PremountBundle {
     pub cpio_size: usize,
     /// ISO file start LBA on the real partition (512-byte sectors)
     pub iso_offset_bytes: u64,
+}
+
+/// Trait for early-boot fixups injected via initrd.
+///
+/// Implementations build a cpio archive containing hook scripts that
+/// run before the distro's own initramfs scripts (e.g. casper, live-boot,
+/// dracut).  This allows filesystem-independent loopback mounting of
+/// the payload without relying on kernel modules for the host filesystem.
+pub trait EarlyBootFixup {
+    /// Build an initrd cpio archive that will be injected into the
+    /// boot chain (appended to the initrd line / served as synthetic file).
+    ///
+    /// Returns `None` if the fixup cannot be built (e.g. OOM).
+    fn build_initrd(&self, ctx: &BootContext, bs: &mut BootServices) -> Option<PremountBundle>;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  CasperFixup — Ubuntu / Mint / Pop!_OS (casper initramfs)
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub struct CasperFixup;
+
+impl EarlyBootFixup for CasperFixup {
+    fn build_initrd(&self, ctx: &BootContext, bs: &mut BootServices) -> Option<PremountBundle> {
+        let iso = ctx.selected_iso();
+        let relative_sector_offset = iso.file_start_lba - ctx.partition_start_lba;
+        prepare_premount_initrd(bs, relative_sector_offset)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  LiveBootFixup — Debian Live (live-boot initramfs)
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub struct LiveBootFixup;
+
+impl EarlyBootFixup for LiveBootFixup {
+    fn build_initrd(&self, ctx: &BootContext, bs: &mut BootServices) -> Option<PremountBundle> {
+        let iso = ctx.selected_iso();
+        let relative_sector_offset = iso.file_start_lba - ctx.partition_start_lba;
+        prepare_premount_initrd(bs, relative_sector_offset)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  DracutFixup — Fedora / RHEL / CentOS (dracut initramfs)
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub struct DracutFixup;
+
+impl EarlyBootFixup for DracutFixup {
+    fn build_initrd(&self, ctx: &BootContext, bs: &mut BootServices) -> Option<PremountBundle> {
+        let iso = ctx.selected_iso();
+        let relative_sector_offset = iso.file_start_lba - ctx.partition_start_lba;
+        prepare_premount_initrd(bs, relative_sector_offset)
+    }
 }
 
 fn hex_nibble(n: u8) -> u8 {
