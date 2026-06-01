@@ -777,7 +777,7 @@ fn uefi_chainload_iso(
     if !vbio_ptr.is_null() && premount_bundle.is_some() {
         let vb = unsafe { &mut *vbio_ptr };
         let bundle = premount_bundle.as_ref().unwrap();
-        // cpio may need up to 4096 bytes → allocate 2 sectors
+        // cpio may need up to 8192 bytes → 4 sectors
         let premount_cpio_sectors = ((bundle.cpio_size as u64 + 2047) / 2048) as u32;
         {
             let dst = unsafe { core::slice::from_raw_parts_mut(bundle.cpio_buf, premount_cpio_sectors as usize * 2048) };
