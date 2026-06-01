@@ -58,6 +58,9 @@ fn build_premount_script(offset_bytes: u64) -> [u8; 2048] {
     // BusyBox ash does NOT support glob expansion in for-loops, but it
     // DOES support while-read loops with /proc/partitions, which gives
     // us a dynamic list of all block devices — no hardcoded names needed.
+    //
+    // Uses `losetup -f` to find a free loop device instead of hardcoding
+    // /dev/loop0, which may already be in use (e.g. by snap packages).
     let src = b"\
 #!/bin/sh
 echo 'start OFFSET' >/tmp/choosable.log
@@ -71,17 +74,19 @@ while read -r major minor blocks name; do
   dev=\"/dev/$name\"
   [ -b \"$dev\" ] || continue
   echo \"try $name\" >>/tmp/choosable.log
-  losetup -o OFFSET /dev/loop0 \"$dev\" 2>>/tmp/choosable.log || continue
+  LOOP=$(losetup -f 2>/dev/null) || continue
+  [ -n \"$LOOP\" ] || continue
+  losetup -o OFFSET \"$LOOP\" \"$dev\" 2>>/tmp/choosable.log || continue
   echo \"loopok $name\" >>/tmp/choosable.log
-  mount -t iso9660 -o ro /dev/loop0 /cdrom 2>>/tmp/choosable.log || continue
+  mount -t iso9660 -o ro \"$LOOP\" /cdrom 2>>/tmp/choosable.log || continue
   echo \"mntok $name\" >>/tmp/choosable.log
-  if [ -f /cdrom/casper/filesystem.squashfs ] || [ -f /cdrom/live/filesystem.squashfs ] || [ -f /cdrom/LiveOS/squashfs.img ] || [ -f /cdrom/images/install.img ]; then
+  if [ -f /cdrom/casper/filesystem.squashfs ] || [ -f /cdrom/live/filesystem.squashfs ] || [ -f /cdrom/LiveOS/squashfs.img ] || [ -f /cdrom/images/install.img ] || [ -f /cdrom/casper/filesystem.squashfs.gpg ] || [ -f /cdrom/.disk/info ]; then
     echo \"squashfs found on $name\" >>/tmp/choosable.log
     exit 0
   fi
   echo \"nosquash $name\" >>/tmp/choosable.log
   umount /cdrom 2>/dev/null
-  losetup -d /dev/loop0 2>/dev/null
+  losetup -d \"$LOOP\" 2>/dev/null
 done < /proc/partitions
 echo 'gaveup' >>/tmp/choosable.log
 ";
@@ -163,7 +168,8 @@ pub fn prepare_premount_initrd(
     let script_len = script.iter().position(|&c| c == 0).unwrap_or(2047);
 
     // cpio grows with multiple entries — safe margin
-    let cpio_estimate = 8192usize;
+    // 10 entries (4× script + 4× override stub + trailer + 1 spare)
+    let cpio_estimate = 16384usize;
     let mut cpio_ptr: *mut c_void = core::ptr::null_mut();
     let status = unsafe {
         (bs.allocate_pool)(MemoryType::EfiLoaderData, cpio_estimate, &mut cpio_ptr)
@@ -194,27 +200,54 @@ pub fn prepare_premount_initrd(
     // delete the ISO's original scripts like 20iso_scan.
     // Only add the file entries; directories already exist.
     //
-    // Inject into both live-premount (Debian live-boot) and
-    // casper-premount (Ubuntu/casper) so the premount script
-    // runs regardless of which initramfs variant is used.
+    // Inject into multiple initramfs hook directories so the premount
+    // script runs regardless of which distro's initramfs variant is used:
     //
-    // File: scripts/live-premount/00choosable (runs BEFORE 20iso_scan)
-    if !append_entry(cpio, &mut off, b"scripts/live-premount/00choosable", &script[..script_len], 0o100755) {
+    //   scripts/live/               — Debian live-boot (main hook dir)
+    //   scripts/live-premount/      — Debian live-boot (premount variant)
+    //   scripts/casper-premount/    — Ubuntu/casper (premount hooks)
+    //   scripts/casper-bottom/      — Ubuntu/casper (bottom hooks, fallback)
+    //
+    // All hooks named 00choosable so they sort lexically before the
+    // distro's built-in iso-scan scripts (typically 20iso_scan or similar).
+    //
+    // File: scripts/live/00choosable (Debian live-boot primary)
+    if !append_entry(cpio, &mut off, b"scripts/live/00choosable", &script[..script_len], 0o100755) {
         unsafe { (bs.free_pool)(cpio_ptr); }
         return None;
     }
     // Override 20iso_scan for live-boot
+    if !append_entry(cpio, &mut off, b"scripts/live/20iso_scan", b"#!/bin/sh\nexit 0\n", 0o100755) {
+        unsafe { (bs.free_pool)(cpio_ptr); }
+        return None;
+    }
+    // File: scripts/live-premount/00choosable (Debian live-boot premount)
+    if !append_entry(cpio, &mut off, b"scripts/live-premount/00choosable", &script[..script_len], 0o100755) {
+        unsafe { (bs.free_pool)(cpio_ptr); }
+        return None;
+    }
+    // Override 20iso_scan for live-premount
     if !append_entry(cpio, &mut off, b"scripts/live-premount/20iso_scan", b"#!/bin/sh\nexit 0\n", 0o100755) {
         unsafe { (bs.free_pool)(cpio_ptr); }
         return None;
     }
-    // File: scripts/casper-premount/00choosable (runs BEFORE 20iso_scan)
+    // File: scripts/casper-premount/00choosable (Ubuntu/casper primary)
     if !append_entry(cpio, &mut off, b"scripts/casper-premount/00choosable", &script[..script_len], 0o100755) {
         unsafe { (bs.free_pool)(cpio_ptr); }
         return None;
     }
-    // Override 20iso_scan for casper
+    // Override 20iso_scan for casper-premount
     if !append_entry(cpio, &mut off, b"scripts/casper-premount/20iso_scan", b"#!/bin/sh\nexit 0\n", 0o100755) {
+        unsafe { (bs.free_pool)(cpio_ptr); }
+        return None;
+    }
+    // File: scripts/casper-bottom/00choosable (Ubuntu/casper bottom — safety net)
+    if !append_entry(cpio, &mut off, b"scripts/casper-bottom/00choosable", &script[..script_len], 0o100755) {
+        unsafe { (bs.free_pool)(cpio_ptr); }
+        return None;
+    }
+    // Override 20iso_scan for casper-bottom (if present)
+    if !append_entry(cpio, &mut off, b"scripts/casper-bottom/20iso_scan", b"#!/bin/sh\nexit 0\n", 0o100755) {
         unsafe { (bs.free_pool)(cpio_ptr); }
         return None;
     }
