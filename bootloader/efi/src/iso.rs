@@ -297,7 +297,6 @@ fn find_eod_in_dir(
         if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, dir_lba + s, scratch) {
             return None;
         }
-        let sector_base = s * 2048;
         let mut off = 0usize;
         // walked already equals sector_base + off because both are
         // incremented by record_len in lockstep within each sector.
