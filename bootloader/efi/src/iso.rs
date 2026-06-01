@@ -499,11 +499,26 @@ fn try_patch_candidate(
     };
 
     let patch = strategy::patch_grub_cfg(&ctx, orig, bs as *mut BootServices, iso_location);
-    unsafe { (bs.free_pool)(orig_ptr as *mut c_void); }
 
     let (patched_buf, patched_size) = match patch {
-        Some(p) => (p.buf, p.size),
-        None => return false,
+        Some(p) if p.size != (orig_len as usize) || {
+            let a = unsafe { core::slice::from_raw_parts(p.buf, p.size) };
+            let b = unsafe { core::slice::from_raw_parts(orig_ptr, orig_len as usize) };
+            a != b
+        } => {
+            unsafe { (bs.free_pool)(orig_ptr as *mut c_void); }
+            (p.buf, p.size)
+        }
+        Some(p) => {
+            // patch produced identical content — no change needed
+            unsafe { (bs.free_pool)(p.buf as *mut c_void); }
+            unsafe { (bs.free_pool)(orig_ptr as *mut c_void); }
+            return false;
+        }
+        None => {
+            unsafe { (bs.free_pool)(orig_ptr as *mut c_void); }
+            return false;
+        }
     };
 
     let sector_aligned_patch = ((patched_size + 2047) / 2048) * 2048;
