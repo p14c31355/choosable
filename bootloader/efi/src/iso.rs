@@ -316,9 +316,9 @@ fn find_eod_in_dir(
                         *dir_size_out = walked;
                         return Some((dir_lba + s, off as u32));
                     }
-                    // Not enough room in the last sector.
-                    *dir_size_out = walked;
-                    return Some((dir_lba + s, off as u32));
+                    // Not enough room in the last sector — caller must
+                    // fall back to locating a real file to overwrite.
+                    return None;
                 }
                 // Not the last sector — this is sector-end padding.
                 // Skip to the next sector.
@@ -331,8 +331,13 @@ fn find_eod_in_dir(
             off += record_len;
         }
         if s + 1 == total_sectors {
-            *dir_size_out = walked;
-            return Some((dir_lba + s, off as u32));
+            // Last sector: make sure we have enough room for the
+            // synthetic entry.  off == 2048 means the sector is full.
+            if off + 47 <= 2048 {
+                *dir_size_out = walked;
+                return Some((dir_lba + s, off as u32));
+            }
+            return None;
         }
         walked = (s + 1) * 2048;
     }
@@ -786,6 +791,7 @@ fn uefi_chainload_iso(
         {
             let dst = unsafe { core::slice::from_raw_parts_mut(bundle.cpio_buf, premount_cpio_sectors as usize * 2048) };
             dst[bundle.cpio_size..].fill(0);
+        }
         let orig_end = vb.media.bim_lb + 1;
         vb.premount_file_sector = orig_end as u32;
         vb.premount_file_sectors = premount_cpio_sectors;

@@ -55,29 +55,34 @@ fn format_decimal_u64(v: u64) -> [u8; 21] {
 /// real partition (iso_lba * 512).
 fn build_premount_script(offset_bytes: u64) -> [u8; 2048] {
     let mut script = [0u8; 2048];
-    // BusyBox ash has no glob in for-loop.  Use fixed candidate list.
-    // CRITICAL: Rust b\"...\" byte strings do NOT escape \\\":
-    //          \" produces literal backslash-quote in the output.
-    //          Avoid escaped quotes — use /dev/$dev directly.
+    // BusyBox ash does NOT support glob expansion in for-loops, but it
+    // DOES support while-read loops with /proc/partitions, which gives
+    // us a dynamic list of all block devices — no hardcoded names needed.
     let src = b"\
 #!/bin/sh
 echo 'start OFFSET' >/tmp/choosable.log
 mkdir -p /cdrom
-for dev in sda1 sda2 sdb1 sdb2 sdc1 sdc2 sdd1 sdd2 sde1 sde2 nvme0n1p1 nvme0n1p2 nvme1n1p1 nvme1n1p2 mmcblk0p1 mmcblk0p2 vda1 vda2; do
-  [ -b /dev/$dev ] || continue
-  echo \"try $dev\" >>/tmp/choosable.log
-  losetup -o OFFSET /dev/loop0 /dev/$dev 2>>/tmp/choosable.log || continue
-  echo \"loopok $dev\" >>/tmp/choosable.log
+while read major minor blocks name; do
+  case \"$name\" in
+    loop*|ram*|dm-*) continue ;;
+    sd[a-z][0-9]*|nvme[0-9]*n[0-9]*p[0-9]*|mmcblk[0-9]*p[0-9]*|vd[a-z][0-9]*) ;;
+    *) continue ;;
+  esac
+  dev=\"/dev/$name\"
+  [ -b \"$dev\" ] || continue
+  echo \"try $name\" >>/tmp/choosable.log
+  losetup -o OFFSET /dev/loop0 \"$dev\" 2>>/tmp/choosable.log || continue
+  echo \"loopok $name\" >>/tmp/choosable.log
   mount -t iso9660 -o ro /dev/loop0 /cdrom 2>>/tmp/choosable.log || continue
-  echo \"mntok $dev\" >>/tmp/choosable.log
+  echo \"mntok $name\" >>/tmp/choosable.log
   if [ -f /cdrom/casper/filesystem.squashfs ] || [ -f /cdrom/live/filesystem.squashfs ] || [ -f /cdrom/LiveOS/squashfs.img ] || [ -f /cdrom/images/install.img ]; then
-    echo \"squashfs found on $dev\" >>/tmp/choosable.log
+    echo \"squashfs found on $name\" >>/tmp/choosable.log
     exit 0
   fi
-  echo \"nosquash $dev\" >>/tmp/choosable.log
+  echo \"nosquash $name\" >>/tmp/choosable.log
   umount /cdrom 2>/dev/null
   losetup -d /dev/loop0 2>/dev/null
-done
+done < /proc/partitions
 echo 'gaveup' >>/tmp/choosable.log
 ";
 
