@@ -386,7 +386,8 @@ fn build_premount_cpio_entry(
     blob[25] = 0; // flags: plain file
     blob[26] = 0; // file unit size
     blob[27] = 0; // interleave gap size
-    blob[28..32].copy_from_slice(&1u32.to_le_bytes()); // volume seq number (LE)
+    blob[28..30].copy_from_slice(&1u16.to_le_bytes());
+    blob[30..32].copy_from_slice(&1u16.to_be_bytes());
     blob[32] = name_len; // 13
     blob[33..33 + name.len()].copy_from_slice(name); // bytes 33–45
 
