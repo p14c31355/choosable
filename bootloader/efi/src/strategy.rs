@@ -112,10 +112,14 @@ fn patch_grub_cfg_impl(
     let eol_extra_dynamic: &[u8] = if !linux_eol_extra.is_empty() && linux_eol_extra.ends_with(b"=") {
         if let Some(path) = iso_path {
             let plen = linux_eol_extra.len();
-            let pl = path.len().min(320 - plen);
-            eol_buf[..plen].copy_from_slice(linux_eol_extra);
-            eol_buf[plen..plen + pl].copy_from_slice(&path[..pl]);
-            &eol_buf[..plen + pl]
+            if plen < 320 {
+                let pl = path.len().min(320 - plen);
+                eol_buf[..plen].copy_from_slice(linux_eol_extra);
+                eol_buf[plen..plen + pl].copy_from_slice(&path[..pl]);
+                &eol_buf[..plen + pl]
+            } else {
+                linux_eol_extra
+            }
         } else { linux_eol_extra }
     } else { linux_eol_extra };
 
