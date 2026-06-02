@@ -156,17 +156,13 @@ impl BootStage for DiscoverPartitionStage {
         } else if &vbr[0x52..0x5A] == b"FAT32   " {
             fs::FsType::Fat32
         } else {
-            if &vbr[0x52..0x5A] == b"FAT32   " {
-                fs::FsType::Fat32
-            } else {
-                let st = st_from_ctx(ctx);
-                print_raw(st, b"Unknown filesystem on partition 1.\r\n\0");
-                print_hex(st, b"  First 16 bytes: ", u64::from_le_bytes(vbr[0..8].try_into().unwrap()));
-                print_hex(st, b"  ", u64::from_le_bytes(vbr[8..16].try_into().unwrap()));
-                print_raw(st, b"\r\n\0");
-                halt_or_reboot(st);
-                loop { unsafe { core::arch::asm!("hlt") } }
-            }
+            let st = st_from_ctx(ctx);
+            print_raw(st, b"Unknown filesystem on partition 1.\r\n\0");
+            print_hex(st, b"  First 16 bytes: ", u64::from_le_bytes(vbr[0..8].try_into().unwrap()));
+            print_hex(st, b"  ", u64::from_le_bytes(vbr[8..16].try_into().unwrap()));
+            print_raw(st, b"\r\n\0");
+            halt_or_reboot(st);
+            loop { unsafe { core::arch::asm!("hlt") } }
         };
 
         ctx.partition_start_lba = part1_lba;

@@ -21,39 +21,19 @@ pub struct PatchOutput {
     pub size: usize,
 }
 
-/// Hook injection target directories.
-/// Each strategy specifies which initramfs hooks to inject.
 pub struct HookTargetSet {
-    /// Scripts/live/ hooks (Debian live-boot main)
     pub live: bool,
-    /// Scripts/live-premount/ hooks (Debian live-boot premount)
     pub live_premount: bool,
-    /// Scripts/casper-premount/ hooks (Ubuntu casper premount)
     pub casper_premount: bool,
-    /// Scripts/casper-bottom/ hooks (Ubuntu casper bottom)
     pub casper_bottom: bool,
 }
 
 pub trait BootStrategy: Sync {
-    /// Detect whether this strategy applies to the given ISO.
     fn detect(&self, ctx: &IsoFsCtx) -> bool;
-
-    /// Patch the kernel command line (linux_extra + linux_eol_extra).
     fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> { let _ = inp; None }
-
-    /// Return the set of hook directories to inject premount scripts into.
     fn hook_targets(&self) -> HookTargetSet {
-        // Default: inject into all four directories (covers both Debian and Ubuntu)
-        HookTargetSet {
-            live: true,
-            live_premount: true,
-            casper_premount: true,
-            casper_bottom: true,
-        }
+        HookTargetSet { live: true, live_premount: true, casper_premount: true, casper_bottom: true }
     }
-
-    /// Whether to include "modprobe sr_mod" in the hook script.
-    /// Required for Ubuntu casper which checks for optical drives via sr_mod.
     fn needs_sr_mod(&self) -> bool { false }
 }
 
@@ -112,14 +92,10 @@ fn patch_grub_cfg_impl(
     let eol_extra_dynamic: &[u8] = if !linux_eol_extra.is_empty() && linux_eol_extra.ends_with(b"=") {
         if let Some(path) = iso_path {
             let plen = linux_eol_extra.len();
-            if plen < 320 {
-                let pl = path.len().min(320 - plen);
-                eol_buf[..plen].copy_from_slice(linux_eol_extra);
-                eol_buf[plen..plen + pl].copy_from_slice(&path[..pl]);
-                &eol_buf[..plen + pl]
-            } else {
-                linux_eol_extra
-            }
+            let pl = path.len().min(320 - plen);
+            eol_buf[..plen].copy_from_slice(linux_eol_extra);
+            eol_buf[plen..plen + pl].copy_from_slice(&path[..pl]);
+            &eol_buf[..plen + pl]
         } else { linux_eol_extra }
     } else { linux_eol_extra };
 
@@ -157,8 +133,11 @@ fn patch_grub_cfg_impl(
                 let inject_at = find_second_arg_end(line_start, out, dst);
                 shift_and_inject(out, inject_at, &mut dst, linux_extra);
                 if needs_eol {
+                    // Handle \r\n line endings: inject before \r if present.
                     if dst > 0 && out[dst - 1] == b'\n' {
-                        shift_and_inject(out, dst - 1, &mut dst, eol_extra_dynamic);
+                        let mut inject_at = dst - 1;
+                        if dst > 1 && out[dst - 2] == b'\r' { inject_at -= 1; }
+                        shift_and_inject(out, inject_at, &mut dst, eol_extra_dynamic);
                     } else {
                         out[dst..dst + eol_extra_dynamic.len()].copy_from_slice(eol_extra_dynamic);
                         dst += eol_extra_dynamic.len();
@@ -218,29 +197,22 @@ impl BootStrategy for CasperStrategy {
     }
 
     fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> {
-        // live-media=LABEL=Choosable tells casper the real USB device.
-        // iso-scan/filename= tells casper which ISO file on that device.
+        // Premount hook mounts ISO at /cdrom via losetup BEFORE casper.
+        // Casper auto-detects /cdrom when boot=casper is set.
+        // Do NOT inject iso-scan/filename= — it forces casper's 20iso_scan
+        // to mount the real partition (fails on exFAT/NTFS).
         patch_grub_cfg_impl(
             inp,
             b" boot=casper live-media=LABEL=Choosable",
-            b" iso-scan/filename=",
+            b"", // no eol override — premount handles /cdrom
             inp.premount_target_name,
         )
     }
 
-    /// Ubuntu casper checks /sys/block for sr0 (optical drive).
-    /// modprobe sr_mod creates the sr0 device node before casper runs.
     fn needs_sr_mod(&self) -> bool { true }
 
-    /// Only inject into casper hooks; Debian live-boot hooks are
-    /// unnecessary for Ubuntu and may conflict with casper.
     fn hook_targets(&self) -> HookTargetSet {
-        HookTargetSet {
-            live: false,
-            live_premount: false,
-            casper_premount: true,
-            casper_bottom: true,
-        }
+        HookTargetSet { live: false, live_premount: false, casper_premount: true, casper_bottom: true }
     }
 }
 
@@ -266,18 +238,10 @@ impl BootStrategy for LiveBootStrategy {
         )
     }
 
-    /// Debian live-boot does NOT use sr_mod; it's unnecessary overhead.
     fn needs_sr_mod(&self) -> bool { false }
 
-    /// Inject into live-boot hook directories only; casper hooks are
-    /// unnecessary for Debian and may conflict with live-boot.
     fn hook_targets(&self) -> HookTargetSet {
-        HookTargetSet {
-            live: true,
-            live_premount: true,
-            casper_premount: false,
-            casper_bottom: false,
-        }
+        HookTargetSet { live: true, live_premount: true, casper_premount: false, casper_bottom: false }
     }
 }
 
@@ -319,13 +283,11 @@ pub fn patch_grub_cfg(ctx: &IsoFsCtx, original: &[u8], bs: *mut BootServices, is
     })
 }
 
-/// Returns the active strategy's hook targets (which directories to inject into).
 pub fn get_hook_targets(ctx: &IsoFsCtx) -> HookTargetSet {
     let strategy: &dyn BootStrategy = STRATEGIES.iter().find(|s| s.detect(ctx)).copied().unwrap_or(&CasperStrategy);
     strategy.hook_targets()
 }
 
-/// Returns whether the active strategy needs sr_mod loaded.
 pub fn needs_sr_mod(ctx: &IsoFsCtx) -> bool {
     let strategy: &dyn BootStrategy = STRATEGIES.iter().find(|s| s.detect(ctx)).copied().unwrap_or(&CasperStrategy);
     strategy.needs_sr_mod()
