@@ -75,7 +75,11 @@ pub struct IsoMedia {
 
 impl VirtualMedia for IsoMedia {
     fn read_block(&self, block_lba: u64, dst: &mut [u8], dst_offset: usize) -> bool {
-        if block_lba >= self.total_blocks || dst_offset + 2048 > dst.len() {
+        if block_lba >= self.total_blocks {
+            return false;
+        }
+        // Guard against overflow: check that dst_offset + 2048 won't overflow and is in bounds
+        if dst_offset > dst.len() || dst.len() - dst_offset < 2048 {
             return false;
         }
         let disk_lba = self.iso_lba + block_lba * 4;
@@ -374,7 +378,8 @@ pub fn create_virtual_cdrom(
         )
     };
     if dp_status2 != EFI_SUCCESS {
-        unsafe { (bs.free_pool)(dp_ptr); }
+        // dp_ptr is NOT freed here - we still return it in the tuple
+        // The caller may need it even if the protocol install failed
     }
 
     // ═════════════════════════════════════════════════════════════

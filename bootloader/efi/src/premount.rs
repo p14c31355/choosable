@@ -35,7 +35,7 @@ pub trait EarlyBootFixup {
 pub struct CasperFixup;
 impl EarlyBootFixup for CasperFixup {
     fn build_initrd(&self, ctx: &BootContext, bs: &mut BootServices) -> Option<PremountBundle> {
-        let iso = ctx.selected_iso();
+        let iso = ctx.selected_iso()?;
         let rel = iso.file_start_lba - ctx.partition_start_lba;
         prepare_premount_initrd(bs, rel, true)
     }
@@ -44,7 +44,7 @@ impl EarlyBootFixup for CasperFixup {
 pub struct LiveBootFixup;
 impl EarlyBootFixup for LiveBootFixup {
     fn build_initrd(&self, ctx: &BootContext, bs: &mut BootServices) -> Option<PremountBundle> {
-        let iso = ctx.selected_iso();
+        let iso = ctx.selected_iso()?;
         let rel = iso.file_start_lba - ctx.partition_start_lba;
         prepare_premount_initrd(bs, rel, false)
     }
@@ -53,7 +53,7 @@ impl EarlyBootFixup for LiveBootFixup {
 pub struct DracutFixup;
 impl EarlyBootFixup for DracutFixup {
     fn build_initrd(&self, ctx: &BootContext, bs: &mut BootServices) -> Option<PremountBundle> {
-        let iso = ctx.selected_iso();
+        let iso = ctx.selected_iso()?;
         let rel = iso.file_start_lba - ctx.partition_start_lba;
         prepare_premount_initrd(bs, rel, false)
     }
@@ -151,8 +151,8 @@ while read -r major minor blocks name; do
   fi
   echo \"choosable: no content found on $name\" >/dev/console
   echo \"notfound $name\" >>/tmp/choosable.log
-  umount /cdrom 2>/dev/null
   umount /lib/live/mount/medium 2>/dev/null
+  umount /cdrom 2>/dev/null
   losetup -d \"$LOOP\" 2>/dev/null
 done < /proc/partitions
 echo 'choosable: gave up - no ISO found on any partition' >/dev/console

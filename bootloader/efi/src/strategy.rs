@@ -59,7 +59,8 @@ fn count_matching_lines(orig: &[u8]) -> (usize, usize) {
         if t.starts_with(b"linux ") || t.starts_with(b"linux\t")
             || t.starts_with(b"linuxefi ") || t.starts_with(b"linuxefi\t")
         { linux_count += 1; }
-        else if t.starts_with(b"initrd ") || t.starts_with(b"initrd\t") { initrd_count += 1; }
+        else if t.starts_with(b"initrd ") || t.starts_with(b"initrd\t")
+            || t.starts_with(b"initrdefi ") || t.starts_with(b"initrdefi\t") { initrd_count += 1; }
         if pos < orig.len() { pos += 1; }
     }
     (linux_count, initrd_count)
@@ -149,7 +150,8 @@ fn patch_grub_cfg_impl(
                     }
                 }
             }
-            else if (t.starts_with(b"initrd ") || t.starts_with(b"initrd\t"))
+            else if (t.starts_with(b"initrd ") || t.starts_with(b"initrd\t")
+                || t.starts_with(b"initrdefi ") || t.starts_with(b"initrdefi\t"))
                 && dedup_slice.len() <= line.len()
                 && !line.windows(dedup_slice.len()).any(|w| w == dedup_slice)
             {

@@ -19,14 +19,14 @@ pub trait BootStage {
     fn execute(&mut self, ctx: &mut BootContext) -> StageResult;
 }
 
-// ── Helper: extract &mut SystemTable from raw pointer ───────────────
-fn st_from_ctx(ctx: &BootContext) -> &mut SystemTable {
-    unsafe { &mut *ctx.system_table }
+// ── Helper: extract *mut SystemTable from raw pointer ───────────────
+fn st_from_ctx(ctx: &BootContext) -> *mut SystemTable {
+    ctx.system_table
 }
 
-// ── Helper: extract &mut BootServices from raw pointer ──────────────
-fn bs_from_ctx(ctx: &BootContext) -> &mut BootServices {
-    unsafe { &mut *st_from_ctx(ctx).boot_services }
+// ── Helper: extract *mut BootServices from raw pointer ──────────────
+fn bs_from_ctx(ctx: &BootContext) -> *mut BootServices {
+    unsafe { (*ctx.system_table).boot_services }
 }
 
 // ── Helper: extract BlockIo reference from ctx ──────────────────────
@@ -47,19 +47,19 @@ impl BootStage for DiscoverDiskStage {
         let image_handle = ctx.image_handle;
 
         // Banner — use raw pointer to avoid borrow issues
-        banner(st_from_ctx(ctx));
+        banner(unsafe { &mut *st_from_ctx(ctx) });
 
-        let disk_handle = match disk::find_disk_handle(bs_from_ctx(ctx), image_handle) {
+        let disk_handle = match disk::find_disk_handle(unsafe { &mut *bs_from_ctx(ctx) }, image_handle) {
             Some(h) => h,
             None => {
-                die(st_from_ctx(ctx), b"ERROR: No disk device found.\r\n\0");
+                die(unsafe { &mut *st_from_ctx(ctx) }, b"ERROR: No disk device found.\r\n\0");
                 loop { unsafe { core::arch::asm!("hlt") } }
             }
         };
 
         let mut bio: *mut BlockIoProtocol = core::ptr::null_mut();
         {
-            let bs = bs_from_ctx(ctx);
+            let bs = unsafe { &mut *bs_from_ctx(ctx) };
             if unsafe {
                 (bs.handle_protocol)(
                     disk_handle,
@@ -69,7 +69,7 @@ impl BootStage for DiscoverDiskStage {
             } != EFI_SUCCESS
                 || bio.is_null()
             {
-                die(st_from_ctx(ctx), b"ERROR: No Block I/O on disk.\r\n\0");
+                die(unsafe { &mut *st_from_ctx(ctx) }, b"ERROR: No Block I/O on disk.\r\n\0");
                 loop { unsafe { core::arch::asm!("hlt") } }
             }
         }
@@ -105,7 +105,7 @@ impl BootStage for DiscoverPartitionStage {
         // Read MBR
         let mut mbr: [u8; 512] = [0; 512];
         if !disk::read_sector(bio_ref, bio_ptr, mid, 0, &mut mbr) {
-            die(st_from_ctx(ctx), b"ERROR: Cannot read MBR.\r\n\0");
+            die(unsafe { &mut *st_from_ctx(ctx) }, b"ERROR: Cannot read MBR.\r\n\0");
             loop { unsafe { core::arch::asm!("hlt") } }
         }
 
@@ -133,19 +133,19 @@ impl BootStage for DiscoverPartitionStage {
         }
 
         if part1_lba == 0 && is_gpt {
-            let st = st_from_ctx(ctx);
+            let st = unsafe { &mut *st_from_ctx(ctx) };
             print_raw(st, b"GPT detected, searching for data partition...\r\n\0");
             part1_lba = disk::find_gpt_data_partition(st, bio_ref, bio_ptr, mid);
         }
         if part1_lba == 0 {
-            die(st_from_ctx(ctx), b"ERROR: No partition 1 found.\r\n\0");
+            die(unsafe { &mut *st_from_ctx(ctx) }, b"ERROR: No partition 1 found.\r\n\0");
             loop { unsafe { core::arch::asm!("hlt") } }
         }
 
         // Read partition 1 VBR
         let mut vbr: [u8; 512] = [0; 512];
         if !disk::read_sector(bio_ref, bio_ptr, mid, part1_lba, &mut vbr) {
-            die(st_from_ctx(ctx), b"ERROR: Cannot read partition 1.\r\n\0");
+            die(unsafe { &mut *st_from_ctx(ctx) }, b"ERROR: Cannot read partition 1.\r\n\0");
             loop { unsafe { core::arch::asm!("hlt") } }
         }
 
@@ -156,7 +156,7 @@ impl BootStage for DiscoverPartitionStage {
         } else if &vbr[0x52..0x5A] == b"FAT32   " {
             fs::FsType::Fat32
         } else {
-            let st = st_from_ctx(ctx);
+            let st = unsafe { &mut *st_from_ctx(ctx) };
             print_raw(st, b"Unknown filesystem on partition 1.\r\n\0");
             print_hex(st, b"  First 16 bytes: ", u64::from_le_bytes(vbr[0..8].try_into().unwrap()));
             print_hex(st, b"  ", u64::from_le_bytes(vbr[8..16].try_into().unwrap()));
@@ -190,7 +190,7 @@ impl BootStage for MountFilesystemStage {
 
         let mut vbr: [u8; 512] = [0; 512];
         if !disk::read_sector(bio_ref, bio_ptr, mid, part1_lba, &mut vbr) {
-            die(st_from_ctx(ctx), b"ERROR: Cannot re-read partition 1 VBR.\r\n\0");
+            die(unsafe { &mut *st_from_ctx(ctx) }, b"ERROR: Cannot re-read partition 1 VBR.\r\n\0");
             loop { unsafe { core::arch::asm!("hlt") } }
         }
 
@@ -212,7 +212,7 @@ impl BootStage for MountFilesystemStage {
             fs::FsType::Exfat => {
                 let spc_shift = vbr[109] as u32;
                 if spc_shift > 16 {
-                    die(st_from_ctx(ctx), b"ERROR: Invalid SectorsPerClusterShift.\r\n\0");
+                    die(unsafe { &mut *st_from_ctx(ctx) }, b"ERROR: Invalid SectorsPerClusterShift.\r\n\0");
                     loop { unsafe { core::arch::asm!("hlt") } }
                 }
                 let cluster_bytes = (1u32 << spc_shift) * 512;
@@ -227,12 +227,12 @@ impl BootStage for MountFilesystemStage {
                 fs_ctx.heap_start = part1_lba + heap_off;
                 fs_ctx.root_cluster = root_cluster;
 
-                print_raw(st_from_ctx(ctx), b"exFAT detected. Scanning...\r\n\0");
+                print_raw(unsafe { &mut *st_from_ctx(ctx) }, b"exFAT detected. Scanning...\r\n\0");
             }
             fs::FsType::Fat32 => {
                 let spc = vbr[13] as u32;
                 if spc == 0 {
-                    die(st_from_ctx(ctx), b"ERROR: Invalid sectors per cluster.\r\n\0");
+                    die(unsafe { &mut *st_from_ctx(ctx) }, b"ERROR: Invalid sectors per cluster.\r\n\0");
                     loop { unsafe { core::arch::asm!("hlt") } }
                 }
                 let reserved = u16::from_le_bytes([vbr[14], vbr[15]]) as u64;
@@ -249,12 +249,12 @@ impl BootStage for MountFilesystemStage {
                 fs_ctx.heap_start = data_start;
                 fs_ctx.root_cluster = root_cluster;
 
-                print_raw(st_from_ctx(ctx), b"FAT32 detected. Scanning...\r\n\0");
+                print_raw(unsafe { &mut *st_from_ctx(ctx) }, b"FAT32 detected. Scanning...\r\n\0");
             }
             fs::FsType::Ntfs => {
                 let spc = vbr[13] as u32;
                 if spc == 0 {
-                    die(st_from_ctx(ctx), b"ERROR: Invalid sectors per cluster.\r\n\0");
+                    die(unsafe { &mut *st_from_ctx(ctx) }, b"ERROR: Invalid sectors per cluster.\r\n\0");
                     loop { unsafe { core::arch::asm!("hlt") } }
                 }
                 let cluster_bytes = spc as u64 * 512;
@@ -269,7 +269,7 @@ impl BootStage for MountFilesystemStage {
                     0
                 };
                 if mft_record_size == 0 || mft_record_size > 4096 {
-                    die(st_from_ctx(ctx), b"ERROR: Invalid MFT record size.\r\n\0");
+                    die(unsafe { &mut *st_from_ctx(ctx) }, b"ERROR: Invalid MFT record size.\r\n\0");
                     loop { unsafe { core::arch::asm!("hlt") } }
                 }
 
@@ -280,7 +280,7 @@ impl BootStage for MountFilesystemStage {
                 fs_ctx.mft_record_size = mft_record_size;
                 fs_ctx.heap_start = part1_lba;
 
-                print_raw(st_from_ctx(ctx), b"NTFS detected. Scanning...\r\n\0");
+                print_raw(unsafe { &mut *st_from_ctx(ctx) }, b"NTFS detected. Scanning...\r\n\0");
             }
         }
 
@@ -309,7 +309,7 @@ impl BootStage for DiscoverPayloadStage {
         fs::scan_directory(bio_ref, bio_ptr, mid, fs_ctx_ref, &mut ctx.iso_files, &mut ctx.iso_count);
 
         if ctx.iso_count == 0 {
-            let st = st_from_ctx(ctx);
+            let st = unsafe { &mut *st_from_ctx(ctx) };
             print_raw(st, b"\r\nNo ISO files found on partition 1.\r\n\0");
             halt_or_reboot(st);
             loop { unsafe { core::arch::asm!("hlt") } }
@@ -367,7 +367,15 @@ impl BootStage for ExecuteBootStage {
     fn name(&self) -> &'static str { "ExecuteBoot" }
 
     fn execute(&mut self, ctx: &mut BootContext) -> StageResult {
-        ctx.selected_index = self.selected_index;
+        // Validate selected index before proceeding
+        if ctx.iso_count == 0 || self.selected_index >= ctx.iso_count || self.selected_index >= 64 {
+            let st = unsafe { &mut *st_from_ctx(ctx) };
+            print_raw(st, b"ERROR: Invalid ISO selection index.\r\n\0");
+            halt_or_reboot(st);
+            loop { unsafe { core::arch::asm!("hlt") } }
+        }
+
+        ctx.selected_index = Some(self.selected_index);
 
         let image_handle = ctx.image_handle;
         let disk_handle = ctx.disk_handle.expect("disk_handle must be set");

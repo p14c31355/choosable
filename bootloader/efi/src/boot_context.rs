@@ -42,7 +42,7 @@ pub struct BootContext {
     // ── Payload ───────────────────────────────────────────────────────
     pub iso_files: [IsoEntry; 64],
     pub iso_count: usize,
-    pub selected_index: usize,
+    pub selected_index: Option<usize>,
 
     // ── Locator ───────────────────────────────────────────────────────
     pub iso_location: Option<IsoLocation>,
@@ -61,13 +61,19 @@ impl BootContext {
             fs_ctx: None,
             iso_files: [IsoEntry { name: [0; 256], name_len: 0, file_start_lba: 0, file_size: 0 }; 64],
             iso_count: 0,
-            selected_index: 0,
+            selected_index: None,
             iso_location: None,
         }
     }
 
-    /// Returns the selected ISO entry (panics if none selected).
-    pub fn selected_iso(&self) -> &IsoEntry {
-        &self.iso_files[self.selected_index]
+    /// Returns the selected ISO entry, or None if no selection has been made.
+    pub fn selected_iso(&self) -> Option<&IsoEntry> {
+        self.selected_index.and_then(|idx| {
+            if idx < self.iso_count {
+                Some(&self.iso_files[idx])
+            } else {
+                None
+            }
+        })
     }
 }
