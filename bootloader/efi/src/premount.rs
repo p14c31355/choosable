@@ -140,25 +140,35 @@ mkdir -p \"$MNT\" 2>/dev/null
 if ! command -v losetup >/dev/null 2>&1; then
   echo 'choosable: losetup not found' >>/tmp/choosable.log
 fi
+# Write initial debug to /dev/console so it's visible even if /tmp isn't writable
+echo 'choosable: scanning partitions...' >/dev/console
 while read -r major minor blocks name; do
+  # Explicitly skip whole-disk devices so losetup uses partition-relative offsets.
   case \"$name\" in
-    loop*|ram*|dm-*) continue ;;
-    sd[a-z][0-9][0-9]*|nvme[0-9]*n[0-9]*p[0-9][0-9]*|mmcblk[0-9]*p[0-9][0-9]*|vd[a-z][0-9][0-9]*) ;;
+    loop*|ram*|dm-*|sr*) continue ;;
+    sd[a-z]|nvme[0-9]*n[0-9]|mmcblk[0-9]*|vd[a-z]|hd[a-z]) continue ;;
+    sd[a-z][0-9]*|nvme[0-9]*n[0-9]*p[0-9]*|mmcblk[0-9]*p[0-9]*|vd[a-z][0-9]*) ;;
     *) continue ;;
   esac
   dev=\"/dev/$name\"
   [ -b \"$dev\" ] || continue
+  echo \"choosable: trying $name\" >/dev/console
   echo \"try $name\" >>/tmp/choosable.log
   LOOP=$(losetup -f 2>/dev/null) || continue
   [ -n \"$LOOP\" ] || continue
   losetup -o OFFSET \"$LOOP\" \"$dev\" 2>>/tmp/choosable.log || continue
+  sleep 1
   echo \"loopok $name\" >>/tmp/choosable.log
-  mount -t iso9660 -o ro \"$LOOP\" \"$MNT\" 2>>/tmp/choosable.log || continue
+  mount -t iso9660 -o ro \"$LOOP\" \"$MNT\" 2>>/tmp/choosable.log || {
+    echo \"choosable: mount iso9660 failed on $name\" >/dev/console
+    continue
+  }
   echo \"mntok $name\" >>/tmp/choosable.log
   # Bind-mount to casper's expected path
   mount -o bind \"$MNT\" /cdrom 2>>/tmp/choosable.log
   # Bind-mount to live-boot's expected path
   mount -o bind \"$MNT\" /lib/live/mount/medium 2>>/tmp/choosable.log
+  echo \"choosable: mounted ISO at /cdrom from $name\" >/dev/console
   # Check for recognizable ISO content at either location
   FOUND=0
   for d in \"$MNT\" /cdrom; do
@@ -173,16 +183,22 @@ while read -r major minor blocks name; do
     fi
   done
   if [ \"$FOUND\" = \"1\" ]; then
+    echo \"choosable: FOUND content on $name\" >/dev/console
     echo \"found $name\" >>/tmp/choosable.log
     return 0
   fi
+  echo \"choosable: no content found on $name\" >/dev/console
   echo \"notfound $name\" >>/tmp/choosable.log
   umount /cdrom 2>/dev/null
   umount /lib/live/mount/medium 2>/dev/null
   umount \"$MNT\" 2>/dev/null
   losetup -d \"$LOOP\" 2>/dev/null
 done < /proc/partitions
+echo 'choosable: gave up - no ISO found on any partition' >/dev/console
 echo 'gaveup' >>/tmp/choosable.log
+# Do NOT return 1 - casper hook runner may abort the entire chain on non-zero.
+# Let the built-in 20iso_scan run as fallback.
+return 0
 ";
 
     let off_str = format_decimal_u64(offset_bytes);

@@ -1,15 +1,6 @@
 // ═══════════════════════════════════════════════════════════════════════════
 //  ISO Boot Strategy — patches grub.cfg for filesystem-independent boot
 // ═══════════════════════════════════════════════════════════════════════════
-//
-//  Patches both "linux" and "initrd" lines:
-//    linux  → appends "boot=casper rootwait rootdelay=300 debug"
-//    initrd → appends " /choosable/premount.cpio"
-//
-//  The premount cpio is a synthetic file on the virtual CD-ROM that
-//  creates a loop device from the raw partition at the known ISO offset.
-//  It works on any filesystem (exFAT, NTFS, ext4, ReFS) because it
-//  bypasses the filesystem layer entirely via losetup -o $OFFSET.
 
 use core::ffi::c_void;
 use crate::iso_fs::IsoFsCtx;
@@ -22,10 +13,6 @@ pub struct PatchInput<'a> {
     pub bs: *mut BootServices,
     pub live_media_uuid: &'a [u8; 10],
     pub iso_location: Option<&'a IsoLocation>,
-    /// ISO9660 name of the file whose directory entry was overwritten for
-    /// premount cpio injection (e.g. "MD5SUM.TXT" or "UBUNTU").
-    /// Used to construct the initrd line injection dynamically so GRUB
-    /// finds the synthetic file under its original name.
     pub premount_target_name: &'a [u8],
 }
 
@@ -39,163 +26,267 @@ pub trait BootStrategy: Sync {
     fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> { let _ = inp; None }
 }
 
-fn allocate_output(bs: &mut BootServices, orig_len: usize, extra: usize) -> Option<(*mut u8, usize)> {
-    let new_size = orig_len + extra + 256;
+fn allocate_output(bs: &mut BootServices, size: usize) -> Option<(*mut u8, usize)> {
     let mut ptr: *mut c_void = core::ptr::null_mut();
-    let status = unsafe { (bs.allocate_pool)(MemoryType::EfiLoaderData, new_size, &mut ptr) };
-    if status != EFI_SUCCESS || ptr.is_null() { return None; }
-    Some((ptr as *mut u8, new_size))
+    if unsafe { (bs.allocate_pool)(MemoryType::EfiLoaderData, size, &mut ptr) } != EFI_SUCCESS || ptr.is_null() { return None; }
+    Some((ptr as *mut u8, size))
 }
 
-/// Count matching linux/initrd lines in the original grub.cfg to determine
-/// how much extra space is needed for all injections.
-fn count_matching_lines(orig: &[u8]) -> (usize, usize) {
-    let mut linux_count = 0;
-    let mut initrd_count = 0;
+fn matches_any_lower(name: &[u8], patterns: &[&[u8]]) -> bool {
+    patterns.iter().any(|pat| name.windows(pat.len()).any(|w| {
+        w.iter().zip(pat.iter()).all(|(&a, &b)| (a | 0x20) == b)
+    }))
+}
+
+// ── Helpers: find the extent of a `key=value` token in a line ─────
+fn find_token_extent(line: &[u8], key: &[u8]) -> Option<(usize, usize)> {
+    // returns (strip_start, strip_end) where strip_start may include
+    // a leading space.
+    if let Some(pos) = line.windows(key.len()).position(|w| w == key) {
+        let mut end = pos + key.len();
+        while end < line.len() && line[end] != b' ' && line[end] != b'\t'
+            && line[end] != b'\n' && line[end] != b'\r'
+        { end += 1; }
+        let start = if pos > 0 && line[pos - 1] == b' ' { pos - 1 } else { pos };
+        Some((start, end))
+    } else {
+        None
+    }
+}
+
+/// Check whether a line starts with a linux/linuxefi command (after trimming).
+fn is_linux_line(line: &[u8]) -> bool {
+    let mut ts = 0;
+    while ts < line.len() && (line[ts] == b' ' || line[ts] == b'\t') { ts += 1; }
+    if ts >= line.len() { return false; }
+    let t = &line[ts..];
+    t.starts_with(b"linux ") || t.starts_with(b"linux\t")
+        || t.starts_with(b"linuxefi ") || t.starts_with(b"linuxefi\t")
+}
+
+/// Compute total extra bytes needed for injections (minus stripped tokens).
+fn compute_extra(
+    orig: &[u8],
+    linux_extra: &[u8],
+    linux_eol_extra: &[u8],
+    initrd_extra: &[u8],
+    initrd_dedup: &[u8],
+) -> usize {
+    let mut extra: isize = 0;
+    let strip_keys: &[&[u8]] = &[b"iso-scan/filename=", b"findiso="];
     let mut pos = 0;
     while pos < orig.len() {
-        let start = pos;
-        while pos < orig.len() && orig[pos] != b'\n' {
-            pos += 1;
+        let ls = pos;
+        while pos < orig.len() && orig[pos] != b'\n' { pos += 1; }
+        let line = &orig[ls..pos];
+
+        if is_linux_line(line) {
+            extra += linux_extra.len() as isize;
+            if !linux_eol_extra.is_empty() {
+                extra += linux_eol_extra.len() as isize;
+            }
+            for &key in strip_keys {
+                if let Some((s, e)) = find_token_extent(line, key) {
+                    extra -= (e - s) as isize;
+                }
+            }
+        } else {
+            let mut ts = 0;
+            while ts < line.len() && (line[ts] == b' ' || line[ts] == b'\t') { ts += 1; }
+            if ts < line.len() && (line[ts..].starts_with(b"initrd ") || line[ts..].starts_with(b"initrd\t"))
+                && initrd_dedup.len() <= line.len()
+                && !line.windows(initrd_dedup.len()).any(|w| w == initrd_dedup)
+            {
+                extra += initrd_extra.len() as isize;
+            }
         }
-        let line = &orig[start..pos];
-        let mut ts = 0;
-        while ts < line.len() && (line[ts] == b' ' || line[ts] == b'\t') {
-            ts += 1;
-        }
-        let t = &line[ts..];
-        if t.starts_with(b"linux ") || t.starts_with(b"linux\t")
-            || t.starts_with(b"linuxefi ") || t.starts_with(b"linuxefi\t")
-        {
-            linux_count += 1;
-        } else if t.starts_with(b"initrd ") || t.starts_with(b"initrd\t") {
-            initrd_count += 1;
-        }
-        if pos < orig.len() {
-            pos += 1; // skip \n
-        }
+        if pos < orig.len() { pos += 1; }
     }
-    (linux_count, initrd_count)
+    if extra < 0 { extra = 0; }
+    extra as usize
 }
 
 fn patch_grub_cfg_impl(
     inp: &PatchInput,
     linux_extra: &[u8],
-    linux_eol_extra: &[u8],   // injected at END of linux line (overrides earlier params)
+    linux_eol_extra: &[u8],
     premount_target_name: &[u8],
 ) -> Option<PatchOutput> {
     let bs = unsafe { &mut *inp.bs };
     let orig = inp.original;
 
-    // Use the premount target name if set, otherwise fall back to
-    // "PREMOUNT.CPIO" — the SFS layer always serves synthetic cpio data
-    // under this name when premount_cpio_buf is set.
-    let effective_target: &[u8] = if premount_target_name.is_empty() {
-        b"PREMOUNT.CPIO"
-    } else {
-        premount_target_name
-    };
+    let effective_target: &[u8] = if premount_target_name.is_empty() { b"PREMOUNT.CPIO" } else { premount_target_name };
 
-    // Build " /<target_name>" for initrd line injection.
     let mut initrd_extra_buf = [0u8; 32];
-    initrd_extra_buf[0] = b' ';
-    initrd_extra_buf[1] = b'/';
+    initrd_extra_buf[0] = b' '; initrd_extra_buf[1] = b'/';
     let name_len = effective_target.len().min(30);
     initrd_extra_buf[2..2 + name_len].copy_from_slice(&effective_target[..name_len]);
     let initrd_extra = &initrd_extra_buf[..2 + name_len];
 
-    // Build "/<target_name>" for dedup check.
     let mut dedup_buf = [0u8; 32];
     dedup_buf[0] = b'/';
     dedup_buf[1..1 + name_len].copy_from_slice(&effective_target[..name_len]);
-    let dedup_slice = &dedup_buf[..1 + name_len];
+    let initrd_dedup = &dedup_buf[..1 + name_len];
 
-    // Build the full eol extra string: prefix (" findiso=" or " iso-scan/filename=")
-    // followed by the ISO file path from the locator (if available).
-    // This ensures the kernel cmdline has a non-empty path.
+    // Build eol extra with path
     let iso_path: Option<&[u8]> = inp.iso_location.map(|loc| loc.path());
-    let mut eol_extra_with_path_buf = [0u8; 320];
-    let eol_extra_with_path: &[u8] = if !linux_eol_extra.is_empty() && linux_eol_extra.ends_with(b"=") {
+    let mut eol_buf = [0u8; 320];
+    let eol_extra_dynamic: &[u8] = if !linux_eol_extra.is_empty() && linux_eol_extra.ends_with(b"=") {
         if let Some(path) = iso_path {
-            let prefix_len = linux_eol_extra.len();
-            let path_len = path.len().min(320 - prefix_len);
-            eol_extra_with_path_buf[..prefix_len].copy_from_slice(linux_eol_extra);
-            eol_extra_with_path_buf[prefix_len..prefix_len + path_len].copy_from_slice(&path[..path_len]);
-            &eol_extra_with_path_buf[..prefix_len + path_len]
-        } else {
-            linux_eol_extra
-        }
-    } else {
-        linux_eol_extra
-    };
+            let plen = linux_eol_extra.len();
+            let pl = path.len().min(320 - plen);
+            eol_buf[..plen].copy_from_slice(linux_eol_extra);
+            eol_buf[plen..plen + pl].copy_from_slice(&path[..pl]);
+            &eol_buf[..plen + pl]
+        } else { linux_eol_extra }
+    } else { linux_eol_extra };
 
-    // Count matching lines first so the output buffer is large enough for
-    // all injections (typical grub.cfg has multiple menu entries).
-    let (linux_count, initrd_count) = count_matching_lines(orig);
-    let extra = linux_count * (linux_extra.len() + eol_extra_with_path.len())
-        + initrd_count * initrd_extra.len();
-    let (out_ptr, out_cap) = allocate_output(bs, orig.len(), extra)?;
+    let extra = compute_extra(orig, linux_extra, eol_extra_dynamic, initrd_extra, initrd_dedup);
+    let (out_ptr, out_cap) = allocate_output(bs, orig.len() + extra + 256)?;
     let out = unsafe { core::slice::from_raw_parts_mut(out_ptr, out_cap) };
 
+    let strip_keys: &[&[u8]] = &[b"iso-scan/filename=", b"findiso="];
     let mut src = 0usize;
     let mut dst = 0usize;
 
     while src < orig.len() {
-        let ch = orig[src];
-        out[dst] = ch;
-        dst += 1;
-        src += 1;
+        // look ahead to find if this is a linux line with tokens to strip
+        if is_linux_line(&orig[src..]) {
+            // find end of line
+            let mut line_end = src;
+            while line_end < orig.len() && orig[line_end] != b'\n' { line_end += 1; }
+            let line = &orig[src..line_end];
 
-        if ch == b'\n' || src == orig.len() {
-            let line_start = if dst > 0 {
-                let mut ls = dst - 1;
-                while ls > 0 && out[ls - 1] != b'\n' { ls -= 1; }
-                ls
-            } else { 0 };
-            let line = &out[line_start..dst];
-
-            // Trim leading whitespace
-            let mut ts = 0;
-            while ts < line.len() && (line[ts] == b' ' || line[ts] == b'\t') { ts += 1; }
-            let t = &line[ts..];
-
-            // ── linux / linuxefi lines ──
-            if (t.starts_with(b"linux ") || t.starts_with(b"linux\t")
-                || t.starts_with(b"linuxefi ") || t.starts_with(b"linuxefi\t"))
-                && !line.windows(linux_extra.len()).any(|w| w == linux_extra)
-            {
-                // EOL extra ALWAYS needs injection — it overrides earlier
-                // params via kernel last-wins rule even if a similar string
-                // appears earlier (e.g. findiso= overrides findiso=${isopath}).
-                let needs_eol = !eol_extra_with_path.is_empty();
-                let inject_at = find_second_arg_end(line_start, out, dst);
-                shift_and_inject(out, inject_at, &mut dst, linux_extra);
-                // Also inject eol_extra at end of line (overrides earlier
-                // values like iso-scan/filename=/path via kernel's last-wins rule).
-                if needs_eol {
-                    if dst > 0 && out[dst - 1] == b'\n' {
-                        shift_and_inject(out, dst - 1, &mut dst, eol_extra_with_path);
-                    } else {
-                        out[dst..dst + eol_extra_with_path.len()].copy_from_slice(eol_extra_with_path);
-                        dst += eol_extra_with_path.len();
+            // Compute which byte ranges to skip
+            let mut skip_ranges: [(usize, usize); 4] = [(0,0), (0,0), (0,0), (0,0)];
+            let mut sr_count = 0;
+            for &key in strip_keys {
+                if let Some((s, e)) = find_token_extent(line, key) {
+                    if sr_count < 4 {
+                        skip_ranges[sr_count] = (s, e);
+                        sr_count += 1;
                     }
                 }
             }
-            // ── initrd lines ──
-            else if (t.starts_with(b"initrd ") || t.starts_with(b"initrd\t"))
-                && dedup_slice.len() <= line.len()
-                && !line.windows(dedup_slice.len()).any(|w| w == dedup_slice)
+            // sort by start
+            for i in 0..sr_count {
+                for j in i+1..sr_count {
+                    if skip_ranges[i].0 > skip_ranges[j].0 {
+                        let tmp = skip_ranges[i];
+                        skip_ranges[i] = skip_ranges[j];
+                        skip_ranges[j] = tmp;
+                    }
+                }
+            }
+
+            // Copy line byte-by-byte, skipping stripped ranges
+            let mut lp = 0usize;
+            while lp < line.len() {
+                let ch = line[lp];
+                // check if lp falls in any skip range
+                let mut skip = false;
+                for i in 0..sr_count {
+                    if lp >= skip_ranges[i].0 && lp < skip_ranges[i].1 {
+                        skip = true;
+                        // advance lp to end of this skip range
+                        lp = skip_ranges[i].1;
+                        break;
+                    }
+                }
+                if skip { continue; }
+                out[dst] = ch;
+                dst += 1;
+                lp += 1;
+            }
+
+            // Now inject linux_extra after the second arg
+            // Find the line in output buffer
+            let line_start = dst - line.len() + {
+                let mut stripped_total = 0usize;
+                for i in 0..sr_count {
+                    stripped_total += skip_ranges[i].1 - skip_ranges[i].0;
+                }
+                stripped_total
+            }; // approximate — we'll recalculate
+            // Actually, find the real line_start by scanning back
+            let mut line_start = if dst > 0 { dst - 1 } else { 0 };
+            // Scan back to find the beginning of this line in the output
+            // The line in output starts at position (dst - bytes_copied_so_far_for_this_line)
+            // We know we started with line.len() bytes and removed some
+            let bytes_before = {
+                let mut n = 0usize;
+                let mut i = src;
+                while i < line_end {
+                    let mut skip_this = false;
+                    for r in 0..sr_count {
+                        let rel = i - src;
+                        if rel >= skip_ranges[r].0 && rel < skip_ranges[r].1 {
+                            skip_this = true;
+                            i = src + skip_ranges[r].1;
+                            break;
+                        }
+                    }
+                    if !skip_this { n += 1; i += 1; }
+                }
+                n
+            };
+            line_start = dst.saturating_sub(bytes_before);
+
+            // Check dedup: only inject if linux_extra not already present
+            let existing = &out[line_start..dst];
+            if !existing.windows(linux_extra.len()).any(|w| w == linux_extra) {
+                // inject after second arg
+                let inject_at = find_second_arg_end(line_start, out, dst);
+                shift_and_inject(out, inject_at, &mut dst, linux_extra);
+                if !eol_extra_dynamic.is_empty() {
+                    if dst > 0 && out[dst - 1] == b'\n' {
+                        shift_and_inject(out, dst - 1, &mut dst, eol_extra_dynamic);
+                    } else {
+                        out[dst..dst + eol_extra_dynamic.len()].copy_from_slice(eol_extra_dynamic);
+                        dst += eol_extra_dynamic.len();
+                    }
+                }
+            }
+
+            // Copy the newline if present
+            if line_end < orig.len() {
+                out[dst] = orig[line_end];
+                dst += 1;
+            }
+            src = line_end + if line_end < orig.len() { 1 } else { 0 };
+        } else {
+            // Non-linux line: copy verbatim, then check for initrd injection
+            let ls = src;
+            while src < orig.len() && orig[src] != b'\n' {
+                out[dst] = orig[src];
+                dst += 1;
+                src += 1;
+            }
+            // copy newline
+            if src < orig.len() {
+                out[dst] = orig[src];
+                dst += 1;
+                src += 1;
+            }
+
+            let line_end = dst;
+            let line_start = if line_end > 0 {
+                let mut lls = line_end - 1;
+                while lls > 0 && out[lls - 1] != b'\n' { lls -= 1; }
+                lls
+            } else { 0 };
+            let line = &out[line_start..line_end];
+
+            let mut ts = 0;
+            while ts < line.len() && (line[ts] == b' ' || line[ts] == b'\t') { ts += 1; }
+            if ts < line.len() && (line[ts..].starts_with(b"initrd ") || line[ts..].starts_with(b"initrd\t"))
+                && initrd_dedup.len() <= line.len()
+                && !line.windows(initrd_dedup.len()).any(|w| w == initrd_dedup)
             {
-                // Inject before the line ending:
-                //   "initrd /path\n" → "initrd /path /<target_name>\n"
                 let mut inject_at = dst;
-                // Step back over \n
                 if dst > 0 && out[dst - 1] == b'\n' {
                     inject_at -= 1;
-                    // Step back over \r if present (\r\n)
-                    if dst > 1 && out[dst - 2] == b'\r' {
-                        inject_at -= 1;
-                    }
+                    if dst > 1 && out[dst - 2] == b'\r' { inject_at -= 1; }
                 }
                 shift_and_inject(out, inject_at, &mut dst, initrd_extra);
             }
@@ -205,8 +296,6 @@ fn patch_grub_cfg_impl(
     Some(PatchOutput { buf: out_ptr, size: dst })
 }
 
-/// Find position after the second whitespace-separated token on the line
-/// (linux [kernel_path] → inject after vmlinuz path)
 fn find_second_arg_end(line_start: usize, out: &[u8], dst: usize) -> usize {
     let mut pos = line_start;
     while pos < dst && (out[pos] == b' ' || out[pos] == b'\t') { pos += 1; }
@@ -225,12 +314,6 @@ fn shift_and_inject(out: &mut [u8], inject_at: usize, dst: &mut usize, data: &[u
     *dst += data.len();
 }
 
-fn matches_any_lower(name: &[u8], patterns: &[&[u8]]) -> bool {
-    patterns.iter().any(|pat| name.windows(pat.len()).any(|w| {
-        w.iter().zip(pat.iter()).all(|(&a, &b)| (a | 0x20) == b)
-    }))
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
 //  CasperStrategy (Ubuntu, Mint, Pop!_OS)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -239,17 +322,19 @@ pub struct CasperStrategy;
 
 impl BootStrategy for CasperStrategy {
     fn detect(&self, ctx: &IsoFsCtx) -> bool {
-        matches_any_lower(
-            &ctx.iso_name[..ctx.iso_name_len],
-            &[b"ubuntu", b"mint", b"pop"],
-        )
+        matches_any_lower(&ctx.iso_name[..ctx.iso_name_len], &[b"ubuntu", b"mint", b"pop"])
     }
 
     fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> {
+        // Premount hook mounts ISO at /cdrom via losetup.
+        // iso-scan/filename= acts as safety net — if the hook failed,
+        // iso-scan has a path to search for. Existing
+        // iso-scan/filename= tokens in the original grub.cfg are
+        // STRIPPED before we inject our own.
         patch_grub_cfg_impl(
             inp,
             b" boot=casper",             // inject after vmlinuz
-            b" iso-scan/filename=",      // inject at END to override original iso-scan/filename=...
+            b" iso-scan/filename=",      // eol; path auto-appended from IsoLocation
             inp.premount_target_name,
         )
     }
@@ -265,17 +350,14 @@ pub struct LiveBootStrategy;
 
 impl BootStrategy for LiveBootStrategy {
     fn detect(&self, ctx: &IsoFsCtx) -> bool {
-        matches_any_lower(
-            &ctx.iso_name[..ctx.iso_name_len],
-            &[b"debian"],
-        )
+        matches_any_lower(&ctx.iso_name[..ctx.iso_name_len], &[b"debian"])
     }
 
     fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> {
         patch_grub_cfg_impl(
             inp,
-            b" boot=live",               // inject after vmlinuz
-            b" findiso=",                // inject at END to override original findiso=${iso_path}
+            b" boot=live live-media=removable", // inject after vmlinuz
+            b" findiso=",                // eol; path auto-appended
             inp.premount_target_name,
         )
     }
@@ -291,19 +373,11 @@ pub struct LiveOSStrategy;
 
 impl BootStrategy for LiveOSStrategy {
     fn detect(&self, ctx: &IsoFsCtx) -> bool {
-        matches_any_lower(
-            &ctx.iso_name[..ctx.iso_name_len],
-            &[b"fedora", b"rhel", b"centos"],
-        )
+        matches_any_lower(&ctx.iso_name[..ctx.iso_name_len], &[b"fedora", b"rhel", b"centos"])
     }
 
     fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> {
-        patch_grub_cfg_impl(
-            inp,
-            b" rd.live.image rootdelay=300",
-            b"",                         // no eol override needed
-            inp.premount_target_name,
-        )
+        patch_grub_cfg_impl(inp, b" rd.live.image rootdelay=300", b"", inp.premount_target_name)
     }
 }
 
