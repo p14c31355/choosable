@@ -128,7 +128,6 @@ fn build_premount_script(offset_bytes: u64) -> [u8; 2048] {
     // IMPORTANT: This script is sourced by the hook runner (casper or
     // live-boot).  Use 'return', NEVER 'exit' — exit kills the runner.
     let src = b"\
-#!/bin/sh
 echo 'choosable OFFSET start' >/tmp/choosable.log
 # Load essential kernel modules (may not be auto-loaded in all initramfs environments)
 modprobe loop 2>/dev/null
@@ -143,11 +142,12 @@ fi
 # Write initial debug to /dev/console so it's visible even if /tmp isn't writable
 echo 'choosable: scanning partitions...' >/dev/console
 while read -r major minor blocks name; do
-  # Explicitly skip whole-disk devices so losetup uses partition-relative offsets.
+  # Skip non-block, virtual, and whole-disk devices.
+  # Whole disks end with a letter (e.g. sda, sdb, nvme0n1, vda).
+  # Partitions end with a digit (e.g. sda1, sdb2, nvme0n1p3, vda1).
   case \"$name\" in
     loop*|ram*|dm-*|sr*) continue ;;
-    sd[a-z]|nvme[0-9]*n[0-9]|mmcblk[0-9]*|vd[a-z]|hd[a-z]) continue ;;
-    sd[a-z][0-9]*|nvme[0-9]*n[0-9]*p[0-9]*|mmcblk[0-9]*p[0-9]*|vd[a-z][0-9]*) ;;
+    *[0-9]) ;;
     *) continue ;;
   esac
   dev=\"/dev/$name\"

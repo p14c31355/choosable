@@ -326,15 +326,18 @@ impl BootStrategy for CasperStrategy {
     }
 
     fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> {
-        // Premount hook mounts ISO at /cdrom via losetup.
-        // iso-scan/filename= acts as safety net — if the hook failed,
-        // iso-scan has a path to search for. Existing
-        // iso-scan/filename= tokens in the original grub.cfg are
-        // STRIPPED before we inject our own.
+        // Premount hook (00choosable) mounts the ISO at /cdrom via
+        // losetup BEFORE casper runs.  Casper then finds /cdrom already
+        // populated and proceeds.
+        //
+        // CRITICAL: Do NOT inject iso-scan/filename=.  That parameter
+        // causes casper's 20iso_scan to mount the real USB partition
+        // (fails on exFAT/NTFS) and report "Could not find iso" even
+        // when /cdrom is already working.  Premount handles everything.
         patch_grub_cfg_impl(
             inp,
             b" boot=casper",             // inject after vmlinuz
-            b" iso-scan/filename=",      // eol; path auto-appended from IsoLocation
+            b"",                         // no eol override
             inp.premount_target_name,
         )
     }
