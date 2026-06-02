@@ -342,21 +342,13 @@ impl BootStage for SelectPayloadStage {
         let mid = ctx.media_id;
         let fs_ctx_ref = ctx.fs_ctx.as_ref().expect("fs_ctx must be set");
         let iso_count = ctx.iso_count;
-        let st_ptr: *mut SystemTable = ctx.system_table;
-
-        // iso::show_menu takes &[IsoEntry; 64] — use raw pointer
-        // derived from ctx.iso_files BEFORE taking &mut SystemTable.
-        // SAFETY: iso_files is never moved; the pointer remains valid
-        // through the entire call.
-        let iso_files_ptr: *const fs::IsoEntry = ctx.iso_files.as_ptr();
-        let st = unsafe { &mut *st_ptr };
-        let iso_files_ref = unsafe { &*(iso_files_ptr as *const [fs::IsoEntry; 64]) };
+        let st = unsafe { &mut *ctx.system_table };
 
         iso::show_menu(
             st,
             image_handle,
             disk_handle,
-            iso_files_ref,
+            &ctx.iso_files,
             iso_count,
             fs_ctx_ref,
             bio_ref,
@@ -389,18 +381,14 @@ impl BootStage for ExecuteBootStage {
         let bio_ref = unsafe { &*bio_ptr };
         let mid = ctx.media_id;
         let selected_index = self.selected_index;
-        let st_ptr: *mut SystemTable = ctx.system_table;
-        let iso_files_ptr: *const fs::IsoEntry = ctx.iso_files.as_ptr();
-
-        let st = unsafe { &mut *st_ptr };
-        let iso_files_ref = unsafe { &*(iso_files_ptr as *const [fs::IsoEntry; 64]) };
+        let st = unsafe { &mut *ctx.system_table };
 
         iso::boot_iso(
             st,
             image_handle,
             disk_handle,
             partition_start_lba,
-            iso_files_ref,
+            &ctx.iso_files,
             selected_index,
             bio_ref,
             bio_ptr,

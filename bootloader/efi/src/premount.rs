@@ -236,7 +236,15 @@ pub fn prepare_premount_initrd(
     let script = build_premount_script(offset_bytes, needs_sr_mod);
     let script_len = script.iter().position(|&c| c == 0).unwrap_or(4095);
 
-    let cpio_estimate = 12288usize;
+    let entry_size = |name_len: usize, data_len: usize| -> usize {
+        let padded_name_len = ((110 + name_len + 1 + 3) & !3) - 110;
+        110 + padded_name_len + data_len + 3
+    };
+    let cpio_estimate = entry_size(24, script_len)  // scripts/live/00choosable
+        + entry_size(33, script_len)  // scripts/live-premount/00choosable
+        + entry_size(35, script_len)  // scripts/casper-premount/00choosable
+        + entry_size(33, script_len)  // scripts/casper-bottom/00choosable
+        + entry_size(10, 0);          // TRAILER!!!
     let mut cpio_ptr: *mut c_void = core::ptr::null_mut();
     if unsafe { (bs.allocate_pool)(MemoryType::EfiLoaderData, cpio_estimate, &mut cpio_ptr) } != EFI_SUCCESS || cpio_ptr.is_null() { return None; }
     let cpio = unsafe { core::slice::from_raw_parts_mut(cpio_ptr as *mut u8, cpio_estimate) };
