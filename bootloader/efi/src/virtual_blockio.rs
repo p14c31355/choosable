@@ -75,7 +75,7 @@ pub struct IsoMedia {
 
 impl VirtualMedia for IsoMedia {
     fn read_block(&self, block_lba: u64, dst: &mut [u8], dst_offset: usize) -> bool {
-        if block_lba >= self.total_blocks {
+        if block_lba >= self.total_blocks || dst_offset + 2048 > dst.len() {
             return false;
         }
         let disk_lba = self.iso_lba + block_lba * 4;
