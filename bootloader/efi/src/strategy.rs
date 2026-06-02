@@ -110,10 +110,29 @@ fn patch_grub_cfg_impl(
     dedup_buf[1..1 + name_len].copy_from_slice(&effective_target[..name_len]);
     let dedup_slice = &dedup_buf[..1 + name_len];
 
+    // Build the full eol extra string: prefix (" findiso=" or " iso-scan/filename=")
+    // followed by the ISO file path from the locator (if available).
+    // This ensures the kernel cmdline has a non-empty path.
+    let iso_path: Option<&[u8]> = inp.iso_location.map(|loc| loc.path());
+    let mut eol_extra_with_path_buf = [0u8; 320];
+    let eol_extra_with_path: &[u8] = if !linux_eol_extra.is_empty() && linux_eol_extra.ends_with(b"=") {
+        if let Some(path) = iso_path {
+            let prefix_len = linux_eol_extra.len();
+            let path_len = path.len().min(320 - prefix_len);
+            eol_extra_with_path_buf[..prefix_len].copy_from_slice(linux_eol_extra);
+            eol_extra_with_path_buf[prefix_len..prefix_len + path_len].copy_from_slice(&path[..path_len]);
+            &eol_extra_with_path_buf[..prefix_len + path_len]
+        } else {
+            linux_eol_extra
+        }
+    } else {
+        linux_eol_extra
+    };
+
     // Count matching lines first so the output buffer is large enough for
     // all injections (typical grub.cfg has multiple menu entries).
     let (linux_count, initrd_count) = count_matching_lines(orig);
-    let extra = linux_count * (linux_extra.len() + linux_eol_extra.len())
+    let extra = linux_count * (linux_extra.len() + eol_extra_with_path.len())
         + initrd_count * initrd_extra.len();
     let (out_ptr, out_cap) = allocate_output(bs, orig.len(), extra)?;
     let out = unsafe { core::slice::from_raw_parts_mut(out_ptr, out_cap) };
@@ -148,17 +167,17 @@ fn patch_grub_cfg_impl(
                 // EOL extra ALWAYS needs injection — it overrides earlier
                 // params via kernel last-wins rule even if a similar string
                 // appears earlier (e.g. findiso= overrides findiso=${isopath}).
-                let needs_eol = !linux_eol_extra.is_empty();
+                let needs_eol = !eol_extra_with_path.is_empty();
                 let inject_at = find_second_arg_end(line_start, out, dst);
                 shift_and_inject(out, inject_at, &mut dst, linux_extra);
                 // Also inject eol_extra at end of line (overrides earlier
                 // values like iso-scan/filename=/path via kernel's last-wins rule).
                 if needs_eol {
                     if dst > 0 && out[dst - 1] == b'\n' {
-                        shift_and_inject(out, dst - 1, &mut dst, linux_eol_extra);
+                        shift_and_inject(out, dst - 1, &mut dst, eol_extra_with_path);
                     } else {
-                        out[dst..dst + linux_eol_extra.len()].copy_from_slice(linux_eol_extra);
-                        dst += linux_eol_extra.len();
+                        out[dst..dst + eol_extra_with_path.len()].copy_from_slice(eol_extra_with_path);
+                        dst += eol_extra_with_path.len();
                     }
                 }
             }
