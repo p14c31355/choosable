@@ -28,9 +28,6 @@ extern "efiapi" fn efi_main(
     image_handle: *mut c_void,
     system_table: *mut protocol::SystemTable,
 ) -> ! {
-    // ── Banner ──────────────────────────────────────────────────────
-    output::banner(unsafe { &mut *system_table });
-
     // ── Initialize boot context ─────────────────────────────────────
     let mut ctx = BootContext::new(image_handle, system_table);
 
