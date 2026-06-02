@@ -95,8 +95,6 @@ modprobe loop 2>/dev/null
 modprobe iso9660 2>/dev/null
 SRMOD
 mkdir -p /cdrom /lib/live/mount/medium 2>/dev/null
-MNT=/mnt/choosable
-mkdir -p \"$MNT\" 2>/dev/null
 if ! command -v losetup >/dev/null 2>&1; then
   echo 'choosable: losetup not found' >>/tmp/choosable.log
 fi
@@ -135,7 +133,7 @@ while read -r major minor blocks name; do
   mount -o bind /cdrom /lib/live/mount/medium 2>>/tmp/choosable.log
   echo \"choosable: mounted ISO at /cdrom from $name\" >/dev/console
   FOUND=0
-  for d in \"$MNT\" /cdrom; do
+  for d in /cdrom; do
     if [ -f \"$d/casper/filesystem.squashfs\" ] || \
        [ -f \"$d/casper/filesystem.squashfs.gpg\" ] || \
        [ -f \"$d/live/filesystem.squashfs\" ] || \
@@ -155,7 +153,6 @@ while read -r major minor blocks name; do
   echo \"notfound $name\" >>/tmp/choosable.log
   umount /cdrom 2>/dev/null
   umount /lib/live/mount/medium 2>/dev/null
-  umount \"$MNT\" 2>/dev/null
   losetup -d \"$LOOP\" 2>/dev/null
 done < /proc/partitions
 echo 'choosable: gave up - no ISO found on any partition' >/dev/console

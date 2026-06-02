@@ -128,6 +128,7 @@ fn patch_grub_cfg_impl(
             if (t.starts_with(b"linux ") || t.starts_with(b"linux\t")
                 || t.starts_with(b"linuxefi ") || t.starts_with(b"linuxefi\t"))
                 && !line.windows(linux_extra.len()).any(|w| w == linux_extra)
+                && !linux_extra.is_empty()
             {
                 let needs_eol = !eol_extra_dynamic.is_empty();
                 let inject_at = find_second_arg_end(line_start, out, dst);

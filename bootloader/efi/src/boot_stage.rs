@@ -307,7 +307,7 @@ impl BootStage for DiscoverPayloadStage {
         let fs_ctx_ref = ctx.fs_ctx.as_ref().expect("fs_ctx must be set");
 
         let mut iso_count: usize = 0;
-        let mut iso_files: [fs::IsoEntry; 64] = unsafe { core::mem::zeroed() };
+        let mut iso_files: [fs::IsoEntry; 64] = [fs::IsoEntry { name: [0; 256], name_len: 0, file_start_lba: 0, file_size: 0 }; 64];
         fs::scan_directory(bio_ref, bio_ptr, mid, fs_ctx_ref, &mut iso_files, &mut iso_count);
 
         ctx.iso_files = iso_files;
