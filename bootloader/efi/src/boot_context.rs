@@ -59,7 +59,7 @@ impl BootContext {
             partition_start_lba: 0,
             fs_type: None,
             fs_ctx: None,
-            iso_files: unsafe { core::mem::zeroed() },
+            iso_files: [IsoEntry { name: [0; 256], name_len: 0, file_start_lba: 0, file_size: 0 }; 64],
             iso_count: 0,
             selected_index: 0,
             iso_location: None,
