@@ -69,14 +69,41 @@ impl IsoLocation {
     }
 }
 
-/// Trait for resolving the physical location of an ISO.
+/// Trait for resolving the physical location of a boot payload.
 ///
-/// Choosable knows exactly where the ISO lives; this trait exposes that
-/// information as an `IsoLocation`.  Implementations can cover local
-/// block devices, HTTP sources, PXE targets, RAM disks, etc.
+/// Choosable knows exactly where the payload lives; this trait exposes that
+/// information.  Implementations can cover local block devices, HTTP sources,
+/// PXE targets, RAM disks, etc.
 pub trait IsoLocator: Sync {
     /// Resolve and return the ISO's location.
     fn locate(&self) -> IsoLocation;
+}
+
+/// Generalized boot payload locator.
+///
+/// Abstraction over `IsoLocator`, `WimLocator`, `VhdLocator`, `EfiLocator`
+/// — anything that can produce a physical location for a boot payload.
+/// This is the trait used by strategy dispatch and boot preparation.
+pub trait BootPayloadLocator: Sync {
+    type Location;
+
+    /// Resolve and return the payload's physical location.
+    fn locate(&self) -> Self::Location;
+
+    /// Human-readable type name for logging (e.g. "ISO", "WIM", "VHD").
+    fn payload_type(&self) -> &'static str;
+}
+
+impl BootPayloadLocator for FileBackedIsoLocator {
+    type Location = IsoLocation;
+
+    fn locate(&self) -> IsoLocation {
+        self.location
+    }
+
+    fn payload_type(&self) -> &'static str {
+        "ISO"
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

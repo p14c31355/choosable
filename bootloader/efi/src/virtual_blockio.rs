@@ -23,6 +23,90 @@ use crate::protocol::{
     DEVICE_PATH_PROTOCOL_GUID, SIMPLE_FILE_SYSTEM_PROTOCOL_GUID,
 };
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  VirtualMedia trait — abstract over virtual block devices
+// ═══════════════════════════════════════════════════════════════════════════
+//
+//  All virtual media types (ISO, IMG, VHD, RAM disk) implement this trait
+//  so they can be served through the same EFI Block I/O protocol.
+//
+//  Implementations:
+//    IsoMedia   — ISO 9660 filesystem served from an ISO file
+//    ImgMedia   — raw disk image (.img)
+//    VhdMedia   — virtual hard disk (.vhd, .vhdx)
+//    RamMedia   — RAM disk (for synthetic files like premount cpio)
+
+/// Abstracts block-level read access to a virtual medium.
+///
+/// The trait decouples the UEFI Block I/O protocol machinery from
+/// the actual data source, making it easy to add new media types.
+pub trait VirtualMedia {
+    /// Read a single 2048-byte logical block at `block_lba` into `dst`
+    /// at `dst_offset`.  Returns `true` on success.
+    fn read_block(&self, block_lba: u64, dst: &mut [u8], dst_offset: usize) -> bool;
+
+    /// Returns the total number of blocks on this medium.
+    fn block_count(&self) -> u64;
+
+    /// Returns the block size in bytes (typically 2048 for optical media).
+    fn block_size(&self) -> u32;
+
+    /// Media type name for logging (e.g. "ISO", "IMG", "VHD").
+    fn media_type(&self) -> &'static str;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  IsoMedia — ISO backed by a real disk extent
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Virtual medium backed by an ISO file on a physical block device.
+///
+/// Reads are translated from virtual CD-ROM LBA to physical disk LBA.
+pub struct IsoMedia {
+    /// ISO file start LBA on the physical disk
+    pub iso_lba: u64,
+    /// Physical Block I/O protocol pointer
+    pub real_bio_ptr: *mut BlockIoProtocol,
+    /// Physical media ID
+    pub real_media_id: u32,
+    /// Total number of 2048-byte blocks in the ISO
+    pub total_blocks: u64,
+}
+
+impl VirtualMedia for IsoMedia {
+    fn read_block(&self, block_lba: u64, dst: &mut [u8], dst_offset: usize) -> bool {
+        if block_lba >= self.total_blocks {
+            return false;
+        }
+        // Guard against overflow: check that dst_offset + 2048 won't overflow and is in bounds
+        if dst_offset > dst.len() || dst.len() - dst_offset < 2048 {
+            return false;
+        }
+        let disk_lba = self.iso_lba + block_lba * 4;
+        unsafe {
+            ((*self.real_bio_ptr).read_blocks)(
+                self.real_bio_ptr,
+                self.real_media_id,
+                disk_lba,
+                2048,
+                dst.as_mut_ptr().add(dst_offset) as *mut c_void,
+            ) == EFI_SUCCESS
+        }
+    }
+
+    fn block_count(&self) -> u64 {
+        self.total_blocks
+    }
+
+    fn block_size(&self) -> u32 {
+        2048
+    }
+
+    fn media_type(&self) -> &'static str {
+        "ISO"
+    }
+}
+
 /// ReadBlocks implementation for the virtual CD-ROM.
 /// Helper: patch ISO9660 directory entry extent + data length (LE + BE)
 fn patch_dir_entry(entry: &mut [u8], off: usize, new_extent: u32, new_size: u32) {
@@ -294,7 +378,8 @@ pub fn create_virtual_cdrom(
         )
     };
     if dp_status2 != EFI_SUCCESS {
-        unsafe { (bs.free_pool)(dp_ptr); }
+        // dp_ptr is NOT freed here - we still return it in the tuple
+        // The caller may need it even if the protocol install failed
     }
 
     // ═════════════════════════════════════════════════════════════
