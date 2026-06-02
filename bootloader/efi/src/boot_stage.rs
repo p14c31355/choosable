@@ -306,14 +306,9 @@ impl BootStage for DiscoverPayloadStage {
 
         let fs_ctx_ref = ctx.fs_ctx.as_ref().expect("fs_ctx must be set");
 
-        let mut iso_count: usize = 0;
-        let mut iso_files: [fs::IsoEntry; 64] = [fs::IsoEntry { name: [0; 256], name_len: 0, file_start_lba: 0, file_size: 0 }; 64];
-        fs::scan_directory(bio_ref, bio_ptr, mid, fs_ctx_ref, &mut iso_files, &mut iso_count);
+        fs::scan_directory(bio_ref, bio_ptr, mid, fs_ctx_ref, &mut ctx.iso_files, &mut ctx.iso_count);
 
-        ctx.iso_files = iso_files;
-        ctx.iso_count = iso_count;
-
-        if iso_count == 0 {
+        if ctx.iso_count == 0 {
             let st = st_from_ctx(ctx);
             print_raw(st, b"\r\nNo ISO files found on partition 1.\r\n\0");
             halt_or_reboot(st);
