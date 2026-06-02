@@ -130,13 +130,20 @@ fn build_premount_script(offset_bytes: u64) -> [u8; 2048] {
     let src = b"\
 #!/bin/sh
 echo 'choosable OFFSET start' >/tmp/choosable.log
+# Load essential kernel modules (may not be auto-loaded in all initramfs environments)
+modprobe loop 2>/dev/null
+modprobe iso9660 2>/dev/null
 mkdir -p /cdrom /lib/live/mount/medium 2>/dev/null
 MNT=/mnt/choosable
 mkdir -p \"$MNT\" 2>/dev/null
+# Check that losetup is available; fall through gracefully if not.
+if ! command -v losetup >/dev/null 2>&1; then
+  echo 'choosable: losetup not found' >>/tmp/choosable.log
+fi
 while read -r major minor blocks name; do
   case \"$name\" in
     loop*|ram*|dm-*) continue ;;
-    sd[a-z][0-9]*|nvme[0-9]*n[0-9]*p[0-9]*|mmcblk[0-9]*p[0-9]*|vd[a-z][0-9]*) ;;
+    sd[a-z][0-9][0-9]*|nvme[0-9]*n[0-9]*p[0-9][0-9]*|mmcblk[0-9]*p[0-9][0-9]*|vd[a-z][0-9][0-9]*) ;;
     *) continue ;;
   esac
   dev=\"/dev/$name\"
