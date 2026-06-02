@@ -21,89 +21,68 @@ pub struct PatchOutput {
     pub size: usize,
 }
 
+/// Hook injection target directories.
+/// Each strategy specifies which initramfs hooks to inject.
+pub struct HookTargetSet {
+    /// Scripts/live/ hooks (Debian live-boot main)
+    pub live: bool,
+    /// Scripts/live-premount/ hooks (Debian live-boot premount)
+    pub live_premount: bool,
+    /// Scripts/casper-premount/ hooks (Ubuntu casper premount)
+    pub casper_premount: bool,
+    /// Scripts/casper-bottom/ hooks (Ubuntu casper bottom)
+    pub casper_bottom: bool,
+}
+
 pub trait BootStrategy: Sync {
+    /// Detect whether this strategy applies to the given ISO.
     fn detect(&self, ctx: &IsoFsCtx) -> bool;
+
+    /// Patch the kernel command line (linux_extra + linux_eol_extra).
     fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> { let _ = inp; None }
-}
 
-fn allocate_output(bs: &mut BootServices, size: usize) -> Option<(*mut u8, usize)> {
-    let mut ptr: *mut c_void = core::ptr::null_mut();
-    if unsafe { (bs.allocate_pool)(MemoryType::EfiLoaderData, size, &mut ptr) } != EFI_SUCCESS || ptr.is_null() { return None; }
-    Some((ptr as *mut u8, size))
-}
-
-fn matches_any_lower(name: &[u8], patterns: &[&[u8]]) -> bool {
-    patterns.iter().any(|pat| name.windows(pat.len()).any(|w| {
-        w.iter().zip(pat.iter()).all(|(&a, &b)| (a | 0x20) == b)
-    }))
-}
-
-// ── Helpers: find the extent of a `key=value` token in a line ─────
-fn find_token_extent(line: &[u8], key: &[u8]) -> Option<(usize, usize)> {
-    // returns (strip_start, strip_end) where strip_start may include
-    // a leading space.
-    if let Some(pos) = line.windows(key.len()).position(|w| w == key) {
-        let mut end = pos + key.len();
-        while end < line.len() && line[end] != b' ' && line[end] != b'\t'
-            && line[end] != b'\n' && line[end] != b'\r'
-        { end += 1; }
-        let start = if pos > 0 && line[pos - 1] == b' ' { pos - 1 } else { pos };
-        Some((start, end))
-    } else {
-        None
+    /// Return the set of hook directories to inject premount scripts into.
+    fn hook_targets(&self) -> HookTargetSet {
+        // Default: inject into all four directories (covers both Debian and Ubuntu)
+        HookTargetSet {
+            live: true,
+            live_premount: true,
+            casper_premount: true,
+            casper_bottom: true,
+        }
     }
+
+    /// Whether to include "modprobe sr_mod" in the hook script.
+    /// Required for Ubuntu casper which checks for optical drives via sr_mod.
+    fn needs_sr_mod(&self) -> bool { false }
 }
 
-/// Check whether a line starts with a linux/linuxefi command (after trimming).
-fn is_linux_line(line: &[u8]) -> bool {
-    let mut ts = 0;
-    while ts < line.len() && (line[ts] == b' ' || line[ts] == b'\t') { ts += 1; }
-    if ts >= line.len() { return false; }
-    let t = &line[ts..];
-    t.starts_with(b"linux ") || t.starts_with(b"linux\t")
-        || t.starts_with(b"linuxefi ") || t.starts_with(b"linuxefi\t")
+fn allocate_output(bs: &mut BootServices, orig_len: usize, extra: usize) -> Option<(*mut u8, usize)> {
+    let new_size = orig_len + extra + 256;
+    let mut ptr: *mut c_void = core::ptr::null_mut();
+    let status = unsafe { (bs.allocate_pool)(MemoryType::EfiLoaderData, new_size, &mut ptr) };
+    if status != EFI_SUCCESS || ptr.is_null() { return None; }
+    Some((ptr as *mut u8, new_size))
 }
 
-/// Compute total extra bytes needed for injections (minus stripped tokens).
-fn compute_extra(
-    orig: &[u8],
-    linux_extra: &[u8],
-    linux_eol_extra: &[u8],
-    initrd_extra: &[u8],
-    initrd_dedup: &[u8],
-) -> usize {
-    let mut extra: isize = 0;
-    let strip_keys: &[&[u8]] = &[b"iso-scan/filename=", b"findiso="];
+fn count_matching_lines(orig: &[u8]) -> (usize, usize) {
+    let mut linux_count = 0;
+    let mut initrd_count = 0;
     let mut pos = 0;
     while pos < orig.len() {
-        let ls = pos;
+        let start = pos;
         while pos < orig.len() && orig[pos] != b'\n' { pos += 1; }
-        let line = &orig[ls..pos];
-
-        if is_linux_line(line) {
-            extra += linux_extra.len() as isize;
-            if !linux_eol_extra.is_empty() {
-                extra += linux_eol_extra.len() as isize;
-            }
-            for &key in strip_keys {
-                if let Some((s, e)) = find_token_extent(line, key) {
-                    extra -= (e - s) as isize;
-                }
-            }
-        } else {
-            let mut ts = 0;
-            while ts < line.len() && (line[ts] == b' ' || line[ts] == b'\t') { ts += 1; }
-            if ts < line.len() && (line[ts..].starts_with(b"initrd ") || line[ts..].starts_with(b"initrd\t"))
-                && initrd_dedup.len() <= line.len()
-                && !line.windows(initrd_dedup.len()).any(|w| w == initrd_dedup)
-            {
-                extra += initrd_extra.len() as isize;
-            }
-        }
+        let line = &orig[start..pos];
+        let mut ts = 0;
+        while ts < line.len() && (line[ts] == b' ' || line[ts] == b'\t') { ts += 1; }
+        let t = &line[ts..];
+        if t.starts_with(b"linux ") || t.starts_with(b"linux\t")
+            || t.starts_with(b"linuxefi ") || t.starts_with(b"linuxefi\t")
+        { linux_count += 1; }
+        else if t.starts_with(b"initrd ") || t.starts_with(b"initrd\t") { initrd_count += 1; }
         if pos < orig.len() { pos += 1; }
     }
-    if extra < 0 { extra = 0; }
-    extra as usize
+    (linux_count, initrd_count)
 }
 
 fn patch_grub_cfg_impl(
@@ -126,9 +105,8 @@ fn patch_grub_cfg_impl(
     let mut dedup_buf = [0u8; 32];
     dedup_buf[0] = b'/';
     dedup_buf[1..1 + name_len].copy_from_slice(&effective_target[..name_len]);
-    let initrd_dedup = &dedup_buf[..1 + name_len];
+    let dedup_slice = &dedup_buf[..1 + name_len];
 
-    // Build eol extra with path
     let iso_path: Option<&[u8]> = inp.iso_location.map(|loc| loc.path());
     let mut eol_buf = [0u8; 320];
     let eol_extra_dynamic: &[u8] = if !linux_eol_extra.is_empty() && linux_eol_extra.ends_with(b"=") {
@@ -141,104 +119,40 @@ fn patch_grub_cfg_impl(
         } else { linux_eol_extra }
     } else { linux_eol_extra };
 
-    let extra = compute_extra(orig, linux_extra, eol_extra_dynamic, initrd_extra, initrd_dedup);
-    let (out_ptr, out_cap) = allocate_output(bs, orig.len() + extra + 256)?;
+    let (linux_count, initrd_count) = count_matching_lines(orig);
+    let extra = linux_count * (linux_extra.len() + eol_extra_dynamic.len())
+        + initrd_count * initrd_extra.len();
+    let (out_ptr, out_cap) = allocate_output(bs, orig.len(), extra)?;
     let out = unsafe { core::slice::from_raw_parts_mut(out_ptr, out_cap) };
 
-    let strip_keys: &[&[u8]] = &[b"iso-scan/filename=", b"findiso="];
     let mut src = 0usize;
     let mut dst = 0usize;
 
     while src < orig.len() {
-        // look ahead to find if this is a linux line with tokens to strip
-        if is_linux_line(&orig[src..]) {
-            // find end of line
-            let mut line_end = src;
-            while line_end < orig.len() && orig[line_end] != b'\n' { line_end += 1; }
-            let line = &orig[src..line_end];
+        let ch = orig[src];
+        out[dst] = ch;
+        dst += 1;
+        src += 1;
 
-            // Compute which byte ranges to skip
-            let mut skip_ranges: [(usize, usize); 4] = [(0,0), (0,0), (0,0), (0,0)];
-            let mut sr_count = 0;
-            for &key in strip_keys {
-                if let Some((s, e)) = find_token_extent(line, key) {
-                    if sr_count < 4 {
-                        skip_ranges[sr_count] = (s, e);
-                        sr_count += 1;
-                    }
-                }
-            }
-            // sort by start
-            for i in 0..sr_count {
-                for j in i+1..sr_count {
-                    if skip_ranges[i].0 > skip_ranges[j].0 {
-                        let tmp = skip_ranges[i];
-                        skip_ranges[i] = skip_ranges[j];
-                        skip_ranges[j] = tmp;
-                    }
-                }
-            }
+        if ch == b'\n' || src == orig.len() {
+            let line_start = if dst > 0 {
+                let mut ls = dst - 1;
+                while ls > 0 && out[ls - 1] != b'\n' { ls -= 1; }
+                ls
+            } else { 0 };
+            let line = &out[line_start..dst];
+            let mut ts = 0;
+            while ts < line.len() && (line[ts] == b' ' || line[ts] == b'\t') { ts += 1; }
+            let t = &line[ts..];
 
-            // Copy line byte-by-byte, skipping stripped ranges
-            let mut lp = 0usize;
-            while lp < line.len() {
-                let ch = line[lp];
-                // check if lp falls in any skip range
-                let mut skip = false;
-                for i in 0..sr_count {
-                    if lp >= skip_ranges[i].0 && lp < skip_ranges[i].1 {
-                        skip = true;
-                        // advance lp to end of this skip range
-                        lp = skip_ranges[i].1;
-                        break;
-                    }
-                }
-                if skip { continue; }
-                out[dst] = ch;
-                dst += 1;
-                lp += 1;
-            }
-
-            // Now inject linux_extra after the second arg
-            // Find the line in output buffer
-            let line_start = dst - line.len() + {
-                let mut stripped_total = 0usize;
-                for i in 0..sr_count {
-                    stripped_total += skip_ranges[i].1 - skip_ranges[i].0;
-                }
-                stripped_total
-            }; // approximate — we'll recalculate
-            // Actually, find the real line_start by scanning back
-            let mut line_start = if dst > 0 { dst - 1 } else { 0 };
-            // Scan back to find the beginning of this line in the output
-            // The line in output starts at position (dst - bytes_copied_so_far_for_this_line)
-            // We know we started with line.len() bytes and removed some
-            let bytes_before = {
-                let mut n = 0usize;
-                let mut i = src;
-                while i < line_end {
-                    let mut skip_this = false;
-                    for r in 0..sr_count {
-                        let rel = i - src;
-                        if rel >= skip_ranges[r].0 && rel < skip_ranges[r].1 {
-                            skip_this = true;
-                            i = src + skip_ranges[r].1;
-                            break;
-                        }
-                    }
-                    if !skip_this { n += 1; i += 1; }
-                }
-                n
-            };
-            line_start = dst.saturating_sub(bytes_before);
-
-            // Check dedup: only inject if linux_extra not already present
-            let existing = &out[line_start..dst];
-            if !existing.windows(linux_extra.len()).any(|w| w == linux_extra) {
-                // inject after second arg
+            if (t.starts_with(b"linux ") || t.starts_with(b"linux\t")
+                || t.starts_with(b"linuxefi ") || t.starts_with(b"linuxefi\t"))
+                && !line.windows(linux_extra.len()).any(|w| w == linux_extra)
+            {
+                let needs_eol = !eol_extra_dynamic.is_empty();
                 let inject_at = find_second_arg_end(line_start, out, dst);
                 shift_and_inject(out, inject_at, &mut dst, linux_extra);
-                if !eol_extra_dynamic.is_empty() {
+                if needs_eol {
                     if dst > 0 && out[dst - 1] == b'\n' {
                         shift_and_inject(out, dst - 1, &mut dst, eol_extra_dynamic);
                     } else {
@@ -247,41 +161,9 @@ fn patch_grub_cfg_impl(
                     }
                 }
             }
-
-            // Copy the newline if present
-            if line_end < orig.len() {
-                out[dst] = orig[line_end];
-                dst += 1;
-            }
-            src = line_end + if line_end < orig.len() { 1 } else { 0 };
-        } else {
-            // Non-linux line: copy verbatim, then check for initrd injection
-            let ls = src;
-            while src < orig.len() && orig[src] != b'\n' {
-                out[dst] = orig[src];
-                dst += 1;
-                src += 1;
-            }
-            // copy newline
-            if src < orig.len() {
-                out[dst] = orig[src];
-                dst += 1;
-                src += 1;
-            }
-
-            let line_end = dst;
-            let line_start = if line_end > 0 {
-                let mut lls = line_end - 1;
-                while lls > 0 && out[lls - 1] != b'\n' { lls -= 1; }
-                lls
-            } else { 0 };
-            let line = &out[line_start..line_end];
-
-            let mut ts = 0;
-            while ts < line.len() && (line[ts] == b' ' || line[ts] == b'\t') { ts += 1; }
-            if ts < line.len() && (line[ts..].starts_with(b"initrd ") || line[ts..].starts_with(b"initrd\t"))
-                && initrd_dedup.len() <= line.len()
-                && !line.windows(initrd_dedup.len()).any(|w| w == initrd_dedup)
+            else if (t.starts_with(b"initrd ") || t.starts_with(b"initrd\t"))
+                && dedup_slice.len() <= line.len()
+                && !line.windows(dedup_slice.len()).any(|w| w == dedup_slice)
             {
                 let mut inject_at = dst;
                 if dst > 0 && out[dst - 1] == b'\n' {
@@ -314,6 +196,12 @@ fn shift_and_inject(out: &mut [u8], inject_at: usize, dst: &mut usize, data: &[u
     *dst += data.len();
 }
 
+fn matches_any_lower(name: &[u8], patterns: &[&[u8]]) -> bool {
+    patterns.iter().any(|pat| name.windows(pat.len()).any(|w| {
+        w.iter().zip(pat.iter()).all(|(&a, &b)| (a | 0x20) == b)
+    }))
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  CasperStrategy (Ubuntu, Mint, Pop!_OS)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -326,27 +214,36 @@ impl BootStrategy for CasperStrategy {
     }
 
     fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> {
-        // Premount hook (00choosable) mounts the ISO at /cdrom via
-        // losetup BEFORE casper runs.  Casper then finds /cdrom already
-        // populated and proceeds.
-        //
-        // CRITICAL: Do NOT inject iso-scan/filename=.  That parameter
-        // causes casper's 20iso_scan to mount the real USB partition
-        // (fails on exFAT/NTFS) and report "Could not find iso" even
-        // when /cdrom is already working.  Premount handles everything.
+        // live-media=LABEL=Choosable tells casper the real USB device.
+        // iso-scan/filename= tells casper which ISO file on that device.
         patch_grub_cfg_impl(
             inp,
-            b" boot=casper",             // inject after vmlinuz
-            b"",                         // no eol override
+            b" boot=casper live-media=LABEL=Choosable",
+            b" iso-scan/filename=",
             inp.premount_target_name,
         )
+    }
+
+    /// Ubuntu casper checks /sys/block for sr0 (optical drive).
+    /// modprobe sr_mod creates the sr0 device node before casper runs.
+    fn needs_sr_mod(&self) -> bool { true }
+
+    /// Only inject into casper hooks; Debian live-boot hooks are
+    /// unnecessary for Ubuntu and may conflict with casper.
+    fn hook_targets(&self) -> HookTargetSet {
+        HookTargetSet {
+            live: false,
+            live_premount: false,
+            casper_premount: true,
+            casper_bottom: true,
+        }
     }
 }
 
 unsafe impl Sync for CasperStrategy {}
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  LiveBootStrategy (Debian Live — uses boot=live, NOT boot=casper)
+//  LiveBootStrategy (Debian Live)
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub struct LiveBootStrategy;
@@ -359,10 +256,24 @@ impl BootStrategy for LiveBootStrategy {
     fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> {
         patch_grub_cfg_impl(
             inp,
-            b" boot=live live-media=removable", // inject after vmlinuz
-            b" findiso=",                // eol; path auto-appended
+            b" boot=live live-media=removable",
+            b" findiso=",
             inp.premount_target_name,
         )
+    }
+
+    /// Debian live-boot does NOT use sr_mod; it's unnecessary overhead.
+    fn needs_sr_mod(&self) -> bool { false }
+
+    /// Inject into live-boot hook directories only; casper hooks are
+    /// unnecessary for Debian and may conflict with live-boot.
+    fn hook_targets(&self) -> HookTargetSet {
+        HookTargetSet {
+            live: true,
+            live_premount: true,
+            casper_premount: false,
+            casper_bottom: false,
+        }
     }
 }
 
@@ -402,4 +313,16 @@ pub fn patch_grub_cfg(ctx: &IsoFsCtx, original: &[u8], bs: *mut BootServices, is
         iso_location,
         premount_target_name: &ctx.premount_target_name[..ctx.premount_target_name_len],
     })
+}
+
+/// Returns the active strategy's hook targets (which directories to inject into).
+pub fn get_hook_targets(ctx: &IsoFsCtx) -> HookTargetSet {
+    let strategy: &dyn BootStrategy = STRATEGIES.iter().find(|s| s.detect(ctx)).copied().unwrap_or(&CasperStrategy);
+    strategy.hook_targets()
+}
+
+/// Returns whether the active strategy needs sr_mod loaded.
+pub fn needs_sr_mod(ctx: &IsoFsCtx) -> bool {
+    let strategy: &dyn BootStrategy = STRATEGIES.iter().find(|s| s.detect(ctx)).copied().unwrap_or(&CasperStrategy);
+    strategy.needs_sr_mod()
 }

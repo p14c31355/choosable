@@ -778,7 +778,7 @@ fn uefi_chainload_iso(
     };
 
     // ── Build premount cpio ──────────────────────────────────────────
-    let premount_bundle = crate::premount::prepare_premount_initrd(bs, iso_lba - part1_lba);
+    let premount_bundle = crate::premount::prepare_premount_initrd(bs, iso_lba - part1_lba, true);
     if premount_bundle.is_none() {
         print_raw(st, b"[premount] allocation failed, skipping\r\n\0");
     }
