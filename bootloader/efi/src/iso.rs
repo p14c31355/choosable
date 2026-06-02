@@ -758,7 +758,7 @@ fn uefi_chainload_iso(
     bio_ref: &BlockIoProtocol,
     bio_ptr: *mut BlockIoProtocol,
     mid: u32,
-) {
+) -> ! {
     let iso_lba = files[idx].file_start_lba;
     let iso_size = files[idx].file_size;
     let bs = unsafe { &mut *st.boot_services };
@@ -773,7 +773,7 @@ fn uefi_chainload_iso(
         Some((h, dp, vb, sfs)) => (h, dp, vb, sfs),
         None => {
             print_raw(st, b"ERROR: Failed to create virtual CD-ROM.\r\n\0");
-            return;
+            halt_or_reboot(st);
         }
     };
 
@@ -904,14 +904,14 @@ fn uefi_chainload_iso(
         Some(v) => v,
         None => {
             print_raw(st, b"ERROR: /EFI/BOOT/BOOTX64.EFI not found in ISO.\r\n\0");
-            return;
+            halt_or_reboot(st);
         }
     };
     let (buf_ptr, buf_len) = match read_extent(bs, bio_ref, bio_ptr, mid, iso_lba, efi_lba, efi_size) {
         Some(v) => v,
         None => {
             print_raw(st, b"ERROR: Failed to read EFI executable.\r\n\0");
-            return;
+            halt_or_reboot(st);
         }
     };
     let device_path = build_iso_device_path(bs, iso_size);
@@ -924,7 +924,7 @@ fn uefi_chainload_iso(
     } != EFI_SUCCESS {
         print_raw(st, b"ERROR: LoadImage failed.\r\n\0");
         unsafe { (bs.free_pool)(buf_ptr as _); (bs.free_pool)(device_path); }
-        return;
+        halt_or_reboot(st);
     }
     unsafe { (bs.free_pool)(buf_ptr as _); }
 
@@ -933,6 +933,7 @@ fn uefi_chainload_iso(
         unsafe {
             (*lip).device_handle = device_handle;
             (*lip).file_path = device_path;
+            (*lip).parent_handle = image_handle;
         }
     }
     print_raw(st, b"Starting EFI image...\r\n\0");
@@ -1008,9 +1009,11 @@ pub fn show_menu(
             let idx = (ch - b'1') as usize;
             if idx < count {
                 boot_iso(st, image_handle, disk_handle, ctx.part1_lba, files, idx, bio_ref, bio_ptr, mid);
+                halt_or_reboot(st); // boot_iso returned — fatal error
             }
         } else if ch == b'0' && count >= 10 {
             boot_iso(st, image_handle, disk_handle, ctx.part1_lba, files, 9, bio_ref, bio_ptr, mid);
+            halt_or_reboot(st); // boot_iso returned — fatal error
         } else if ch == b'r' || ch == b'R' {
             print_raw(st, b"\r\nRe-scanning...\r\n\0");
             let mut new_files: [IsoEntry; 64] = unsafe { core::mem::zeroed() };
