@@ -936,7 +936,13 @@ fn uefi_chainload_iso(
         }
     }
     print_raw(st, b"Starting EFI image...\r\n\0");
-    unsafe { (bs.start_image)(child_handle, &mut 0u64, &mut core::ptr::null_mut::<u16>()); }
+    let status = unsafe { (bs.start_image)(child_handle, &mut 0u64, &mut core::ptr::null_mut::<u16>()) };
+    if status != EFI_SUCCESS {
+        print_raw(st, b"ERROR: StartImage returned \0");
+        print_dec(st, status as u64);
+        print_raw(st, b"\r\n\0");
+    }
+    halt_or_reboot(st);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
