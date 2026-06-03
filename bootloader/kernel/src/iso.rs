@@ -47,7 +47,11 @@ fn parse_el_torito(
     for i in 0..(512 / 32) {
         let off = i * 32;
         let etype = catalog[off];
-        if etype == 0x88 || etype == 0x90 {
+        // Only accept BootEntry (0x88), not SectionHeader (0x90/0x91).
+        // Also verify platform_id == 0x00 (BIOS/x86) so we don't
+        // accidentally load a UEFI ESP as a BIOS boot sector.
+        let platform = catalog[off + 4];
+        if etype == 0x88 && platform == 0x00 {
             let count = u16::from_le_bytes([catalog[off + 6], catalog[off + 7]]);
             let image_iso_lba = u32::from_le_bytes([
                 catalog[off + 8], catalog[off + 9], catalog[off + 10], catalog[off + 11],
