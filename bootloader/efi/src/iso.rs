@@ -13,7 +13,7 @@ use core::ffi::c_void;
 
 use crate::disk::read_sector;
 use crate::fs::{IsoEntry, FsCtx};
-use crate::output::{format_u64_buf, halt_or_reboot, print_dec, print_raw};
+use crate::output::{format_u64_buf, halt_or_reboot, print_dec, print_hex, print_raw};
 use crate::protocol::{
     BlockIoProtocol, BootServices, LoadedImageProtocol, MemoryType, SystemTable,
     DevicePathProtocol, VirtualBlockIo, EFI_SUCCESS, LOADED_IMAGE_PROTOCOL_GUID,
@@ -920,13 +920,22 @@ fn uefi_chainload_iso(
     };
     let device_path = build_iso_device_path(bs, iso_size);
     print_raw(st, b"Loading EFI image...\r\n\0");
+    print_raw(st, b"EFI image size=\0");
+    print_dec(st, buf_len as u64);
+    print_raw(st, b" bytes\r\n\0");
 
+    // UEFI spec: when SourceBuffer is non-NULL, FilePath may be NULL.
+    // InsydeH2O may reject a synthetic DevicePath, so pass NULL.
     let mut child_handle: *mut c_void = core::ptr::null_mut();
-    if unsafe {
-        (bs.load_image)(false, image_handle, device_path as *mut DevicePathProtocol,
+    let load_status = unsafe {
+        (bs.load_image)(false, image_handle, core::ptr::null_mut(),
             buf_ptr, buf_len as u64, &mut child_handle)
-    } != EFI_SUCCESS {
-        print_raw(st, b"ERROR: LoadImage failed.\r\n\0");
+    };
+    if load_status != EFI_SUCCESS {
+        print_hex(st, b"ERROR: LoadImage failed, status=0x", load_status as u64);
+        print_raw(st, b"\r\nEFI size=\0");
+        print_dec(st, buf_len as u64);
+        print_raw(st, b" bytes\r\n\0");
         unsafe { (bs.free_pool)(buf_ptr as _); (bs.free_pool)(device_path); }
         halt_or_reboot(st);
     }
@@ -940,11 +949,40 @@ fn uefi_chainload_iso(
             (*lip).parent_handle = image_handle;
         }
     }
-    print_raw(st, b"StartImage...\r\n\0");
+    print_raw(st, b"Press any key to start...\r\n\0");
+    {
+        let bs_ref = unsafe { &mut *st.boot_services };
+        if !st.con_in.is_null() {
+            let ci = unsafe { &mut *(st.con_in as *mut crate::protocol::SimpleTextInput) };
+            loop {
+                let mut k = crate::protocol::Key { sc: 0, uc: 0 };
+                if unsafe { (ci.read_key_stroke)(ci as *mut _, &mut k) } == EFI_SUCCESS {
+                    break;
+                }
+                unsafe { (bs_ref.stall)(100_000) };
+            }
+        }
+    }
+    print_raw(st, b"Starting...\r\n\0");
     let status = unsafe { (bs.start_image)(child_handle, &mut 0u64, &mut core::ptr::null_mut::<u16>()) };
     print_raw(st, b"StartImage returned 0x\0");
     print_dec(st, status as u64);
     print_raw(st, b"\r\n\0");
+    // Wait for key press so user can read the return value before possible reset
+    print_raw(st, b"Press any key...\r\n\0");
+    {
+        let bs_ref = unsafe { &mut *st.boot_services };
+        if !st.con_in.is_null() {
+            let ci = unsafe { &mut *(st.con_in as *mut crate::protocol::SimpleTextInput) };
+            loop {
+                let mut k = crate::protocol::Key { sc: 0, uc: 0 };
+                if unsafe { (ci.read_key_stroke)(ci as *mut _, &mut k) } == EFI_SUCCESS {
+                    break;
+                }
+                unsafe { (bs_ref.stall)(100_000) };
+            }
+        }
+    }
     if status != EFI_SUCCESS {
         print_raw(st, b"Press any key to reboot...\r\n\0");
         let bs_ref = unsafe { &mut *st.boot_services };
