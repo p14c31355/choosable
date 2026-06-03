@@ -749,6 +749,41 @@ fn build_iso_device_path(bs: &mut BootServices, iso_size_bytes: u64) -> *mut c_v
 //  Main chainload entry
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Probe for the ISO9660 Primary Volume Descriptor (PVD) starting from
+/// `raw_iso_lba` and return the number of ISO (2048-byte) sectors to add
+/// to `raw_iso_lba` so that ISO sector 0 aligns with the real start of
+/// the ISO9660 filesystem.
+///
+/// In a flat (non-hybrid) ISO the filesystem starts at the very
+/// beginning of the file → offset 0.
+/// In an isohybrid ISO with GPT the filesystem is shifted by
+/// `iso_data_lba` sectors (usually 20) because the first 40 KiB are
+/// occupied by MBR + GPT structures.
+fn probe_iso9660_offset(
+    bio_ref: &BlockIoProtocol,
+    bio_ptr: *mut BlockIoProtocol,
+    mid: u32,
+    raw_iso_lba: u64,
+) -> u64 {
+    let mut scratch = [0u8; 2048];
+    // Scan forward from ISO-sector 16 up to sector 128 (256 KiB)
+    // looking for the PVD signature.
+    for n in 0u64..128u64 {
+        let disk_lba = raw_iso_lba + (16 + n) * 4;
+        for i in 0..4 {
+            let mut sec = [0u8; 512];
+            if !read_sector(bio_ref, bio_ptr, mid, disk_lba + i as u64, &mut sec) {
+                break;
+            }
+            scratch[i * 512..(i + 1) * 512].copy_from_slice(&sec);
+        }
+        if scratch[0] == 1 && &scratch[1..6] == b"CD001" {
+            return n; // offset in ISO (2048-byte) sectors
+        }
+    }
+    0 // fallback: assume flat ISO
+}
+
 fn uefi_chainload_iso(
     st: &mut SystemTable,
     image_handle: *mut c_void,
@@ -759,15 +794,21 @@ fn uefi_chainload_iso(
     bio_ptr: *mut BlockIoProtocol,
     mid: u32,
 ) -> ! {
-    let iso_lba = files[idx].file_start_lba;
+    let raw_iso_lba = files[idx].file_start_lba;
     let iso_size = files[idx].file_size;
     let bs = unsafe { &mut *st.boot_services };
     unsafe { (bs.set_watchdog_timer)(0, 0x10000, 0, core::ptr::null()); }
     let iso_name = &files[idx].name[..files[idx].name_len.min(files[idx].name.len())];
     let live_uuid = [0u8; 10];
 
+    // The ISO file may be isohybrid (MBR + GPT at the front), pushing
+    // the ISO9660 filesystem forward.  Probe where the PVD really is
+    // and compute the effective LBA so that ISO sector 0 === filesystem start.
+    let iso_data_offset = probe_iso9660_offset(bio_ref, bio_ptr, mid, raw_iso_lba);
+    let iso_lba = raw_iso_lba + iso_data_offset * 4; // convert ISO→512B sectors
+
     let cdrom_tuple = crate::virtual_blockio::create_virtual_cdrom(
-        bs, st as *mut SystemTable, iso_lba, bio_ptr, mid, iso_size, iso_name, &live_uuid,
+        bs, st as *mut SystemTable, iso_lba, bio_ptr, mid, iso_size - iso_data_offset * 2048, iso_name, &live_uuid,
     );
     let (device_handle, cdrom_dp, vbio_ptr, sfs_instance) = match cdrom_tuple {
         Some((h, dp, vb, sfs)) => (h, dp, vb, sfs),
