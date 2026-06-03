@@ -25,6 +25,9 @@ use crate::protocol::{BootServices, MemoryType, EFI_SUCCESS};
 pub struct PremountBundle {
     pub cpio_buf: *mut u8,
     pub cpio_size: usize,
+    /// Actual allocated size of `cpio_buf` (equal to `cpio_estimate`).
+    /// Always >= cpio_size.  Callers must not write beyond this bound.
+    pub cpio_alloc_size: usize,
     pub iso_offset_bytes: u64,
 }
 
@@ -267,5 +270,5 @@ pub fn prepare_premount_initrd(
     if !append_entry(cpio, &mut off, b"scripts/casper-bottom/00choosable", &script[..script_len], 0o100755) { unsafe { (bs.free_pool)(cpio_ptr); } return None; }
     if !append_entry(cpio, &mut off, b"TRAILER!!!", b"", 0) { unsafe { (bs.free_pool)(cpio_ptr); } return None; }
 
-    Some(PremountBundle { cpio_buf: cpio_ptr as *mut u8, cpio_size: off, iso_offset_bytes: offset_bytes })
+    Some(PremountBundle { cpio_buf: cpio_ptr as *mut u8, cpio_size: off, cpio_alloc_size: cpio_estimate, iso_offset_bytes: offset_bytes })
 }

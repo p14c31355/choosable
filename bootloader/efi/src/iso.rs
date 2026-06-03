@@ -792,12 +792,16 @@ fn uefi_chainload_iso(
     if !vbio_ptr.is_null() && premount_bundle.is_some() {
         let vb = unsafe { &mut *vbio_ptr };
         let bundle = premount_bundle.as_ref().unwrap();
-        // cpio may need up to 8192 bytes → 4 sectors
-        let premount_cpio_sectors = ((bundle.cpio_size as u64 + 2047) / 2048) as u32;
+        // Only zero-fill up to the actual allocation boundary.
+        // bundle.cpio_alloc_size is the real pool size; writing beyond
+        // it would corrupt the UEFI pool heap.
+        let alloc_size = bundle.cpio_alloc_size;
         {
-            let dst = unsafe { core::slice::from_raw_parts_mut(bundle.cpio_buf, premount_cpio_sectors as usize * 2048) };
+            let dst = unsafe { core::slice::from_raw_parts_mut(bundle.cpio_buf, alloc_size) };
             dst[bundle.cpio_size..].fill(0);
         }
+        // Effective cpio size (zero-padded to alloc_size, rounded to sectors)
+        let premount_cpio_sectors = ((alloc_size as u64 + 2047) / 2048) as u32;
         let orig_end = vb.media.bim_lb + 1;
         vb.premount_file_sector = orig_end as u32;
         vb.premount_file_sectors = premount_cpio_sectors;
