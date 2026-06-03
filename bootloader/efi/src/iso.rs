@@ -940,14 +940,30 @@ fn uefi_chainload_iso(
             (*lip).parent_handle = image_handle;
         }
     }
-    print_raw(st, b"Starting EFI image...\r\n\0");
+    print_raw(st, b"StartImage...\r\n\0");
     let status = unsafe { (bs.start_image)(child_handle, &mut 0u64, &mut core::ptr::null_mut::<u16>()) };
+    print_raw(st, b"StartImage returned 0x\0");
+    print_dec(st, status as u64);
+    print_raw(st, b"\r\n\0");
     if status != EFI_SUCCESS {
-        print_raw(st, b"ERROR: StartImage returned \0");
-        print_dec(st, status as u64);
-        print_raw(st, b"\r\n\0");
+        print_raw(st, b"Press any key to reboot...\r\n\0");
+        let bs_ref = unsafe { &mut *st.boot_services };
+        if !st.con_in.is_null() {
+            let ci = unsafe { &mut *(st.con_in as *mut crate::protocol::SimpleTextInput) };
+            loop {
+                let mut k = crate::protocol::Key { sc: 0, uc: 0 };
+                if unsafe { (ci.read_key_stroke)(ci as *mut _, &mut k) } == EFI_SUCCESS {
+                    break;
+                }
+                unsafe { (bs_ref.stall)(100_000) };
+            }
+        }
+        halt_or_reboot(st);
     }
-    halt_or_reboot(st);
+    // Child called ExitBootServices.  Never reboot.
+    loop {
+        unsafe { core::arch::asm!("hlt") }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
