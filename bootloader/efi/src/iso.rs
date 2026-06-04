@@ -13,7 +13,7 @@ use core::ffi::c_void;
 
 use crate::disk::read_sector;
 use crate::fs::{IsoEntry, FsCtx};
-use crate::output::{format_u64_buf, halt_or_reboot, print_dec, print_raw};
+use crate::output::{format_u64_buf, halt_or_reboot, print_dec, print_hex, print_raw};
 use crate::protocol::{
     BlockIoProtocol, BootServices, LoadedImageProtocol, MemoryType, SystemTable,
     DevicePathProtocol, VirtualBlockIo, EFI_SUCCESS, LOADED_IMAGE_PROTOCOL_GUID,
@@ -758,7 +758,7 @@ fn uefi_chainload_iso(
     bio_ref: &BlockIoProtocol,
     bio_ptr: *mut BlockIoProtocol,
     mid: u32,
-) {
+) -> ! {
     let iso_lba = files[idx].file_start_lba;
     let iso_size = files[idx].file_size;
     let bs = unsafe { &mut *st.boot_services };
@@ -773,7 +773,7 @@ fn uefi_chainload_iso(
         Some((h, dp, vb, sfs)) => (h, dp, vb, sfs),
         None => {
             print_raw(st, b"ERROR: Failed to create virtual CD-ROM.\r\n\0");
-            return;
+            halt_or_reboot(st);
         }
     };
 
@@ -792,12 +792,16 @@ fn uefi_chainload_iso(
     if !vbio_ptr.is_null() && premount_bundle.is_some() {
         let vb = unsafe { &mut *vbio_ptr };
         let bundle = premount_bundle.as_ref().unwrap();
-        // cpio may need up to 8192 bytes → 4 sectors
-        let premount_cpio_sectors = ((bundle.cpio_size as u64 + 2047) / 2048) as u32;
+        // Only zero-fill up to the actual allocation boundary.
+        // bundle.cpio_alloc_size is the real pool size; writing beyond
+        // it would corrupt the UEFI pool heap.
+        let alloc_size = bundle.cpio_alloc_size;
         {
-            let dst = unsafe { core::slice::from_raw_parts_mut(bundle.cpio_buf, premount_cpio_sectors as usize * 2048) };
+            let dst = unsafe { core::slice::from_raw_parts_mut(bundle.cpio_buf, alloc_size) };
             dst[bundle.cpio_size..].fill(0);
         }
+        // Effective cpio size (zero-padded to alloc_size, rounded to sectors)
+        let premount_cpio_sectors = ((alloc_size as u64 + 2047) / 2048) as u32;
         let orig_end = vb.media.bim_lb + 1;
         vb.premount_file_sector = orig_end as u32;
         vb.premount_file_sectors = premount_cpio_sectors;
@@ -904,27 +908,36 @@ fn uefi_chainload_iso(
         Some(v) => v,
         None => {
             print_raw(st, b"ERROR: /EFI/BOOT/BOOTX64.EFI not found in ISO.\r\n\0");
-            return;
+            halt_or_reboot(st);
         }
     };
     let (buf_ptr, buf_len) = match read_extent(bs, bio_ref, bio_ptr, mid, iso_lba, efi_lba, efi_size) {
         Some(v) => v,
         None => {
             print_raw(st, b"ERROR: Failed to read EFI executable.\r\n\0");
-            return;
+            halt_or_reboot(st);
         }
     };
     let device_path = build_iso_device_path(bs, iso_size);
     print_raw(st, b"Loading EFI image...\r\n\0");
+    print_raw(st, b"EFI image size=\0");
+    print_dec(st, buf_len as u64);
+    print_raw(st, b" bytes\r\n\0");
 
+    // UEFI spec: when SourceBuffer is non-NULL, FilePath may be NULL.
+    // InsydeH2O may reject a synthetic DevicePath, so pass NULL.
     let mut child_handle: *mut c_void = core::ptr::null_mut();
-    if unsafe {
-        (bs.load_image)(false, image_handle, device_path as *mut DevicePathProtocol,
+    let load_status = unsafe {
+        (bs.load_image)(false, image_handle, core::ptr::null_mut(),
             buf_ptr, buf_len as u64, &mut child_handle)
-    } != EFI_SUCCESS {
-        print_raw(st, b"ERROR: LoadImage failed.\r\n\0");
+    };
+    if load_status != EFI_SUCCESS {
+        print_hex(st, b"ERROR: LoadImage failed, status=0x", load_status as u64);
+        print_raw(st, b"\r\nEFI size=\0");
+        print_dec(st, buf_len as u64);
+        print_raw(st, b" bytes\r\n\0");
         unsafe { (bs.free_pool)(buf_ptr as _); (bs.free_pool)(device_path); }
-        return;
+        halt_or_reboot(st);
     }
     unsafe { (bs.free_pool)(buf_ptr as _); }
 
@@ -933,10 +946,61 @@ fn uefi_chainload_iso(
         unsafe {
             (*lip).device_handle = device_handle;
             (*lip).file_path = device_path;
+            (*lip).parent_handle = image_handle;
         }
     }
-    print_raw(st, b"Starting EFI image...\r\n\0");
-    unsafe { (bs.start_image)(child_handle, &mut 0u64, &mut core::ptr::null_mut::<u16>()); }
+    print_raw(st, b"Press any key to start...\r\n\0");
+    {
+        let bs_ref = unsafe { &mut *st.boot_services };
+        if !st.con_in.is_null() {
+            let ci = unsafe { &mut *(st.con_in as *mut crate::protocol::SimpleTextInput) };
+            loop {
+                let mut k = crate::protocol::Key { sc: 0, uc: 0 };
+                if unsafe { (ci.read_key_stroke)(ci as *mut _, &mut k) } == EFI_SUCCESS {
+                    break;
+                }
+                unsafe { (bs_ref.stall)(100_000) };
+            }
+        }
+    }
+    print_raw(st, b"Starting...\r\n\0");
+    let status = unsafe { (bs.start_image)(child_handle, &mut 0u64, &mut core::ptr::null_mut::<u16>()) };
+    print_hex(st, b"StartImage returned 0x\0", status as u64);
+    print_raw(st, b"\r\n\0");
+    // Wait for key press so user can read the return value before possible reset
+    print_raw(st, b"Press any key...\r\n\0");
+    {
+        let bs_ref = unsafe { &mut *st.boot_services };
+        if !st.con_in.is_null() {
+            let ci = unsafe { &mut *(st.con_in as *mut crate::protocol::SimpleTextInput) };
+            loop {
+                let mut k = crate::protocol::Key { sc: 0, uc: 0 };
+                if unsafe { (ci.read_key_stroke)(ci as *mut _, &mut k) } == EFI_SUCCESS {
+                    break;
+                }
+                unsafe { (bs_ref.stall)(100_000) };
+            }
+        }
+    }
+    if status != EFI_SUCCESS {
+        print_raw(st, b"Press any key to reboot...\r\n\0");
+        let bs_ref = unsafe { &mut *st.boot_services };
+        if !st.con_in.is_null() {
+            let ci = unsafe { &mut *(st.con_in as *mut crate::protocol::SimpleTextInput) };
+            loop {
+                let mut k = crate::protocol::Key { sc: 0, uc: 0 };
+                if unsafe { (ci.read_key_stroke)(ci as *mut _, &mut k) } == EFI_SUCCESS {
+                    break;
+                }
+                unsafe { (bs_ref.stall)(100_000) };
+            }
+        }
+        halt_or_reboot(st);
+    }
+    // Child called ExitBootServices.  Never reboot.
+    loop {
+        unsafe { core::arch::asm!("hlt") }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1002,9 +1066,11 @@ pub fn show_menu(
             let idx = (ch - b'1') as usize;
             if idx < count {
                 boot_iso(st, image_handle, disk_handle, ctx.part1_lba, files, idx, bio_ref, bio_ptr, mid);
+                halt_or_reboot(st); // boot_iso returned — fatal error
             }
         } else if ch == b'0' && count >= 10 {
             boot_iso(st, image_handle, disk_handle, ctx.part1_lba, files, 9, bio_ref, bio_ptr, mid);
+            halt_or_reboot(st); // boot_iso returned — fatal error
         } else if ch == b'r' || ch == b'R' {
             print_raw(st, b"\r\nRe-scanning...\r\n\0");
             let mut new_files: [IsoEntry; 64] = unsafe { core::mem::zeroed() };

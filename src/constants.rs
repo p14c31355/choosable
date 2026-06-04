@@ -18,7 +18,7 @@ pub const CHOOSABLE_PART1_START_SECTOR: u64 = 2048;
 pub const CHOOSABLE_EFI_PART_ATTR: u64 = 0x0000_0000_0000_0001;
 
 /// Choosable image file section count in 512-byte sectors
-pub const CHOOSABLE_SECTOR_NUM: u64 = 65536; // 32 MiB (Ventoy: VENTOY_SECTOR_NUM=65536)
+pub const CHOOSABLE_SECTOR_NUM: u64 = 65536; // 32 MiB
 
 /// Choosable part 1 + part 2 total size in MiB
 pub const CHOOSABLE_PART_SIZE_MB: u64 = 33; // min: 1 MiB part1 + 32 MiB EFI part

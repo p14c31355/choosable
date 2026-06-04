@@ -44,10 +44,23 @@ fn parse_el_torito(
         return false;
     }
 
+    // El Torito catalog structure:
+    // Entry 0: Validation Entry (type 0x01), platform_id at offset 1
+    // Subsequent entries: Boot Entry (0x88) or Section Header (0x90/0x91)
+    // Section headers have platform_id at offset 1; boot entries inherit from their section
+    let mut platform_id = if catalog[0] == 0x01 { catalog[1] } else { 0xFF };
+
     for i in 0..(512 / 32) {
         let off = i * 32;
         let etype = catalog[off];
-        if etype == 0x88 || etype == 0x90 {
+
+        // Section headers (0x90/0x91) update the current platform_id
+        if etype == 0x90 || etype == 0x91 {
+            platform_id = catalog[off + 1];
+        }
+        // Only accept BootEntry (0x88) with platform_id == 0x00 (BIOS/x86)
+        // so we don't accidentally load a UEFI ESP as a BIOS boot sector.
+        else if etype == 0x88 && platform_id == 0x00 {
             let count = u16::from_le_bytes([catalog[off + 6], catalog[off + 7]]);
             let image_iso_lba = u32::from_le_bytes([
                 catalog[off + 8], catalog[off + 9], catalog[off + 10], catalog[off + 11],

@@ -25,6 +25,9 @@ use crate::protocol::{BootServices, MemoryType, EFI_SUCCESS};
 pub struct PremountBundle {
     pub cpio_buf: *mut u8,
     pub cpio_size: usize,
+    /// Actual allocated size of `cpio_buf` (rounded up to 2048-byte sectors).
+    /// Always >= cpio_size.  Callers must not write beyond this bound.
+    pub cpio_alloc_size: usize,
     pub iso_offset_bytes: u64,
 }
 
@@ -242,9 +245,11 @@ pub fn prepare_premount_initrd(
         + entry_size(35, script_len)  // scripts/casper-premount/00choosable
         + entry_size(33, script_len)  // scripts/casper-bottom/00choosable
         + entry_size(10, 0);          // TRAILER!!!
+    // Round up to 2048-byte sectors to avoid reads past the UEFI pool on the final sector
+    let cpio_alloc_size = (cpio_estimate + 2047) & !2047;
     let mut cpio_ptr: *mut c_void = core::ptr::null_mut();
-    if unsafe { (bs.allocate_pool)(MemoryType::EfiLoaderData, cpio_estimate, &mut cpio_ptr) } != EFI_SUCCESS || cpio_ptr.is_null() { return None; }
-    let cpio = unsafe { core::slice::from_raw_parts_mut(cpio_ptr as *mut u8, cpio_estimate) };
+    if unsafe { (bs.allocate_pool)(MemoryType::EfiLoaderData, cpio_alloc_size, &mut cpio_ptr) } != EFI_SUCCESS || cpio_ptr.is_null() { return None; }
+    let cpio = unsafe { core::slice::from_raw_parts_mut(cpio_ptr as *mut u8, cpio_alloc_size) };
     let mut off = 0usize;
 
     let mut append_entry = |cpio: &mut [u8], off: &mut usize, name: &[u8], data: &[u8], mode: u32| -> bool {
@@ -267,5 +272,5 @@ pub fn prepare_premount_initrd(
     if !append_entry(cpio, &mut off, b"scripts/casper-bottom/00choosable", &script[..script_len], 0o100755) { unsafe { (bs.free_pool)(cpio_ptr); } return None; }
     if !append_entry(cpio, &mut off, b"TRAILER!!!", b"", 0) { unsafe { (bs.free_pool)(cpio_ptr); } return None; }
 
-    Some(PremountBundle { cpio_buf: cpio_ptr as *mut u8, cpio_size: off, iso_offset_bytes: offset_bytes })
+    Some(PremountBundle { cpio_buf: cpio_ptr as *mut u8, cpio_size: off, cpio_alloc_size, iso_offset_bytes: offset_bytes })
 }
