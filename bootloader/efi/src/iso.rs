@@ -965,8 +965,7 @@ fn uefi_chainload_iso(
     }
     print_raw(st, b"Starting...\r\n\0");
     let status = unsafe { (bs.start_image)(child_handle, &mut 0u64, &mut core::ptr::null_mut::<u16>()) };
-    print_raw(st, b"StartImage returned 0x\0");
-    print_dec(st, status as u64);
+    print_hex(st, b"StartImage returned 0x\0", status as u64);
     print_raw(st, b"\r\n\0");
     // Wait for key press so user can read the return value before possible reset
     print_raw(st, b"Press any key...\r\n\0");
