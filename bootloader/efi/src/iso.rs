@@ -962,6 +962,18 @@ fn uefi_chainload_iso(
         match fixup {
             crate::strategy::FixupType::Alpine =>
                 crate::premount::prepare_alpine_initrd(bs, iso_lba - part1_lba, iso_name),
+            crate::strategy::FixupType::AlpinePremount => {
+                // AlpinePremount uses the standard premount initrd
+                // (casper-style hook) instead of a custom /init.choosable.
+                crate::premount::prepare_premount_initrd(bs, iso_lba - part1_lba, false, iso_name)
+            }
+            crate::strategy::FixupType::Arch => {
+                // ArchISO: premount initrd mounts ISO at /run/archiso/bootmnt
+                // after the initramfs has already started.  The kernel
+                // cmdline archisodevice=... handles the rest.
+                crate::premount::prepare_premount_initrd(bs, iso_lba - part1_lba, false, iso_name)
+            }
+            crate::strategy::FixupType::WindowsPE => None,
             _ => {
                 let needs_sr = crate::strategy::needs_sr_mod(ctx);
                 crate::premount::prepare_premount_initrd(bs, iso_lba - part1_lba, needs_sr, iso_name)

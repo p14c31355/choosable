@@ -80,6 +80,22 @@ impl EarlyBootFixup for AlpineFixup {
     }
 }
 
+/// AlpinePremount fixup — uses the standard premount initrd (casper-style)
+/// instead of a custom /init.choosable script.  This is the recommended
+/// path for Alpine because it doesn't rely on Alpine's own initramfs
+/// behavior.
+pub struct AlpinePremountFixup;
+impl EarlyBootFixup for AlpinePremountFixup {
+    fn build_initrd(&self, ctx: &BootContext, bs: &mut BootServices) -> Option<PremountBundle> {
+        let p = ctx.selected_payload()?;
+        let rel = p.file_start_lba - ctx.partition_start_lba;
+        let name_bytes = &p.name[..p.name_len.min(p.name.len())];
+        // Alpine doesn't need sr_mod since it doesn't have a real CD-ROM
+        // driver dependency; loop+iso9660 are enough.
+        prepare_premount_initrd(bs, rel, false, name_bytes)
+    }
+}
+
 /// Build a CPIO with `/init.choosable` that mounts the ISO and then exec's
 /// the distro's original `/init`.  This is necessary for Alpine Linux whose
 /// initramfs does NOT source casper-premount or live-premount hooks.
@@ -254,6 +270,8 @@ mount -o bind /cdrom /lib/live/mount/medium 2>/dev/null
 [ -f /cdrom/LiveOS/squashfs.img ]&&return 0
 [ -f /cdrom/.alpine-release ]&&return 0
 [ -f /cdrom/.ALPINE_RELEASE ]&&return 0
+[ -d /cdrom/apks ]&&return 0
+[ -d /cdrom/arch ]&&{ mkdir -p /run/archiso/bootmnt 2>/dev/null;mount -o bind /cdrom /run/archiso/bootmnt 2>/dev/null;return 0;}
 umount /lib/live/mount/medium 2>/dev/null
 umount /cdrom 2>/dev/null
 losetup -d $LOOP 2>/dev/null
