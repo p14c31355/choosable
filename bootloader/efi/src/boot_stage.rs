@@ -433,7 +433,7 @@ impl BootStage for NetworkPayloadLocatorStage {
         if let Some(url) = self.url {
             print_raw(st, url);
         } else {
-            print_raw(st, b"(DHCP / PXE)");
+            print_raw(st, b"(DHCP / PXE)\0");
         }
         print_raw(st, b"\r\n\0");
 
