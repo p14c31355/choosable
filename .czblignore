@@ -7,15 +7,20 @@
 # All matching is case-insensitive.
 #
 # Why these are excluded:
-#   MD5SUM*   — GRUB uses if [ -f /MD5SUM.TXT ] for integrity checks
-#   README*   — boot scripts / GRUB may reference README.DISKDEFINES etc.
-#   UBUNTU*   — referenced by Ubuntu GRUB as /UBUNTU.
-#   AUTORUN.INF — Windows autorun, occasionally checked
+#   MD5SUM*       — GRUB uses if [ -f /MD5SUM.TXT ] for integrity checks
+#   README*       — boot scripts / GRUB may reference README.DISKDEFINES etc.
+#   UBUNTU*       — referenced by Ubuntu GRUB as /UBUNTU sentinel file
+#   DEBIAN*       — referenced by Debian GRUB as /DEBIAN sentinel file
+#   POP*          — referenced by Pop!_OS GRUB as /POP sentinel file
+#   AUTORUN.INF   — Windows autorun, occasionally checked
+#   .ALPINE_RELEASE — Alpine Linux requires this file to detect the live medium
 
 MD5SUM*
 README*
 UBUNTU*
 DEBIAN*
+POP*
 AUTORUN.INF
 EFI.IMG
 SHA256SUM.TXT
+.ALPINE_RELEASE*

@@ -120,19 +120,27 @@ pub struct RawMedia {
 impl VirtualMedia for RawMedia {
     fn read_block(&self, block_lba: u64, dst: &mut [u8], dst_offset: usize) -> bool {
         if block_lba >= self.total_blocks { return false; }
-        let bs = 2048u32;
-        if dst_offset > dst.len() || dst.len() - dst_offset < bs as usize { return false; }
-        let disk_lba = self.start_lba + block_lba * (bs as u64 / 512);
+        let sector_size = self.sector_size.max(512) as u64;
+        if sector_size > 65536 { return false; }
+        if dst_offset as u64 + sector_size > dst.len() as u64 { return false; }
+        let sectors_per_block = sector_size / 512;
+        let disk_lba = match block_lba
+            .checked_mul(sectors_per_block)
+            .and_then(|off| self.start_lba.checked_add(off))
+        {
+            Some(lba) => lba,
+            None => return false,
+        };
         unsafe {
             ((*self.real_bio_ptr).read_blocks)(
                 self.real_bio_ptr, self.real_media_id,
-                disk_lba, bs as usize,
+                disk_lba, sector_size as usize,
                 dst.as_mut_ptr().add(dst_offset) as *mut c_void,
             ) == EFI_SUCCESS
         }
     }
     fn block_count(&self) -> u64 { self.total_blocks }
-    fn block_size(&self) -> u32 { 2048 }
+    fn block_size(&self) -> u32 { self.sector_size.max(512) }
     fn media_type(&self) -> &'static str { "IMG" }
 }
 
@@ -157,19 +165,27 @@ pub struct VhdMedia {
 impl VirtualMedia for VhdMedia {
     fn read_block(&self, block_lba: u64, dst: &mut [u8], dst_offset: usize) -> bool {
         if block_lba >= self.total_blocks { return false; }
-        let bs = 2048u32;
-        if dst_offset > dst.len() || dst.len() - dst_offset < bs as usize { return false; }
-        let disk_lba = self.data_lba + block_lba * (bs as u64 / 512);
+        let sector_size = self.sector_size.max(512) as u64;
+        if sector_size > 65536 { return false; }
+        if dst_offset as u64 + sector_size > dst.len() as u64 { return false; }
+        let sectors_per_block = sector_size / 512;
+        let disk_lba = match block_lba
+            .checked_mul(sectors_per_block)
+            .and_then(|off| self.data_lba.checked_add(off))
+        {
+            Some(lba) => lba,
+            None => return false,
+        };
         unsafe {
             ((*self.real_bio_ptr).read_blocks)(
                 self.real_bio_ptr, self.real_media_id,
-                disk_lba, bs as usize,
+                disk_lba, sector_size as usize,
                 dst.as_mut_ptr().add(dst_offset) as *mut c_void,
             ) == EFI_SUCCESS
         }
     }
     fn block_count(&self) -> u64 { self.total_blocks }
-    fn block_size(&self) -> u32 { 2048 }
+    fn block_size(&self) -> u32 { self.sector_size.max(512) }
     fn media_type(&self) -> &'static str { "VHD" }
 }
 

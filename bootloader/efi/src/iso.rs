@@ -404,21 +404,45 @@ fn find_efi_boot(
     mid: u32,
     iso_lba: u64,
 ) -> Option<(u32, u32)> {
-    let (root_lba, root_size) = get_root_dir(st, bio_ref, bio_ptr, mid, iso_lba)?;
     let mut scratch = [0u8; 2048];
+    let (root_lba, root_size) = get_root_dir(st, bio_ref, bio_ptr, mid, iso_lba)?;
 
-    let (efi_lba, efi_size) = find_in_dir(
-        bio_ref, bio_ptr, mid, iso_lba,
-        root_lba, root_size, b"EFI", &mut scratch,
-    )?;
-    let (boot_lba, boot_size) = find_in_dir(
-        bio_ref, bio_ptr, mid, iso_lba,
-        efi_lba, efi_size, b"BOOT", &mut scratch,
-    )?;
-    find_in_dir(
-        bio_ref, bio_ptr, mid, iso_lba,
-        boot_lba, boot_size, b"BOOTX64.EFI", &mut scratch,
-    )
+    let candidates: &[&[u8]] = &[b"EFI"];
+    let mut efi_dir = None;
+    for &name in candidates {
+        if let Some(v) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, name, &mut scratch) {
+            efi_dir = Some(v);
+            break;
+        }
+    }
+    let (efi_lba, efi_size) = efi_dir?;
+
+    let boot_subdirs: &[&[u8]] = &[b"BOOT"];
+    let mut boot_dir = None;
+    for &name in boot_subdirs {
+        if let Some(v) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, efi_lba, efi_size, name, &mut scratch) {
+            boot_dir = Some(v);
+            break;
+        }
+    }
+    let (boot_lba, boot_size) = boot_dir?;
+
+    let efi_names: &[&[u8]] = &[b"BOOTX64.EFI", b"BOOTIA32.EFI", b"GRUBX64.EFI", b"SHIMX64.EFI"];
+    for &name in efi_names {
+        if let Some(v) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, boot_lba, boot_size, name, &mut scratch) {
+            return Some(v);
+        }
+    }
+
+    // Debug: dump root directory content
+    print_raw(st, b"[find_efi_boot] root_lba=\0");
+    print_dec(st, root_lba as u64);
+    print_raw(st, b" root_size=\0");
+    print_dec(st, root_size as u64);
+    print_raw(st, b" iso_lba=\0");
+    print_dec(st, iso_lba);
+    print_raw(st, b"\r\n\0");
+    None
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1069,13 +1093,22 @@ fn uefi_chainload_iso(
     print_dec(st, buf_len as u64);
     print_raw(st, b" bytes\r\n\0");
 
-    // UEFI spec: when SourceBuffer is non-NULL, FilePath may be NULL.
-    // InsydeH2O may reject a synthetic DevicePath, so pass NULL.
+    // Most firmware accepts the synthetic DevicePath; some (InsydeH2O)
+    // reject it and require NULL when SourceBuffer is set.  Try the
+    // DevicePath first, then retry with NULL on EFI_UNSUPPORTED.
     let mut child_handle: *mut c_void = core::ptr::null_mut();
-    let load_status = unsafe {
-        (bs.load_image)(false, image_handle, core::ptr::null_mut(),
+    let mut load_status = unsafe {
+        (bs.load_image)(false, image_handle,
+            device_path as *mut crate::protocol::DevicePathProtocol,
             buf_ptr, buf_len as u64, &mut child_handle)
     };
+    if load_status == crate::protocol::EFI_INVALID_PARAMETER || load_status == crate::protocol::EFI_UNSUPPORTED {
+        // Retry with NULL DevicePath (firmware rejects synthetic path).
+        load_status = unsafe {
+            (bs.load_image)(false, image_handle, core::ptr::null_mut(),
+                buf_ptr, buf_len as u64, &mut child_handle)
+        };
+    }
     if load_status != EFI_SUCCESS {
         print_hex(st, b"ERROR: LoadImage failed, status=0x", load_status as u64);
         print_raw(st, b"\r\nEFI size=\0");
@@ -1185,7 +1218,7 @@ pub fn show_payload_menu(
         halt_or_reboot(st);
     }
     print_raw(st, b"\r\n=== Choosable UEFI Boot Menu ===\r\n\0");
-    for i in 0..count.min(20) {
+    for i in 0..count.min(10) {
         let (sb, sl) = format_u64_buf((i + 1) as u64);
         print_raw(st, b" "); print_raw(st, &sb[20 - sl..]); print_raw(st, b". ");
         if payloads[i].name_len > 0 && payloads[i].name[0] != 0 {

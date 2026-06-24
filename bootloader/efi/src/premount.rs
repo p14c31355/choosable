@@ -139,6 +139,8 @@ mount -o bind /cdrom /lib/live/mount/medium 2>/dev/null
 [ -f /cdrom/casper/filesystem.squashfs ]&&return 0
 [ -f /cdrom/live/filesystem.squashfs ]&&return 0
 [ -f /cdrom/LiveOS/squashfs.img ]&&return 0
+[ -f /cdrom/.alpine-release ]&&return 0
+[ -f /cdrom/.ALPINE_RELEASE ]&&return 0
 umount /lib/live/mount/medium 2>/dev/null
 umount /cdrom 2>/dev/null
 losetup -d $LOOP 2>/dev/null
