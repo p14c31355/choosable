@@ -62,10 +62,123 @@ impl EarlyBootFixup for ArchFixup {
 pub struct WindowsPEFixup;
 impl EarlyBootFixup for WindowsPEFixup {
     fn build_initrd(&self, _ctx: &BootContext, _bs: &mut BootServices) -> Option<PremountBundle> {
-        // Windows PE does not use the Linux initramfs mechanism.
-        // WinPE's boot.wim is loaded directly by the Windows Boot Manager.
         None
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Alpine fixup — custom /init.choosable (Alpine has no hook mechanism)
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub struct AlpineFixup;
+impl EarlyBootFixup for AlpineFixup {
+    fn build_initrd(&self, ctx: &BootContext, bs: &mut BootServices) -> Option<PremountBundle> {
+        let p = ctx.selected_payload()?;
+        let rel = p.file_start_lba - ctx.partition_start_lba;
+        let name_bytes = &p.name[..p.name_len.min(p.name.len())];
+        prepare_alpine_initrd(bs, rel, name_bytes)
+    }
+}
+
+/// Build a CPIO with `/init.choosable` that mounts the ISO and then exec's
+/// the distro's original `/init`.  This is necessary for Alpine Linux whose
+/// initramfs does NOT source casper-premount or live-premount hooks.
+pub fn prepare_alpine_initrd(
+    bs: &mut BootServices,
+    relative_sector_offset: u64,
+    iso_name: &[u8],
+) -> Option<PremountBundle> {
+    let offset_bytes = relative_sector_offset * 512;
+
+    // Build the /init.choosable script
+    let off_str = format_decimal_u64(offset_bytes);
+    let mut off_start = 0;
+    while off_start < 20 && off_str[off_start] == b'0' { off_start += 1; }
+    if off_start >= 20 { off_start = 19; }
+    let off_slice = &off_str[off_start..];
+
+    // Template: mount proc/sys/dev, create loop, mount ISO, then exec /init
+    let mut script = [0u8; 4096];
+    let src = b"\
+#!/bin/sh
+mount -t proc none /proc 2>/dev/null
+mount -t sysfs none /sys 2>/dev/null
+mount -t devtmpfs none /dev 2>/dev/null
+modprobe loop 2>/dev/null;modprobe iso9660 2>/dev/null
+for i in 0 1 2 3 4 5 6 7;do [ -b /dev/loop$i ]||mknod /dev/loop$i b 7 $i 2>/dev/null;done
+[ -d /cdrom ]||mkdir -p /cdrom 2>/dev/null
+for dev in /dev/[sv]d*[0-9] /dev/nvme*n1p* /dev/mmcblk*p*;do
+ [ -b \"$dev\" ]||continue
+ for i in 0 1 2 3 4 5 6 7;do
+  L=/dev/loop$i
+  losetup $L >/dev/null 2>&1&&continue
+  losetup -o OFFSET $L \"$dev\" 2>/dev/null||continue
+  mount -t iso9660 -ro $L /cdrom 2>/dev/null||{ losetup -d $L 2>/dev/null;continue;}
+  if [ -f /cdrom/.alpine-release ]||[ -f /cdrom/.ALPINE_RELEASE ];then
+   exec /init \"$@\"
+  fi
+  umount /cdrom 2>/dev/null;losetup -d $L 2>/dev/null
+ done
+done
+exec /init \"$@\"
+";
+
+    let mut pos = 0usize;
+    let mut i = 0;
+    while i < src.len() {
+        if i + 6 <= src.len()
+            && src[i] == b'O' && src[i+1] == b'F' && src[i+2] == b'F'
+            && src[i+3] == b'S' && src[i+4] == b'E' && src[i+5] == b'T'
+        {
+            for j in 0..off_slice.len() {
+                if pos < 4095 { script[pos] = off_slice[j]; pos += 1; }
+            }
+            i += 6;
+        } else {
+            if pos < 4095 { script[pos] = src[i]; pos += 1; }
+            i += 1;
+        }
+    }
+    let script_len = script.iter().position(|&c| c == 0).unwrap_or(4095);
+
+    // Build CPIO with a single file: /init.choosable
+    let name = b"init.choosable";
+    let name_len = name.len() + 1;
+    let padded_name_len = ((110 + name_len + 3) & !3) - 110;
+    let hdr_len = 110 + padded_name_len;
+    let pad = (4 - ((hdr_len + script_len) & 3)) & 3;
+    let total = hdr_len + script_len + pad + 110 + 10 + 0 + 3; // header + data + trailer roughly
+    let alloc_size = (total + 2047) & !2047;
+
+    let mut cpio_ptr: *mut c_void = core::ptr::null_mut();
+    if unsafe { (bs.allocate_pool)(MemoryType::EfiLoaderData, alloc_size, &mut cpio_ptr) } != EFI_SUCCESS || cpio_ptr.is_null() { return None; }
+    let cpio = unsafe { core::slice::from_raw_parts_mut(cpio_ptr as *mut u8, alloc_size) };
+    let mut off = 0usize;
+
+    let mut append_entry = |cpio: &mut [u8], off: &mut usize, name: &[u8], data: &[u8], mode: u32| -> bool {
+        let nlen = name.len() + 1;
+        let pnlen = ((110 + nlen + 3) & !3) - 110;
+        let hlen = 110 + pnlen;
+        let p = (4 - ((*off + hlen + data.len()) & 3)) & 3;
+        if *off + hlen + data.len() + p > cpio.len() { return false; }
+        let actual = cpio_newc_header(&mut cpio[*off..], name, data.len() as u32, mode);
+        *off += actual;
+        cpio[*off..*off + data.len()].copy_from_slice(data);
+        *off += data.len();
+        for _ in 0..p { cpio[*off] = 0; *off += 1; }
+        true
+    };
+
+    if !append_entry(cpio, &mut off, b"init.choosable", &script[..script_len], 0o100755) {
+        unsafe { (bs.free_pool)(cpio_ptr); }
+        return None;
+    }
+    if !append_entry(cpio, &mut off, b"TRAILER!!!", b"", 0) {
+        unsafe { (bs.free_pool)(cpio_ptr); }
+        return None;
+    }
+
+    Some(PremountBundle { cpio_buf: cpio_ptr as *mut u8, cpio_size: off, cpio_alloc_size: alloc_size, iso_offset_bytes: offset_bytes })
 }
 
 fn hex_nibble(n: u8) -> u8 {

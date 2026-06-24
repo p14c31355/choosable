@@ -28,6 +28,23 @@ pub struct HookTargetSet {
     pub casper_bottom: bool,
 }
 
+/// Identifies which initrd builder to use for the early-boot fixup.
+#[derive(Clone, Copy, PartialEq)]
+pub enum FixupType {
+    /// initramfs-tools casper-premount hooks (Ubuntu, Mint, Pop)
+    Casper,
+    /// initramfs-tools live-premount hooks (Debian Live)
+    LiveBoot,
+    /// dracut premount hook (Fedora, RHEL, CentOS)
+    Dracut,
+    /// archiso copytoram hook (Arch Linux)
+    Arch,
+    /// No initrd fixup needed (Windows PE)
+    WindowsPE,
+    /// Custom /init.choosable (Alpine Linux — no hook mechanism)
+    Alpine,
+}
+
 pub trait BootStrategy: Sync {
     fn detect(&self, ctx: &IsoFsCtx) -> bool;
     fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> { let _ = inp; None }
@@ -35,6 +52,7 @@ pub trait BootStrategy: Sync {
         HookTargetSet { live: true, live_premount: true, casper_premount: true, casper_bottom: true }
     }
     fn needs_sr_mod(&self) -> bool { false }
+    fn fixup_type(&self) -> FixupType { FixupType::Casper }
 }
 
 fn allocate_output(bs: &mut BootServices, orig_len: usize, extra: usize) -> Option<(*mut u8, usize)> {
@@ -220,6 +238,8 @@ impl BootStrategy for CasperStrategy {
 
     fn needs_sr_mod(&self) -> bool { true }
 
+    fn fixup_type(&self) -> FixupType { FixupType::Casper }
+
     fn hook_targets(&self) -> HookTargetSet {
         HookTargetSet { live: false, live_premount: false, casper_premount: true, casper_bottom: true }
     }
@@ -249,6 +269,8 @@ impl BootStrategy for LiveBootStrategy {
 
     fn needs_sr_mod(&self) -> bool { false }
 
+    fn fixup_type(&self) -> FixupType { FixupType::LiveBoot }
+
     fn hook_targets(&self) -> HookTargetSet {
         HookTargetSet { live: true, live_premount: true, casper_premount: false, casper_bottom: false }
     }
@@ -270,15 +292,56 @@ impl BootStrategy for LiveOSStrategy {
     fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> {
         patch_grub_cfg_impl(inp, b" rd.live.image rootdelay=300", b"", inp.premount_target_name)
     }
+
+    fn fixup_type(&self) -> FixupType { FixupType::Dracut }
 }
 
 unsafe impl Sync for LiveOSStrategy {}
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  AlpineStrategy — Alpine Linux (custom initramfs, no casper/live hooks)
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub struct AlpineStrategy;
+
+impl BootStrategy for AlpineStrategy {
+    fn detect(&self, ctx: &IsoFsCtx) -> bool {
+        matches_any_lower(&ctx.iso_name[..ctx.iso_name_len], &[b"alpine"])
+    }
+
+    fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> {
+        // Alpine's initramfs does NOT use initramfs-tools hooks.  We must
+        // launch a custom init (/init.choosable) that creates the loop
+        // device and then exec's the original /init.
+        patch_grub_cfg_impl(
+            inp,
+            b" init=/init.choosable modules=loop,iso9660",
+            b"",
+            inp.premount_target_name,
+        )
+    }
+
+    fn hook_targets(&self) -> HookTargetSet {
+        HookTargetSet {
+            live: false,
+            live_premount: false,
+            casper_premount: false,
+            casper_bottom: false,
+        }
+    }
+
+    fn needs_sr_mod(&self) -> bool { false }
+
+    fn fixup_type(&self) -> FixupType { FixupType::Alpine }
+}
+
+unsafe impl Sync for AlpineStrategy {}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  Registry
 // ═══════════════════════════════════════════════════════════════════════════
 
-static STRATEGIES: &[&dyn BootStrategy] = &[&LiveOSStrategy, &CasperStrategy, &LiveBootStrategy];
+static STRATEGIES: &[&dyn BootStrategy] = &[&LiveOSStrategy, &CasperStrategy, &LiveBootStrategy, &AlpineStrategy];
 
 pub fn patch_grub_cfg(ctx: &IsoFsCtx, original: &[u8], bs: *mut BootServices, iso_location: Option<&IsoLocation>) -> Option<PatchOutput> {
     let strategy: &dyn BootStrategy = STRATEGIES.iter().find(|s| s.detect(ctx)).copied().unwrap_or(&CasperStrategy);
@@ -300,4 +363,9 @@ pub fn get_hook_targets(ctx: &IsoFsCtx) -> HookTargetSet {
 pub fn needs_sr_mod(ctx: &IsoFsCtx) -> bool {
     let strategy: &dyn BootStrategy = STRATEGIES.iter().find(|s| s.detect(ctx)).copied().unwrap_or(&CasperStrategy);
     strategy.needs_sr_mod()
+}
+
+pub fn get_fixup_type(ctx: &IsoFsCtx) -> FixupType {
+    let strategy: &dyn BootStrategy = STRATEGIES.iter().find(|s| s.detect(ctx)).copied().unwrap_or(&CasperStrategy);
+    strategy.fixup_type()
 }

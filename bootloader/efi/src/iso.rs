@@ -614,11 +614,14 @@ fn patch_grub_cfg_blockio(
     }; 8];
     let mut entry_count = 0usize;
 
-    let known_paths: [(&[u8], &[u8], &[u8], &[u8]); 4] = [
-        (b"BOOT", b"GRUB", b"GRUB.CFG",     b"/boot/grub/grub.cfg"),
-        (b"BOOT", b"GRUB", b"LOOPBACK.CFG", b"/boot/grub/loopback.cfg"),
-        (b"EFI", b"BOOT", b"GRUB.CFG",      b"/EFI/BOOT/grub.cfg"),
-        (b"",     b"",    b"GRUB.CFG",      b"/grub.cfg"),
+    let known_paths: [(&[u8], &[u8], &[u8], &[u8]); 7] = [
+        (b"BOOT", b"GRUB",  b"GRUB.CFG",     b"/boot/grub/grub.cfg"),
+        (b"BOOT", b"GRUB",  b"LOOPBACK.CFG", b"/boot/grub/loopback.cfg"),
+        (b"BOOT", b"GRUB2", b"GRUB.CFG",     b"/boot/grub2/grub.cfg"),
+        (b"BOOT", b"GRUB2", b"LOOPBACK.CFG", b"/boot/grub2/loopback.cfg"),
+        (b"EFI",  b"BOOT",  b"GRUB.CFG",     b"/EFI/BOOT/grub.cfg"),
+        (b"",     b"",      b"GRUB.CFG",     b"/grub.cfg"),
+        (b"",     b"",      b"GRUB.CFG",     b"/grub2/grub.cfg"),
     ];
 
     for (dir1, dir2, filename, path) in &known_paths {
@@ -946,13 +949,21 @@ fn uefi_chainload_iso(
         }
     };
 
-    // ── Build premount cpio ──────────────────────────────────────────
-    let needs_sr = if !sfs_instance.is_null() {
-        unsafe { crate::strategy::needs_sr_mod(&(*sfs_instance).ctx) }
+    // ── Build premount cpio (fixup type depends on strategy) ──────────
+    let premount_bundle = if !sfs_instance.is_null() {
+        let ctx = unsafe { &(*sfs_instance).ctx };
+        let fixup = crate::strategy::get_fixup_type(ctx);
+        match fixup {
+            crate::strategy::FixupType::Alpine =>
+                crate::premount::prepare_alpine_initrd(bs, iso_lba - part1_lba, iso_name),
+            _ => {
+                let needs_sr = crate::strategy::needs_sr_mod(ctx);
+                crate::premount::prepare_premount_initrd(bs, iso_lba - part1_lba, needs_sr, iso_name)
+            }
+        }
     } else {
-        true
+        crate::premount::prepare_premount_initrd(bs, iso_lba - part1_lba, true, iso_name)
     };
-    let premount_bundle = crate::premount::prepare_premount_initrd(bs, iso_lba - part1_lba, needs_sr, iso_name);
     if premount_bundle.is_none() {
         print_raw(st, b"[premount] allocation failed, skipping\r\n\0");
     }
