@@ -12,7 +12,7 @@
 use core::ffi::c_void;
 
 use crate::disk::read_sector;
-use crate::fs::{IsoEntry, FsCtx};
+use crate::fs::{FsCtx, PayloadEntry, PayloadType, PAYLOAD_SLOT_COUNT};
 use crate::output::{format_u64_buf, halt_or_reboot, print_dec, print_hex, print_raw};
 use crate::protocol::{
     BlockIoProtocol, BootServices, LoadedImageProtocol, MemoryType, SystemTable,
@@ -403,22 +403,46 @@ fn find_efi_boot(
     bio_ptr: *mut BlockIoProtocol,
     mid: u32,
     iso_lba: u64,
-) -> Option<(u32, u32)> {
-    let (root_lba, root_size) = get_root_dir(st, bio_ref, bio_ptr, mid, iso_lba)?;
+) -> Option<(u32, u32, &'static [u8])> {
     let mut scratch = [0u8; 2048];
+    let (root_lba, root_size) = get_root_dir(st, bio_ref, bio_ptr, mid, iso_lba)?;
 
-    let (efi_lba, efi_size) = find_in_dir(
-        bio_ref, bio_ptr, mid, iso_lba,
-        root_lba, root_size, b"EFI", &mut scratch,
-    )?;
-    let (boot_lba, boot_size) = find_in_dir(
-        bio_ref, bio_ptr, mid, iso_lba,
-        efi_lba, efi_size, b"BOOT", &mut scratch,
-    )?;
-    find_in_dir(
-        bio_ref, bio_ptr, mid, iso_lba,
-        boot_lba, boot_size, b"BOOTX64.EFI", &mut scratch,
-    )
+    let candidates: &[&[u8]] = &[b"EFI"];
+    let mut efi_dir = None;
+    for &name in candidates {
+        if let Some(v) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, name, &mut scratch) {
+            efi_dir = Some(v);
+            break;
+        }
+    }
+    let (efi_lba, efi_size) = efi_dir?;
+
+    let boot_subdirs: &[&[u8]] = &[b"BOOT"];
+    let mut boot_dir = None;
+    for &name in boot_subdirs {
+        if let Some(v) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, efi_lba, efi_size, name, &mut scratch) {
+            boot_dir = Some(v);
+            break;
+        }
+    }
+    let (boot_lba, boot_size) = boot_dir?;
+
+    let efi_names: &[&[u8]] = &[b"BOOTX64.EFI", b"BOOTIA32.EFI", b"GRUBX64.EFI", b"SHIMX64.EFI"];
+    for &name in efi_names {
+        if let Some(v) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, boot_lba, boot_size, name, &mut scratch) {
+            return Some((v.0, v.1, name));
+        }
+    }
+
+    // Debug: dump root directory content
+    print_raw(st, b"[find_efi_boot] root_lba=\0");
+    print_dec(st, root_lba as u64);
+    print_raw(st, b" root_size=\0");
+    print_dec(st, root_size as u64);
+    print_raw(st, b" iso_lba=\0");
+    print_dec(st, iso_lba);
+    print_raw(st, b"\r\n\0");
+    None
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -590,11 +614,14 @@ fn patch_grub_cfg_blockio(
     }; 8];
     let mut entry_count = 0usize;
 
-    let known_paths: [(&[u8], &[u8], &[u8], &[u8]); 4] = [
-        (b"BOOT", b"GRUB", b"GRUB.CFG",     b"/boot/grub/grub.cfg"),
-        (b"BOOT", b"GRUB", b"LOOPBACK.CFG", b"/boot/grub/loopback.cfg"),
-        (b"EFI", b"BOOT", b"GRUB.CFG",      b"/EFI/BOOT/grub.cfg"),
-        (b"",     b"",    b"GRUB.CFG",      b"/grub.cfg"),
+    let known_paths: [(&[u8], &[u8], &[u8], &[u8]); 7] = [
+        (b"BOOT", b"GRUB",  b"GRUB.CFG",     b"/boot/grub/grub.cfg"),
+        (b"BOOT", b"GRUB",  b"LOOPBACK.CFG", b"/boot/grub/loopback.cfg"),
+        (b"BOOT", b"GRUB2", b"GRUB.CFG",     b"/boot/grub2/grub.cfg"),
+        (b"BOOT", b"GRUB2", b"LOOPBACK.CFG", b"/boot/grub2/loopback.cfg"),
+        (b"EFI",  b"BOOT",  b"GRUB.CFG",     b"/EFI/BOOT/grub.cfg"),
+        (b"",     b"",      b"GRUB.CFG",     b"/grub.cfg"),
+        (b"",     b"",      b"GRUB.CFG",     b"/grub2/grub.cfg"),
     ];
 
     for (dir1, dir2, filename, path) in &known_paths {
@@ -707,23 +734,33 @@ fn recursive_find_cfg_with_loc(
 //  DevicePath builder
 // ═══════════════════════════════════════════════════════════════════════════
 
-fn build_iso_device_path(bs: &mut BootServices, iso_size_bytes: u64) -> *mut c_void {
+fn build_iso_device_path(bs: &mut BootServices, iso_size_bytes: u64, efi_filename: &[u8]) -> *mut c_void {
     const CDROM_NODE: [u8; 24] = {
         let mut n = [0u8; 24];
         n[0] = 0x04; n[1] = 0x02; n[2] = 24; n[3] = 0;
         n
     };
-    let file_name: [u16; 22] = [
-        b'\\' as u16, b'E' as u16, b'F' as u16, b'I' as u16,
-        b'\\' as u16, b'B' as u16, b'O' as u16, b'O' as u16, b'T' as u16,
-        b'\\' as u16,
-        b'B' as u16, b'O' as u16, b'O' as u16, b'T' as u16, b'X' as u16,
-        b'6' as u16, b'4' as u16, b'.' as u16, b'E' as u16, b'F' as u16, b'I' as u16,
-        0x0000,
-    ];
+
+    // Build UTF-16 path dynamically from the matched EFI filename
+    let mut file_name = [0u16; 32];
+    let mut idx = 0;
+    // \EFI\BOOT\
+    for &ch in b"\\EFI\\BOOT\\" {
+        file_name[idx] = ch as u16;
+        idx += 1;
+    }
+    // Append the EFI filename (e.g., BOOTX64.EFI, BOOTIA32.EFI)
+    for i in 0..efi_filename.len().min(32 - idx - 1) {
+        file_name[idx] = efi_filename[i] as u16;
+        idx += 1;
+    }
+    // Null terminator
+    file_name[idx] = 0;
+    idx += 1;
+
     const END_NODE: [u8; 4] = [0x7F, 0xFF, 0x04, 0x00];
 
-    let file_body_bytes = file_name.len() * 2;
+    let file_body_bytes = idx * 2;
     let total = CDROM_NODE.len() + 4 + file_body_bytes + END_NODE.len();
     let mut ptr: *mut c_void = core::ptr::null_mut();
     if unsafe { (bs.allocate_pool)(MemoryType::EfiLoaderData, total, &mut ptr) } != EFI_SUCCESS || ptr.is_null() {
@@ -733,7 +770,13 @@ fn build_iso_device_path(bs: &mut BootServices, iso_size_bytes: u64) -> *mut c_v
     unsafe {
         dp.copy_from_nonoverlapping(CDROM_NODE.as_ptr(), CDROM_NODE.len());
         *(dp.add(8) as *mut u64) = 0u64.to_le();
-        *(dp.add(16) as *mut u64) = (iso_size_bytes / 2048).to_le();
+        // Partition Start — 0 for virtual CD-ROM backed by an ISO file.
+        // On physical CD-ROM this is typically 16 (after the System Area).
+        // Some firmware rejects the DevicePath if this field is set to the
+        // ISO size (as was done previously), causing LoadImage to return
+        // EFI_UNSUPPORTED.
+        let partition_start = 0u64;
+        *(dp.add(16) as *mut u64) = partition_start.to_le();
         let mut off = 24usize;
         dp.add(off).write_volatile(0x04u8); off += 1;
         dp.add(off).write_volatile(0x04u8); off += 1;
@@ -745,6 +788,177 @@ fn build_iso_device_path(bs: &mut BootServices, iso_size_bytes: u64) -> *mut c_v
     ptr
 }
 
+/// Build a CD-ROM-only DevicePath (Media + End nodes, no File Path).
+/// Used as a fallback when firmware rejects the synthetic file path node
+/// but requires a DevicePath to locate the virtual CD-ROM handle.
+fn build_cdrom_only_device_path(bs: &mut BootServices, _iso_size_bytes: u64) -> *mut c_void {
+    const CDROM_NODE: [u8; 24] = {
+        let mut n = [0u8; 24];
+        n[0] = 0x04; n[1] = 0x02; n[2] = 24; n[3] = 0;
+        n
+    };
+    const END_NODE: [u8; 4] = [0x7F, 0xFF, 0x04, 0x00];
+    let total = CDROM_NODE.len() + END_NODE.len();
+    let mut ptr: *mut c_void = core::ptr::null_mut();
+    if unsafe { (bs.allocate_pool)(MemoryType::EfiLoaderData, total, &mut ptr) } != EFI_SUCCESS || ptr.is_null() {
+        return core::ptr::null_mut();
+    }
+    let dp = ptr as *mut u8;
+    unsafe {
+        dp.copy_from_nonoverlapping(CDROM_NODE.as_ptr(), CDROM_NODE.len());
+        *(dp.add(8) as *mut u64) = 0u64.to_le();
+        *(dp.add(16) as *mut u64) = 0u64.to_le(); // Partition Start = 0
+        dp.add(CDROM_NODE.len())
+            .copy_from_nonoverlapping(END_NODE.as_ptr(), END_NODE.len());
+    }
+    ptr
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Boot dispatcher — routes to the correct boot method by payload type
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn boot_payload_by_type(
+    st: &mut SystemTable,
+    image_handle: *mut c_void,
+    disk_handle: *mut c_void,
+    part1_lba: u64,
+    payloads: &[PayloadEntry; PAYLOAD_SLOT_COUNT],
+    idx: usize,
+    bio_ref: &BlockIoProtocol,
+    bio_ptr: *mut BlockIoProtocol,
+    mid: u32,
+) -> ! {
+    if idx >= payloads.len() {
+        print_raw(st, b"ERROR: payload index out of range.\r\n\0");
+        halt_or_reboot(st);
+    }
+    let p = &payloads[idx];
+    match p.payload_type {
+        PayloadType::Iso => uefi_chainload_iso(st, image_handle, part1_lba, payloads, idx, bio_ref, bio_ptr, mid),
+        PayloadType::Wim => boot_wim_payload(st, image_handle, part1_lba, payloads, idx, bio_ref, bio_ptr, mid),
+        PayloadType::Vhd | PayloadType::Vhdx => boot_vhd_payload(st, image_handle, part1_lba, payloads, idx, bio_ref, bio_ptr, mid),
+        PayloadType::Img => boot_img_payload(st, image_handle, part1_lba, payloads, idx, bio_ref, bio_ptr, mid),
+        PayloadType::Efi => boot_efi_payload(st, image_handle, payloads, idx, bio_ref, bio_ptr, mid),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Generic payload boot stubs — full implementations to be added as needed
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn boot_wim_payload(
+    st: &mut SystemTable,
+    _image_handle: *mut c_void,
+    _part1_lba: u64,
+    _payloads: &[PayloadEntry; PAYLOAD_SLOT_COUNT],
+    _idx: usize,
+    _bio_ref: &BlockIoProtocol,
+    _bio_ptr: *mut BlockIoProtocol,
+    _mid: u32,
+) -> ! {
+    print_raw(st, b"WIM boot: not yet implemented.\r\n\0");
+    print_raw(st, b"  Windows PE / WIM boot requires a Windows Boot Manager\r\n\0");
+    print_raw(st, b"  (bootmgfw.efi) on the ESP.  Place boot.wim and boot.sdi\r\n\0");
+    print_raw(st, b"  alongside the WIM file and configure BCD manually.\r\n\0");
+    halt_or_reboot(st);
+}
+
+fn boot_vhd_payload(
+    st: &mut SystemTable,
+    _image_handle: *mut c_void,
+    _part1_lba: u64,
+    _payloads: &[PayloadEntry; PAYLOAD_SLOT_COUNT],
+    _idx: usize,
+    _bio_ref: &BlockIoProtocol,
+    _bio_ptr: *mut BlockIoProtocol,
+    _mid: u32,
+) -> ! {
+    print_raw(st, b"VHD/VHDX boot: not yet implemented.\r\n\0");
+    print_raw(st, b"  Virtual-disk boot requires converting the VHD to\r\n\0");
+    print_raw(st, b"  a virtual BlockIo and chainloading a VHD-aware OS.\r\n\0");
+    halt_or_reboot(st);
+}
+
+fn boot_img_payload(
+    st: &mut SystemTable,
+    _image_handle: *mut c_void,
+    _part1_lba: u64,
+    _payloads: &[PayloadEntry; PAYLOAD_SLOT_COUNT],
+    _idx: usize,
+    _bio_ref: &BlockIoProtocol,
+    _bio_ptr: *mut BlockIoProtocol,
+    _mid: u32,
+) -> ! {
+    print_raw(st, b"IMG boot: not yet implemented.\r\n\0");
+    print_raw(st, b"  Raw disk-image boot requires creating a virtual BlockIo\r\n\0");
+    print_raw(st, b"  and chainloading the image's EFI bootloader.\r\n\0");
+    halt_or_reboot(st);
+}
+
+fn boot_efi_payload(
+    st: &mut SystemTable,
+    image_handle: *mut c_void,
+    payloads: &[PayloadEntry; PAYLOAD_SLOT_COUNT],
+    idx: usize,
+    bio_ref: &BlockIoProtocol,
+    bio_ptr: *mut BlockIoProtocol,
+    mid: u32,
+) -> ! {
+    let p = &payloads[idx];
+    let bs = unsafe { &mut *st.boot_services };
+    let media_block_size = if !unsafe { (*bio_ptr).media }.is_null() {
+        unsafe { (*(*bio_ptr).media).bim_bs }
+    } else {
+        512
+    };
+    let block_count = ((p.file_size + media_block_size as u64 - 1) / media_block_size as u64) as usize;
+    let buf_size = block_count * media_block_size as usize;
+    let mut buf_ptr: *mut c_void = core::ptr::null_mut();
+    if unsafe { (bs.allocate_pool)(MemoryType::EfiLoaderData, buf_size, &mut buf_ptr) } != EFI_SUCCESS || buf_ptr.is_null() {
+        print_raw(st, b"ERROR: Out of memory for EFI payload.\r\n\0");
+        halt_or_reboot(st);
+    }
+    let status = unsafe {
+        (bio_ref.read_blocks)(bio_ptr, mid, p.file_start_lba, buf_size, buf_ptr)
+    };
+    if status != EFI_SUCCESS {
+        print_raw(st, b"ERROR: Failed to read EFI payload.\r\n\0");
+        unsafe { (bs.free_pool)(buf_ptr); }
+        halt_or_reboot(st);
+    }
+
+    print_raw(st, b"Booting EFI payload: \0");
+    print_raw(st, &p.name[..p.name_len.min(120)]);
+    print_raw(st, b" ...\r\n\0");
+
+    let mut child_handle: *mut c_void = core::ptr::null_mut();
+    let load_status = unsafe {
+        (bs.load_image)(false, image_handle, core::ptr::null_mut(),
+            buf_ptr as *const u8, p.file_size, &mut child_handle)
+    };
+    if load_status != EFI_SUCCESS {
+        print_hex(st, b"ERROR: LoadImage failed, status=0x", load_status as u64);
+        print_raw(st, b"\r\n\0");
+        unsafe { (bs.free_pool)(buf_ptr); }
+        halt_or_reboot(st);
+    }
+    unsafe { (bs.free_pool)(buf_ptr); }
+
+    let mut lip: *mut LoadedImageProtocol = core::ptr::null_mut();
+    if unsafe { (bs.handle_protocol)(child_handle, &LOADED_IMAGE_PROTOCOL_GUID, &mut lip as *mut _ as _) } == EFI_SUCCESS && !lip.is_null() {
+        unsafe {
+            (*lip).device_handle = image_handle;
+            (*lip).parent_handle = image_handle;
+        }
+    }
+    print_raw(st, b"Starting EFI payload...\r\n\0");
+    let result = unsafe { (bs.start_image)(child_handle, &mut 0u64, &mut core::ptr::null_mut::<u16>()) };
+    print_hex(st, b"StartImage returned 0x", result as u64);
+    print_raw(st, b"\r\n\0");
+    halt_or_reboot(st);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Main chainload entry
 // ═══════════════════════════════════════════════════════════════════════════
@@ -753,7 +967,7 @@ fn uefi_chainload_iso(
     st: &mut SystemTable,
     image_handle: *mut c_void,
     part1_lba: u64,
-    files: &[IsoEntry; 64],
+    files: &[PayloadEntry; PAYLOAD_SLOT_COUNT],
     idx: usize,
     bio_ref: &BlockIoProtocol,
     bio_ptr: *mut BlockIoProtocol,
@@ -777,13 +991,33 @@ fn uefi_chainload_iso(
         }
     };
 
-    // ── Build premount cpio ──────────────────────────────────────────
-    let needs_sr = if !sfs_instance.is_null() {
-        unsafe { crate::strategy::needs_sr_mod(&(*sfs_instance).ctx) }
+    // ── Build premount cpio (fixup type depends on strategy) ──────────
+    let premount_bundle = if !sfs_instance.is_null() {
+        let ctx = unsafe { &(*sfs_instance).ctx };
+        let fixup = crate::strategy::get_fixup_type(ctx);
+        match fixup {
+            crate::strategy::FixupType::Alpine =>
+                crate::premount::prepare_alpine_initrd(bs, iso_lba - part1_lba, iso_name),
+            crate::strategy::FixupType::AlpinePremount => {
+                // AlpinePremount uses the standard premount initrd
+                // (casper-style hook) instead of a custom /init.choosable.
+                crate::premount::prepare_premount_initrd(bs, iso_lba - part1_lba, false, iso_name)
+            }
+            crate::strategy::FixupType::Arch => {
+                // ArchISO: premount initrd mounts ISO at /run/archiso/bootmnt
+                // after the initramfs has already started.  The kernel
+                // cmdline archisodevice=... handles the rest.
+                crate::premount::prepare_premount_initrd(bs, iso_lba - part1_lba, false, iso_name)
+            }
+            crate::strategy::FixupType::WindowsPE => None,
+            _ => {
+                let needs_sr = crate::strategy::needs_sr_mod(ctx);
+                crate::premount::prepare_premount_initrd(bs, iso_lba - part1_lba, needs_sr, iso_name)
+            }
+        }
     } else {
-        true
+        crate::premount::prepare_premount_initrd(bs, iso_lba - part1_lba, true, iso_name)
     };
-    let premount_bundle = crate::premount::prepare_premount_initrd(bs, iso_lba - part1_lba, needs_sr);
     if premount_bundle.is_none() {
         print_raw(st, b"[premount] allocation failed, skipping\r\n\0");
     }
@@ -894,7 +1128,7 @@ fn uefi_chainload_iso(
         }
     }
 
-    let locator = FileBackedIsoLocator::from_iso_entry(
+    let locator = FileBackedIsoLocator::from_payload_entry(
         &files[idx],
         crate::protocol::Guid { d1: 0, d2: 0, d3: 0, d4: [0u8; 8] },
         1, part1_lba,
@@ -904,7 +1138,7 @@ fn uefi_chainload_iso(
     patch_grub_cfg_blockio(st, bs, vbio_ptr, sfs_instance, bio_ref, bio_ptr, mid, iso_lba, iso_name,
         &live_uuid, Some(&iso_loc));
 
-    let (efi_lba, efi_size) = match find_efi_boot(st, bio_ref, bio_ptr, mid, iso_lba) {
+    let (efi_lba, efi_size, efi_filename) = match find_efi_boot(st, bio_ref, bio_ptr, mid, iso_lba) {
         Some(v) => v,
         None => {
             print_raw(st, b"ERROR: /EFI/BOOT/BOOTX64.EFI not found in ISO.\r\n\0");
@@ -918,19 +1152,46 @@ fn uefi_chainload_iso(
             halt_or_reboot(st);
         }
     };
-    let device_path = build_iso_device_path(bs, iso_size);
+    let device_path = build_iso_device_path(bs, iso_size, efi_filename);
     print_raw(st, b"Loading EFI image...\r\n\0");
     print_raw(st, b"EFI image size=\0");
     print_dec(st, buf_len as u64);
     print_raw(st, b" bytes\r\n\0");
 
-    // UEFI spec: when SourceBuffer is non-NULL, FilePath may be NULL.
-    // InsydeH2O may reject a synthetic DevicePath, so pass NULL.
+    // Most firmware accepts the synthetic DevicePath; some (InsydeH2O)
+    // reject it and require NULL when SourceBuffer is set.  Try the
+    // DevicePath first, then retry with NULL on EFI_UNSUPPORTED, and
+    // finally retry with a CD-ROM-only DevicePath (no file path node)
+    // which some firmware prefers over NULL.
     let mut child_handle: *mut c_void = core::ptr::null_mut();
-    let load_status = unsafe {
-        (bs.load_image)(false, image_handle, core::ptr::null_mut(),
+    let mut load_status = unsafe {
+        (bs.load_image)(false, image_handle,
+            device_path as *mut crate::protocol::DevicePathProtocol,
             buf_ptr, buf_len as u64, &mut child_handle)
     };
+    if load_status == crate::protocol::EFI_INVALID_PARAMETER || load_status == crate::protocol::EFI_UNSUPPORTED {
+        // Retry with NULL DevicePath (firmware rejects synthetic path).
+        load_status = unsafe {
+            (bs.load_image)(false, image_handle, core::ptr::null_mut(),
+                buf_ptr, buf_len as u64, &mut child_handle)
+        };
+    }
+    if load_status == crate::protocol::EFI_INVALID_PARAMETER || load_status == crate::protocol::EFI_UNSUPPORTED {
+        // Retry with CD-ROM-only DevicePath (no file path node).
+        // Some firmware needs a real DevicePath to locate the
+        // device, but rejects the synthetic file path.
+        let cdrom_only_dp = build_cdrom_only_device_path(bs, iso_size);
+        if !cdrom_only_dp.is_null() {
+            load_status = unsafe {
+                (bs.load_image)(false, image_handle,
+                    cdrom_only_dp as *mut crate::protocol::DevicePathProtocol,
+                    buf_ptr, buf_len as u64, &mut child_handle)
+            };
+            if load_status != EFI_SUCCESS {
+                unsafe { (bs.free_pool)(cdrom_only_dp); }
+            }
+        }
+    }
     if load_status != EFI_SUCCESS {
         print_hex(st, b"ERROR: LoadImage failed, status=0x", load_status as u64);
         print_raw(st, b"\r\nEFI size=\0");
@@ -1012,7 +1273,7 @@ pub fn boot_iso(
     image_handle: *mut c_void,
     _disk_handle: *mut c_void,
     part1_lba: u64,
-    files: &[IsoEntry; 64],
+    files: &[PayloadEntry; PAYLOAD_SLOT_COUNT],
     idx: usize,
     bio_ref: &BlockIoProtocol,
     bio_ptr: *mut BlockIoProtocol,
@@ -1022,13 +1283,13 @@ pub fn boot_iso(
     uefi_chainload_iso(st, image_handle, part1_lba, files, idx, bio_ref, bio_ptr, mid);
 }
 
-use crate::fs::scan_directory;
+use crate::fs::scan_payloads;
 
-pub fn show_menu(
+pub fn show_payload_menu(
     st: &mut SystemTable,
     image_handle: *mut c_void,
     disk_handle: *mut c_void,
-    files: &[IsoEntry; 64],
+    payloads: &[PayloadEntry; PAYLOAD_SLOT_COUNT],
     count: usize,
     ctx: &FsCtx,
     bio_ref: &BlockIoProtocol,
@@ -1036,19 +1297,32 @@ pub fn show_menu(
     mid: u32,
 ) -> ! {
     if count == 0 {
-        print_raw(st, b"\r\nNo ISO files found on partition 1.\r\n\0");
+        print_raw(st, b"\r\nNo bootable payloads found on partition 1.\r\n\0");
         halt_or_reboot(st);
     }
     print_raw(st, b"\r\n=== Choosable UEFI Boot Menu ===\r\n\0");
-    for i in 0..count.min(20) {
+    for i in 0..count.min(10) {
         let (sb, sl) = format_u64_buf((i + 1) as u64);
         print_raw(st, b" "); print_raw(st, &sb[20 - sl..]); print_raw(st, b". ");
-        if files[i].name_len > 0 && files[i].name[0] != 0 {
-            print_raw(st, &files[i].name[..files[i].name_len]);
+        if payloads[i].name_len > 0 && payloads[i].name[0] != 0 {
+            print_raw(st, &payloads[i].name[..payloads[i].name_len]);
         }
-        let size_mb = files[i].file_size / (1024 * 1024);
+        let (type_str, is_supported): (&[u8], bool) = match payloads[i].payload_type {
+            PayloadType::Iso => (b" ISO ", true),
+            PayloadType::Wim => (b" WIM  [unsupported]", false),
+            PayloadType::Vhd => (b" VHD  [unsupported]", false),
+            PayloadType::Vhdx => (b" VHDX [unsupported]", false),
+            PayloadType::Img => (b" IMG  [unsupported]", false),
+            PayloadType::Efi => (b" EFI ", true),
+        };
+        let size_mb = payloads[i].file_size / (1024 * 1024);
         let (sb2, sl2) = format_u64_buf(size_mb);
-        print_raw(st, b" ("); print_raw(st, &sb2[20 - sl2..]); print_raw(st, b" MiB)\r\n\0");
+        print_raw(st, type_str);
+        if is_supported {
+            print_raw(st, b" ("); print_raw(st, &sb2[20 - sl2..]); print_raw(st, b" MiB)\r\n\0");
+        } else {
+            print_raw(st, b"\r\n\0");
+        }
     }
     print_raw(st, b"Enter number to boot (or 'r' to scan): \0");
 
@@ -1065,19 +1339,29 @@ pub fn show_menu(
         if (b'1'..=b'9').contains(&ch) {
             let idx = (ch - b'1') as usize;
             if idx < count {
-                boot_iso(st, image_handle, disk_handle, ctx.part1_lba, files, idx, bio_ref, bio_ptr, mid);
-                halt_or_reboot(st); // boot_iso returned — fatal error
+                let is_supported = matches!(payloads[idx].payload_type, PayloadType::Iso | PayloadType::Efi);
+                if !is_supported {
+                    print_raw(st, b"\r\nPayload type not yet implemented. Press any key to continue...\r\n\0");
+                    continue;
+                }
+                boot_payload_by_type(st, image_handle, disk_handle, ctx.part1_lba, payloads, idx, bio_ref, bio_ptr, mid);
             }
         } else if ch == b'0' && count >= 10 {
-            boot_iso(st, image_handle, disk_handle, ctx.part1_lba, files, 9, bio_ref, bio_ptr, mid);
-            halt_or_reboot(st); // boot_iso returned — fatal error
+            let is_supported = matches!(payloads[9].payload_type, PayloadType::Iso | PayloadType::Efi);
+            if !is_supported {
+                print_raw(st, b"\r\nPayload type not yet implemented. Press any key to continue...\r\n\0");
+                continue;
+            }
+            boot_payload_by_type(st, image_handle, disk_handle, ctx.part1_lba, payloads, 9, bio_ref, bio_ptr, mid);
         } else if ch == b'r' || ch == b'R' {
             print_raw(st, b"\r\nRe-scanning...\r\n\0");
-            let mut new_files: [IsoEntry; 64] = unsafe { core::mem::zeroed() };
+            let mut new_payloads: [PayloadEntry; PAYLOAD_SLOT_COUNT] = [PayloadEntry {
+                name: [0; 256], name_len: 0, file_start_lba: 0, file_size: 0,
+                payload_type: PayloadType::Iso,
+            }; PAYLOAD_SLOT_COUNT];
             let mut new_count: usize = 0;
-            scan_directory(bio_ref, bio_ptr, mid, ctx, &mut new_files, &mut new_count);
-            show_menu(st, image_handle, disk_handle, &new_files, new_count, ctx, bio_ref, bio_ptr, mid);
+            scan_payloads(bio_ref, bio_ptr, mid, ctx, &mut new_payloads, &mut new_count);
+            show_payload_menu(st, image_handle, disk_handle, &new_payloads, new_count, ctx, bio_ref, bio_ptr, mid);
         }
     }
-    halt_or_reboot(st)
 }

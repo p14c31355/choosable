@@ -16,6 +16,7 @@
 //    - Additional backends (HTTP, PXE, RAM disk) can be added by
 //      implementing this trait.
 
+use crate::fs::PayloadEntry;
 use crate::protocol::Guid;
 
 /// Physical location of an ISO file on a block device.
@@ -119,9 +120,9 @@ pub struct FileBackedIsoLocator {
 }
 
 impl FileBackedIsoLocator {
-    /// Build a locator from an IsoEntry and partition information.
-    pub fn from_iso_entry(
-        entry: &crate::fs::IsoEntry,
+    /// Build a locator from a payload entry and partition information.
+    pub fn from_payload_entry(
+        entry: &PayloadEntry,
         partition_guid: Guid,
         partition_number: u32,
         part1_lba: u64,
@@ -150,4 +151,104 @@ impl IsoLocator for FileBackedIsoLocator {
     }
 }
 
-unsafe impl Sync for FileBackedIsoLocator {}
+// ═══════════════════════════════════════════════════════════════════════════
+//  WimPayloadLocator — Windows Imaging Format payload
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub struct WimPayloadLocator {
+    pub location: IsoLocation,
+}
+
+impl WimPayloadLocator {
+    pub fn from_payload_entry(entry: &PayloadEntry, partition_guid: Guid, partition_number: u32, part1_lba: u64) -> Self {
+        let mut file_path = [0u8; 256];
+        let name_len = entry.name_len.min(255);
+        file_path[..name_len].copy_from_slice(&entry.name[..name_len]);
+        WimPayloadLocator {
+            location: IsoLocation {
+                partition_guid,
+                partition_number,
+                file_path,
+                file_path_len: name_len,
+                file_size: entry.file_size,
+                part1_lba,
+                iso_lba: entry.file_start_lba,
+            },
+        }
+    }
+}
+
+impl BootPayloadLocator for WimPayloadLocator {
+    type Location = IsoLocation;
+    fn locate(&self) -> IsoLocation { self.location }
+    fn payload_type(&self) -> &'static str { "WIM" }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  VhdPayloadLocator — VHD/VHDX virtual disk payload
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub struct VhdPayloadLocator {
+    pub location: IsoLocation,
+    pub is_vhdx: bool,
+}
+
+impl VhdPayloadLocator {
+    pub fn from_payload_entry(entry: &PayloadEntry, partition_guid: Guid, partition_number: u32, part1_lba: u64) -> Self {
+        let mut file_path = [0u8; 256];
+        let name_len = entry.name_len.min(255);
+        file_path[..name_len].copy_from_slice(&entry.name[..name_len]);
+        let is_vhdx = matches!(entry.payload_type, crate::fs::PayloadType::Vhdx);
+        VhdPayloadLocator {
+            location: IsoLocation {
+                partition_guid,
+                partition_number,
+                file_path,
+                file_path_len: name_len,
+                file_size: entry.file_size,
+                part1_lba,
+                iso_lba: entry.file_start_lba,
+            },
+            is_vhdx,
+        }
+    }
+}
+
+impl BootPayloadLocator for VhdPayloadLocator {
+    type Location = IsoLocation;
+    fn locate(&self) -> IsoLocation { self.location }
+    fn payload_type(&self) -> &'static str { if self.is_vhdx { "VHDX" } else { "VHD" } }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  EfiPayloadLocator — raw EFI executable payload
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub struct EfiPayloadLocator {
+    pub location: IsoLocation,
+}
+
+impl EfiPayloadLocator {
+    pub fn from_payload_entry(entry: &PayloadEntry, partition_guid: Guid, partition_number: u32, part1_lba: u64) -> Self {
+        let mut file_path = [0u8; 256];
+        let name_len = entry.name_len.min(255);
+        file_path[..name_len].copy_from_slice(&entry.name[..name_len]);
+        EfiPayloadLocator {
+            location: IsoLocation {
+                partition_guid,
+                partition_number,
+                file_path,
+                file_path_len: name_len,
+                file_size: entry.file_size,
+                part1_lba,
+                iso_lba: entry.file_start_lba,
+            },
+        }
+    }
+}
+
+impl BootPayloadLocator for EfiPayloadLocator {
+    type Location = IsoLocation;
+    fn locate(&self) -> IsoLocation { self.location }
+    fn payload_type(&self) -> &'static str { "EFI" }
+}

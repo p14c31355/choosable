@@ -82,7 +82,19 @@ impl VirtualMedia for IsoMedia {
         if dst_offset > dst.len() || dst.len() - dst_offset < 2048 {
             return false;
         }
-        let disk_lba = self.iso_lba + block_lba * 4;
+        // Validate that 2048-byte ISO sectors are an exact multiple of backing block size
+        let backing_block_size = unsafe {
+            if (*self.real_bio_ptr).media.is_null() {
+                512
+            } else {
+                (*(*self.real_bio_ptr).media).bim_bs
+            }
+        };
+        if backing_block_size == 0 || 2048 % backing_block_size != 0 {
+            return false;
+        }
+        let sectors_per_iso_block = 2048 / backing_block_size;
+        let disk_lba = self.iso_lba + block_lba * sectors_per_iso_block as u64;
         unsafe {
             ((*self.real_bio_ptr).read_blocks)(
                 self.real_bio_ptr,
@@ -102,9 +114,113 @@ impl VirtualMedia for IsoMedia {
         2048
     }
 
-    fn media_type(&self) -> &'static str {
-        "ISO"
+    fn media_type(&self) -> &'static str { "ISO" }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  RawMedia — raw disk image (.img) backed by a physical disk extent
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub struct RawMedia {
+    pub start_lba: u64,
+    pub total_blocks: u64,
+    pub real_bio_ptr: *mut BlockIoProtocol,
+    pub real_media_id: u32,
+    pub sector_size: u32,
+}
+
+impl VirtualMedia for RawMedia {
+    fn read_block(&self, block_lba: u64, dst: &mut [u8], dst_offset: usize) -> bool {
+        if block_lba >= self.total_blocks { return false; }
+        let sector_size = self.sector_size.max(512) as u64;
+        if sector_size > 65536 { return false; }
+        if dst_offset as u64 + sector_size > dst.len() as u64 { return false; }
+        // Validate that virtual sector size is an exact multiple of backing block size
+        let backing_block_size = unsafe {
+            if (*self.real_bio_ptr).media.is_null() {
+                512
+            } else {
+                (*(*self.real_bio_ptr).media).bim_bs
+            }
+        } as u64;
+        if backing_block_size == 0 || sector_size % backing_block_size != 0 {
+            return false;
+        }
+        let sectors_per_block = sector_size / backing_block_size;
+        let disk_lba = match block_lba
+            .checked_mul(sectors_per_block)
+            .and_then(|off| self.start_lba.checked_add(off))
+        {
+            Some(lba) => lba,
+            None => return false,
+        };
+        unsafe {
+            ((*self.real_bio_ptr).read_blocks)(
+                self.real_bio_ptr, self.real_media_id,
+                disk_lba, sector_size as usize,
+                dst.as_mut_ptr().add(dst_offset) as *mut c_void,
+            ) == EFI_SUCCESS
+        }
     }
+    fn block_count(&self) -> u64 { self.total_blocks }
+    fn block_size(&self) -> u32 { self.sector_size.max(512) }
+    fn media_type(&self) -> &'static str { "IMG" }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  VhdMedia — FIXED VHD only (contiguous data layout)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+//  This implementation is restricted to FIXED VHD images where all data
+//  occupies a contiguous extent starting at `data_lba`.  Dynamic VHD and
+//  VHDX formats require block allocation table (BAT) mapping, which is
+//  NOT implemented here.  Any dynamic or differencing VHD/VHDX will produce
+//  incorrect reads and must not use this VirtualMedia implementation.
+
+pub struct VhdMedia {
+    pub data_lba: u64,
+    pub total_blocks: u64,
+    pub real_bio_ptr: *mut BlockIoProtocol,
+    pub real_media_id: u32,
+    pub sector_size: u32,
+}
+
+impl VirtualMedia for VhdMedia {
+    fn read_block(&self, block_lba: u64, dst: &mut [u8], dst_offset: usize) -> bool {
+        if block_lba >= self.total_blocks { return false; }
+        let sector_size = self.sector_size.max(512) as u64;
+        if sector_size > 65536 { return false; }
+        if dst_offset as u64 + sector_size > dst.len() as u64 { return false; }
+        // Validate that virtual sector size is an exact multiple of backing block size
+        let backing_block_size = unsafe {
+            if (*self.real_bio_ptr).media.is_null() {
+                512
+            } else {
+                (*(*self.real_bio_ptr).media).bim_bs
+            }
+        } as u64;
+        if backing_block_size == 0 || sector_size % backing_block_size != 0 {
+            return false;
+        }
+        let sectors_per_block = sector_size / backing_block_size;
+        let disk_lba = match block_lba
+            .checked_mul(sectors_per_block)
+            .and_then(|off| self.data_lba.checked_add(off))
+        {
+            Some(lba) => lba,
+            None => return false,
+        };
+        unsafe {
+            ((*self.real_bio_ptr).read_blocks)(
+                self.real_bio_ptr, self.real_media_id,
+                disk_lba, sector_size as usize,
+                dst.as_mut_ptr().add(dst_offset) as *mut c_void,
+            ) == EFI_SUCCESS
+        }
+    }
+    fn block_count(&self) -> u64 { self.total_blocks }
+    fn block_size(&self) -> u32 { self.sector_size.max(512) }
+    fn media_type(&self) -> &'static str { "VHD" }
 }
 
 /// ReadBlocks implementation for the virtual CD-ROM.
@@ -117,9 +233,21 @@ fn patch_dir_entry(entry: &mut [u8], off: usize, new_extent: u32, new_size: u32)
     entry[off + 14..off + 18].copy_from_slice(&new_size.to_be_bytes());
 }
 
-/// Helper: read one ISO sector (4 × 512B) from real disk into dst at offset
+/// Helper: read one ISO sector (2048B) from real disk into dst at offset
 fn read_real_iso_sector(vbio: &VirtualBlockIo, iso_sector: u64, dst: &mut [u8], dst_off: usize) -> bool {
-    let disk_lba = vbio.iso_lba + iso_sector * 4;
+    // Get backing media block size
+    let backing_block_size = unsafe {
+        if (*vbio.real_bio_ptr).media.is_null() {
+            512
+        } else {
+            (*(*vbio.real_bio_ptr).media).bim_bs
+        }
+    };
+    if backing_block_size == 0 || 2048 % backing_block_size != 0 {
+        return false;
+    }
+    let sectors_per_iso_block = 2048 / backing_block_size;
+    let disk_lba = vbio.iso_lba + iso_sector * sectors_per_iso_block as u64;
     unsafe {
         ((*vbio.real_bio_ptr).read_blocks)(
             vbio.real_bio_ptr,
@@ -218,6 +346,16 @@ unsafe extern "efiapi" fn vblock_read(
             dst[off + 80..off + 84].copy_from_slice(&new_vol_size.to_le_bytes());
             dst[off + 84..off + 88].copy_from_slice(&new_vol_size.to_be_bytes());
 
+            // Override Volume ID to "CHOOSABLE" (space-padded to 32 bytes)
+            // so that LABEL=Choosable kernel cmdline parameters
+            // (live-media, archisodevice, rd.live.image, etc.) work.
+            // ISO9660 Volume Identifier: bytes 40-71 (32 bytes, space-padded).
+            {
+                let label = b"CHOOSABLE                       ";
+                // label is exactly 32 bytes
+                dst[off + 40..off + 72].copy_from_slice(&label[0..32]);
+            }
+
             // If premount entry was injected (not patched over existing),
             // also update the root directory record data length in PVD
             // so GRUB walks past the synthetic PREMOUNT.CPIO record.
@@ -270,7 +408,11 @@ pub fn create_virtual_cdrom(
     unsafe {
         dp.copy_from_nonoverlapping(CDROM_NODE.as_ptr(), CDROM_NODE.len());
         *(dp.add(8) as *mut u64) = 0u64.to_le();
-        *(dp.add(16) as *mut u64) = (iso_size_bytes / 2048).to_le();
+        // Partition Start — must be 0 for virtual ISO-backed CD-ROM.
+        // Some firmware rejects the DevicePath if this is set to the
+        // volume size / last_block value.
+        let partition_start = 0u64;
+        *(dp.add(16) as *mut u64) = partition_start.to_le();
         dp.add(CDROM_NODE.len())
             .copy_from_nonoverlapping(END_NODE.as_ptr(), END_NODE.len());
     }

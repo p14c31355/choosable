@@ -15,7 +15,7 @@
 
 use core::ffi::c_void;
 
-use crate::fs::{FsCtx, FsType, IsoEntry};
+use crate::fs::{FsCtx, FsType, PayloadEntry, PAYLOAD_SLOT_COUNT};
 use crate::locator::IsoLocation;
 use crate::protocol::{BlockIoProtocol, SystemTable};
 
@@ -40,8 +40,8 @@ pub struct BootContext {
     pub fs_ctx: Option<FsCtx>,
 
     // ── Payload ───────────────────────────────────────────────────────
-    pub iso_files: [IsoEntry; 64],
-    pub iso_count: usize,
+    pub payloads: [PayloadEntry; PAYLOAD_SLOT_COUNT],
+    pub payload_count: usize,
     pub selected_index: Option<usize>,
 
     // ── Locator ───────────────────────────────────────────────────────
@@ -59,21 +59,30 @@ impl BootContext {
             partition_start_lba: 0,
             fs_type: None,
             fs_ctx: None,
-            iso_files: [IsoEntry { name: [0; 256], name_len: 0, file_start_lba: 0, file_size: 0 }; 64],
-            iso_count: 0,
+            payloads: [PayloadEntry {
+                name: [0; 256],
+                name_len: 0,
+                file_start_lba: 0,
+                file_size: 0,
+                payload_type: crate::fs::PayloadType::Iso,
+            }; PAYLOAD_SLOT_COUNT],
+            payload_count: 0,
             selected_index: None,
             iso_location: None,
         }
     }
 
-    /// Returns the selected ISO entry, or None if no selection has been made.
-    pub fn selected_iso(&self) -> Option<&IsoEntry> {
+    /// Returns the currently selected payload entry, or None.
+    pub fn selected_payload(&self) -> Option<&PayloadEntry> {
         self.selected_index.and_then(|idx| {
-            if idx < self.iso_count {
-                Some(&self.iso_files[idx])
-            } else {
-                None
-            }
+            if idx < self.payload_count { Some(&self.payloads[idx]) } else { None }
+        })
+    }
+
+    /// Returns a mutable reference to the currently selected payload, or None.
+    pub fn selected_payload_mut(&mut self) -> Option<&mut PayloadEntry> {
+        self.selected_index.and_then(|idx| {
+            if idx < self.payload_count { Some(&mut self.payloads[idx]) } else { None }
         })
     }
 }

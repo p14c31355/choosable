@@ -5,6 +5,8 @@
 use crate::disk::read_sector;
 use crate::protocol::{BlockIoProtocol, EFI_SUCCESS};
 
+pub const PAYLOAD_SLOT_COUNT: usize = 64;
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum FsType {
     Exfat,
@@ -28,12 +30,45 @@ pub struct FsCtx {
     pub mft_record_size: u64,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum PayloadType {
+    Iso,
+    Wim,
+    Vhd,
+    Vhdx,
+    Img,
+    Efi,
+}
+
 #[derive(Clone, Copy)]
 pub struct IsoEntry {
     pub name: [u8; 256],
     pub name_len: usize,
     pub file_start_lba: u64,
     pub file_size: u64,
+    pub payload_type: PayloadType,
+}
+
+/// Unified payload descriptor — supersedes `IsoEntry` for general payloads.
+#[derive(Clone, Copy)]
+pub struct PayloadEntry {
+    pub name: [u8; 256],
+    pub name_len: usize,
+    pub file_start_lba: u64,
+    pub file_size: u64,
+    pub payload_type: PayloadType,
+}
+
+impl From<IsoEntry> for PayloadEntry {
+    fn from(e: IsoEntry) -> Self {
+        PayloadEntry {
+            name: e.name,
+            name_len: e.name_len,
+            file_start_lba: e.file_start_lba,
+            file_size: e.file_size,
+            payload_type: e.payload_type,
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -223,22 +258,18 @@ let depth = path_prefix.iter().filter(|&&c| c == b'/').count();
                             bio_ref, bio_ptr, mid, start_cl, spc, fat_start, heap_start,
                             files, count, &sub_path[..sp],
                         );
-                    } else if name_pos >= 4
-                        && name_buf[name_pos - 4..name_pos]
-                            .eq_ignore_ascii_case(b".iso")
+                    } else if is_bootable_extension(&name_buf, name_pos)
                         && *count < 64
                     {
                         let file_lba = heap_start
                             + (start_cl as u64 - 2) * spc as u64;
 
-                        // Build full path
                         let prefix_len = path_prefix.len();
                         let mut full_buf = [0u8; 256];
                         let mut fp = 0usize;
                         full_buf[fp..fp + prefix_len].copy_from_slice(path_prefix);
                         fp += prefix_len;
                         if prefix_len == 1 && path_prefix[0] == b'/' {
-                            // root: "/" + "name" = "/name"
                         } else {
                             if fp < 256 { full_buf[fp] = b'/'; fp += 1; }
                         }
@@ -251,6 +282,7 @@ let depth = path_prefix.iter().filter(|&&c| c == b'/').count();
                             name_len: fp,
                             file_start_lba: file_lba,
                             file_size: fsize,
+                            payload_type: classify_payload_type(&name_buf, name_pos),
                         };
                         *count += 1;
                     }
@@ -456,11 +488,9 @@ let depth = path_prefix.iter().filter(|&&c| c == b'/').count();
                     continue;
                 }
 
-                let is_iso = name_len >= 4
-                    && name_buf[name_len - 4..name_len]
-                        .eq_ignore_ascii_case(b".iso");
+                let is_bootable = is_bootable_extension(&name_buf, name_len);
 
-                if is_iso && *count < 64 {
+                if is_bootable && *count < 64 {
                     let file_cl = u32::from_le_bytes([
                         buf[off + 26],
                         buf[off + 27],
@@ -476,15 +506,12 @@ let depth = path_prefix.iter().filter(|&&c| c == b'/').count();
                     let file_lba = data_start
                         + (file_cl as u64 - 2) * spc as u64;
 
-                    // Build full path: path_prefix is always "/"-prefixed.
-                    // If prefix is just "/", don't add another separator.
                     let prefix_len = path_prefix.len();
                     let mut full_buf = [0u8; 256];
                     let mut fp = 0usize;
                     full_buf[fp..fp + prefix_len].copy_from_slice(path_prefix);
                     fp += prefix_len;
                     if prefix_len == 1 && path_prefix[0] == b'/' {
-                        // root: "/" + "name" = "/name"
                     } else {
                         if fp < 256 { full_buf[fp] = b'/'; fp += 1; }
                     }
@@ -497,6 +524,7 @@ let depth = path_prefix.iter().filter(|&&c| c == b'/').count();
                         name_len: fp,
                         file_start_lba: file_lba,
                         file_size: file_sz as u64,
+                        payload_type: classify_payload_type(&name_buf, name_len),
                     };
                     *count += 1;
                 }
@@ -826,10 +854,8 @@ fn parse_ntfs_index_entries(
                         }
                     }
                 }
-                let is_iso = np >= 4
-                    && name_buf[np - 4..np]
-                        .eq_ignore_ascii_case(b".iso");
-                if is_iso && *count < 64 && mft_rec > 0 {
+                let is_bootable = is_bootable_extension(&name_buf, np);
+                if is_bootable && *count < 64 && mft_rec > 0 {
                     if let Some((lba, sz)) =
                         get_ntfs_file_lba(
                             bio_ref, bio_ptr, mid, ctx,
@@ -856,6 +882,7 @@ fn parse_ntfs_index_entries(
                             name_len: fp,
                             file_start_lba: lba,
                             file_size: sz,
+                            payload_type: classify_payload_type(&name_buf, np),
                         };
                         *count += 1;
                     }
@@ -872,6 +899,37 @@ fn parse_ntfs_index_entries(
 // ═══════════════════════════════════════════════════════════════════════════
 //  Unified scan dispatcher
 // ═══════════════════════════════════════════════════════════════════════════
+
+/// Returns true if the filename extension matches a known bootable format.
+pub fn is_bootable_extension(name: &[u8], name_len: usize) -> bool {
+    (name_len >= 4 && (name[name_len - 4..name_len].eq_ignore_ascii_case(b".iso")
+        || name[name_len - 4..name_len].eq_ignore_ascii_case(b".wim")
+        || name[name_len - 4..name_len].eq_ignore_ascii_case(b".vhd")
+        || name[name_len - 4..name_len].eq_ignore_ascii_case(b".img")
+        || name[name_len - 4..name_len].eq_ignore_ascii_case(b".efi")))
+    || (name_len >= 5 && name[name_len - 5..name_len].eq_ignore_ascii_case(b".vhdx"))
+}
+
+/// Returns the `PayloadType` for a filename based on its extension.
+fn classify_payload_type(name: &[u8], name_len: usize) -> PayloadType {
+    if name_len >= 4 && name[name_len - 4..name_len].eq_ignore_ascii_case(b".iso") {
+        PayloadType::Iso
+    } else if name_len >= 4 && name[name_len - 4..name_len].eq_ignore_ascii_case(b".wim") {
+        PayloadType::Wim
+    } else if name_len >= 4 && name[name_len - 4..name_len].eq_ignore_ascii_case(b".vhd")
+        && !(name_len >= 5 && name[name_len - 5..name_len].eq_ignore_ascii_case(b".vhdx"))
+    {
+        PayloadType::Vhd
+    } else if name_len >= 5 && name[name_len - 5..name_len].eq_ignore_ascii_case(b".vhdx") {
+        PayloadType::Vhdx
+    } else if name_len >= 4 && name[name_len - 4..name_len].eq_ignore_ascii_case(b".img") {
+        PayloadType::Img
+    } else if name_len >= 4 && name[name_len - 4..name_len].eq_ignore_ascii_case(b".efi") {
+        PayloadType::Efi
+    } else {
+        PayloadType::Iso
+    }
+}
 
 pub fn scan_directory(
     bio_ref: &BlockIoProtocol,
@@ -893,5 +951,31 @@ pub fn scan_directory(
         FsType::Ntfs => {
             scan_ntfs_dir(bio_ref, bio_ptr, mid, ctx, files, count, b"/");
         }
+    }
+}
+
+/// Generalized payload scanner — finds ISOs, WIMs, VHDs, VHDXs, IMGs, EFIs.
+pub fn scan_payloads(
+    bio_ref: &BlockIoProtocol,
+    bio_ptr: *mut BlockIoProtocol,
+    mid: u32,
+    ctx: &FsCtx,
+    payloads: &mut [PayloadEntry; PAYLOAD_SLOT_COUNT],
+    count: &mut usize,
+) {
+    let mut tmp: [IsoEntry; PAYLOAD_SLOT_COUNT] = [IsoEntry {
+        name: [0; 256], name_len: 0, file_start_lba: 0, file_size: 0,
+        payload_type: PayloadType::Iso,
+    }; PAYLOAD_SLOT_COUNT];
+    let mut tmp_count = 0usize;
+    scan_directory(bio_ref, bio_ptr, mid, ctx, &mut tmp, &mut tmp_count);
+    // Convert IsoEntry -> PayloadEntry. The filesystem scanners use
+    // is_bootable_extension to match bootable payloads of multiple types
+    // (.iso, .wim, .vhd, .vhdx, .img, .efi) and classify_payload_type
+    // to tag each entry with the correct PayloadType.
+    for i in 0..tmp_count {
+        if *count >= PAYLOAD_SLOT_COUNT { break; }
+        payloads[*count] = tmp[i].into();
+        *count += 1;
     }
 }
