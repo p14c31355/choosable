@@ -902,12 +902,12 @@ fn parse_ntfs_index_entries(
 
 /// Returns true if the filename extension matches a known bootable format.
 pub fn is_bootable_extension(name: &[u8], name_len: usize) -> bool {
-    (name_len >= 4 && (name[name_len - 4..].eq_ignore_ascii_case(b".iso")
-        || name[name_len - 4..].eq_ignore_ascii_case(b".wim")
-        || name[name_len - 4..].eq_ignore_ascii_case(b".vhd")
-        || name[name_len - 4..].eq_ignore_ascii_case(b".img")
-        || name[name_len - 4..].eq_ignore_ascii_case(b".efi")))
-    || (name_len >= 5 && name[name_len - 5..].eq_ignore_ascii_case(b".vhdx"))
+    (name_len >= 4 && (name[name_len - 4..name_len].eq_ignore_ascii_case(b".iso")
+        || name[name_len - 4..name_len].eq_ignore_ascii_case(b".wim")
+        || name[name_len - 4..name_len].eq_ignore_ascii_case(b".vhd")
+        || name[name_len - 4..name_len].eq_ignore_ascii_case(b".img")
+        || name[name_len - 4..name_len].eq_ignore_ascii_case(b".efi")))
+    || (name_len >= 5 && name[name_len - 5..name_len].eq_ignore_ascii_case(b".vhdx"))
 }
 
 /// Returns the `PayloadType` for a filename based on its extension.
@@ -969,15 +969,13 @@ pub fn scan_payloads(
     }; PAYLOAD_SLOT_COUNT];
     let mut tmp_count = 0usize;
     scan_directory(bio_ref, bio_ptr, mid, ctx, &mut tmp, &mut tmp_count);
-    // Convert IsoEntry -> PayloadEntry, filtering only .iso files from the ISO scanner.
+    // Convert IsoEntry -> PayloadEntry. The filesystem scanners use
+    // is_bootable_extension to match bootable payloads of multiple types
+    // (.iso, .wim, .vhd, .vhdx, .img, .efi) and classify_payload_type
+    // to tag each entry with the correct PayloadType.
     for i in 0..tmp_count {
         if *count >= PAYLOAD_SLOT_COUNT { break; }
         payloads[*count] = tmp[i].into();
         *count += 1;
     }
-    // The filesystem scanners above only match .iso files.
-    // For generalized payload discovery, additional extension matching
-    // would be added here (e.g., matching .wim, .vhd, .vhdx, .img, .efi
-    // in the raw directory entries). For now, the existing .iso scanner
-    // handles the most common case.
 }

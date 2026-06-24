@@ -838,8 +838,13 @@ fn boot_efi_payload(
 ) -> ! {
     let p = &payloads[idx];
     let bs = unsafe { &mut *st.boot_services };
-    let sector_count = ((p.file_size + 511) / 512) as usize;
-    let buf_size = sector_count * 512;
+    let media_block_size = if !unsafe { (*bio_ptr).media }.is_null() {
+        unsafe { (*(*bio_ptr).media).bim_bs }
+    } else {
+        512
+    };
+    let block_count = ((p.file_size + media_block_size as u64 - 1) / media_block_size as u64) as usize;
+    let buf_size = block_count * media_block_size as usize;
     let mut buf_ptr: *mut c_void = core::ptr::null_mut();
     if unsafe { (bs.allocate_pool)(MemoryType::EfiLoaderData, buf_size, &mut buf_ptr) } != EFI_SUCCESS || buf_ptr.is_null() {
         print_raw(st, b"ERROR: Out of memory for EFI payload.\r\n\0");
@@ -1186,18 +1191,22 @@ pub fn show_payload_menu(
         if payloads[i].name_len > 0 && payloads[i].name[0] != 0 {
             print_raw(st, &payloads[i].name[..payloads[i].name_len]);
         }
-        let type_str: &[u8] = match payloads[i].payload_type {
-            PayloadType::Iso => b" ISO ",
-            PayloadType::Wim => b" WIM ",
-            PayloadType::Vhd => b" VHD ",
-            PayloadType::Vhdx => b" VHDX",
-            PayloadType::Img => b" IMG ",
-            PayloadType::Efi => b" EFI ",
+        let (type_str, is_supported): (&[u8], bool) = match payloads[i].payload_type {
+            PayloadType::Iso => (b" ISO ", true),
+            PayloadType::Wim => (b" WIM  [unsupported]", false),
+            PayloadType::Vhd => (b" VHD  [unsupported]", false),
+            PayloadType::Vhdx => (b" VHDX [unsupported]", false),
+            PayloadType::Img => (b" IMG  [unsupported]", false),
+            PayloadType::Efi => (b" EFI ", true),
         };
         let size_mb = payloads[i].file_size / (1024 * 1024);
         let (sb2, sl2) = format_u64_buf(size_mb);
         print_raw(st, type_str);
-        print_raw(st, b" ("); print_raw(st, &sb2[20 - sl2..]); print_raw(st, b" MiB)\r\n\0");
+        if is_supported {
+            print_raw(st, b" ("); print_raw(st, &sb2[20 - sl2..]); print_raw(st, b" MiB)\r\n\0");
+        } else {
+            print_raw(st, b"\r\n\0");
+        }
     }
     print_raw(st, b"Enter number to boot (or 'r' to scan): \0");
 
@@ -1214,9 +1223,19 @@ pub fn show_payload_menu(
         if (b'1'..=b'9').contains(&ch) {
             let idx = (ch - b'1') as usize;
             if idx < count {
+                let is_supported = matches!(payloads[idx].payload_type, PayloadType::Iso | PayloadType::Efi);
+                if !is_supported {
+                    print_raw(st, b"\r\nPayload type not yet implemented. Press any key to continue...\r\n\0");
+                    continue;
+                }
                 boot_payload_by_type(st, image_handle, disk_handle, ctx.part1_lba, payloads, idx, bio_ref, bio_ptr, mid);
             }
         } else if ch == b'0' && count >= 10 {
+            let is_supported = matches!(payloads[9].payload_type, PayloadType::Iso | PayloadType::Efi);
+            if !is_supported {
+                print_raw(st, b"\r\nPayload type not yet implemented. Press any key to continue...\r\n\0");
+                continue;
+            }
             boot_payload_by_type(st, image_handle, disk_handle, ctx.part1_lba, payloads, 9, bio_ref, bio_ptr, mid);
         } else if ch == b'r' || ch == b'R' {
             print_raw(st, b"\r\nRe-scanning...\r\n\0");

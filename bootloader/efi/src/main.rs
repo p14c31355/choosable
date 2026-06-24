@@ -41,7 +41,7 @@ extern "efiapi" fn efi_main(
     // for PXE/HTTP boot:
     //   let mut stage4 = NetworkPayloadLocatorStage { url: None };
     //
-    // Replace SelectPayloadStage with ExecuteBootStage { index: N }
+    // Replace SelectPayloadStage with ExecuteBootStage { selected_index: N }
     // for unattended boot.
     //
     // Additional stages (e.g. SecureBootEnforceStage) can be inserted

@@ -120,7 +120,7 @@ pub struct RawMedia {
 impl VirtualMedia for RawMedia {
     fn read_block(&self, block_lba: u64, dst: &mut [u8], dst_offset: usize) -> bool {
         if block_lba >= self.total_blocks { return false; }
-        let bs = if self.sector_size == 0 { 512 } else { self.sector_size };
+        let bs = 2048u32;
         if dst_offset > dst.len() || dst.len() - dst_offset < bs as usize { return false; }
         let disk_lba = self.start_lba + block_lba * (bs as u64 / 512);
         unsafe {
@@ -132,19 +132,19 @@ impl VirtualMedia for RawMedia {
         }
     }
     fn block_count(&self) -> u64 { self.total_blocks }
-    fn block_size(&self) -> u32 { if self.sector_size == 0 { 512 } else { self.sector_size } }
+    fn block_size(&self) -> u32 { 2048 }
     fn media_type(&self) -> &'static str { "IMG" }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  VhdMedia — fixed VHD / dynamic VHDX backed by a physical disk extent
+//  VhdMedia — FIXED VHD only (contiguous data layout)
 // ═══════════════════════════════════════════════════════════════════════════
 //
-//  For fixed VHD: the data starts at the file LBA, sectors are 512 bytes.
-//  For VHDX: the file begins with a 1 MiB header, then the data starts
-//  at a configurable offset (usually 1 MiB).  The `data_lba` field holds
-//  the absolute disk LBA where the virtual disk data begins.
-//  VHDX log/replay is NOT implemented — the image must be clean.
+//  This implementation is restricted to FIXED VHD images where all data
+//  occupies a contiguous extent starting at `data_lba`.  Dynamic VHD and
+//  VHDX formats require block allocation table (BAT) mapping, which is
+//  NOT implemented here.  Any dynamic or differencing VHD/VHDX will produce
+//  incorrect reads and must not use this VirtualMedia implementation.
 
 pub struct VhdMedia {
     pub data_lba: u64,
@@ -157,7 +157,7 @@ pub struct VhdMedia {
 impl VirtualMedia for VhdMedia {
     fn read_block(&self, block_lba: u64, dst: &mut [u8], dst_offset: usize) -> bool {
         if block_lba >= self.total_blocks { return false; }
-        let bs = if self.sector_size == 0 { 512 } else { self.sector_size };
+        let bs = 2048u32;
         if dst_offset > dst.len() || dst.len() - dst_offset < bs as usize { return false; }
         let disk_lba = self.data_lba + block_lba * (bs as u64 / 512);
         unsafe {
@@ -169,7 +169,7 @@ impl VirtualMedia for VhdMedia {
         }
     }
     fn block_count(&self) -> u64 { self.total_blocks }
-    fn block_size(&self) -> u32 { if self.sector_size == 0 { 512 } else { self.sector_size } }
+    fn block_size(&self) -> u32 { 2048 }
     fn media_type(&self) -> &'static str { "VHD" }
 }
 

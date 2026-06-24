@@ -133,7 +133,7 @@ LOOP=;for i in 0 1 2 3 4 5 6 7;do L=/dev/loop$i
 losetup $L >/dev/null 2>&1&&continue
 losetup -o OFFSET $L $dev 2>/dev/null||{ losetup -d $L 2>/dev/null;continue;}
 LOOP=$L;break;done;[ -n \"$LOOP\" ]||continue
-mount -t iso9660 -ro $LOOP /cdrom 2>/dev/null||{ losetup -d $LOOP 2>/dev/null;continue;}
+mount -t iso9660 -o ro $LOOP /cdrom 2>/dev/null||{ losetup -d $LOOP 2>/dev/null;continue;}
 mount --make-rshared /cdrom 2>/dev/null
 mount -o bind /cdrom /lib/live/mount/medium 2>/dev/null
 [ -f /cdrom/casper/filesystem.squashfs ]&&return 0
@@ -150,6 +150,7 @@ echo 'choosable: gave up - no ISO found on any partition' >/dev/console
     let off_str = format_decimal_u64(offset_bytes);
     let mut off_start = 0;
     while off_start < 20 && off_str[off_start] == b'0' { off_start += 1; }
+    if off_start >= 20 { off_start = 19; }
     let off_slice = &off_str[off_start..];
 
     let mut pos = 0usize;
@@ -211,12 +212,12 @@ fn build_bottom_script(iso_name: &[u8]) -> [u8; 2048] {
 #!/bin/sh
 exec >/dev/null 2>&1
 modprobe exfat 2>/dev/null;modprobe ntfs3 2>/dev/null
-mkdir -p /cdrom
+mkdir -p /tmp
 while read a b c d;do case $d in loop*|ram*|dm-*|sr*)continue;;*[0-9]);;*)continue;;esac
 dev=/dev/$d;[ -b $dev ]||continue
-mount -t exfat -o ro $dev /cdrom 2>/dev/null||mount -t ntfs3 -o ro $dev /cdrom 2>/dev/null||continue
-(dmesg;cat /proc/cmdline)>/cdrom/LOGNAME
-umount /cdrom;exit 0
+mount -t exfat -o rw $dev /tmp 2>/dev/null||mount -t ntfs3 -o rw $dev /tmp 2>/dev/null||continue
+(dmesg;cat /proc/cmdline)>/tmp/LOGNAME
+umount /tmp;exit 0
 done</proc/partitions
 ";
 

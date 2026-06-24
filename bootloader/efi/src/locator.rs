@@ -151,8 +151,6 @@ impl IsoLocator for FileBackedIsoLocator {
     }
 }
 
-unsafe impl Sync for FileBackedIsoLocator {}
-
 // ═══════════════════════════════════════════════════════════════════════════
 //  WimPayloadLocator — Windows Imaging Format payload
 // ═══════════════════════════════════════════════════════════════════════════
