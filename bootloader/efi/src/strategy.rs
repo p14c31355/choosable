@@ -210,8 +210,8 @@ impl BootStrategy for CasperStrategy {
         // to mount the real partition (fails on exFAT/NTFS).
         patch_grub_cfg_impl(
             inp,
-            b" boot=casper live-media=LABEL=Choosable",
-            b"", // no eol override — premount handles /cdrom
+            b" boot=casper",
+            b"", // no eol override — premount handles /cdrom, casper auto-detects it
             inp.premount_target_name,
         )
     }
