@@ -487,7 +487,7 @@ fn try_patch_candidate(
     iso_name: &[u8],
     ext_lba: u32, ext_size: u32, dir_sector: u32, dir_offset: u32,
     iso_location: Option<&crate::locator::IsoLocation>,
-    live_media_uuid: &[u8; 10],
+    boot_kind: crate::boot_kind::BootKind,
 ) -> bool {
     let (orig_ptr, orig_len) = match read_extent(bs, bio_ref, bio_ptr, mid, iso_lba, ext_lba, ext_size) {
         Some(v) => v,
@@ -513,26 +513,14 @@ fn try_patch_candidate(
         return false;
     }
 
-    let mut iso_name_arr = [0u8; 128];
-    let nlen = iso_name.len().min(127);
-    iso_name_arr[..nlen].copy_from_slice(&iso_name[..nlen]);
-    let ctx = crate::iso_fs::IsoFsCtx {
-        real_bio_ptr: bio_ptr,
-        real_media_id: mid,
-        iso_lba,
-        iso_size_bytes: (vb.media.bim_lb + 1) * 2048,
-        root_lba: 0, root_size: 0,
-        bs: bs as *mut BootServices,
-        st: core::ptr::null_mut(),
-        iso_name: iso_name_arr, iso_name_len: nlen,
-        live_media_uuid: *live_media_uuid,
-        premount_cpio_buf: core::ptr::null_mut(),
-        premount_cpio_size: 0,
-        premount_target_name,
-        premount_target_name_len,
-    };
-
-    let patch = strategy::patch_grub_cfg(&ctx, orig, bs as *mut BootServices, iso_location);
+    let patch = strategy::patch_grub_cfg(
+        orig,
+        boot_kind,
+        iso_name,
+        iso_location,
+        &premount_target_name[..premount_target_name_len],
+        bs as *mut BootServices,
+    );
 
     let (patched_buf, patched_size) = match patch {
         Some(p) if p.size != (orig_len as usize) || {
@@ -595,8 +583,8 @@ fn patch_grub_cfg_blockio(
     mid: u32,
     iso_lba: u64,
     iso_name: &[u8],
-    live_media_uuid: &[u8; 10],
     iso_location: Option<&crate::locator::IsoLocation>,
+    boot_kind: crate::boot_kind::BootKind,
 ) {
     if vbio.is_null() { return; }
     let vb = unsafe { &mut *vbio };
@@ -664,7 +652,7 @@ fn patch_grub_cfg_blockio(
         if try_patch_candidate(st, bs, vb, sfs_instance, bio_ref, bio_ptr, mid, iso_lba, iso_name,
             entries[i].ext_lba, entries[i].ext_size,
             entries[i].dir_sector, entries[i].dir_offset,
-            iso_location, live_media_uuid) {
+            iso_location, boot_kind) {
             return;
         }
     }
@@ -728,6 +716,123 @@ fn recursive_find_cfg_with_loc(
             offset += record_len;
         }
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  ISO scanner — detects BootKind from directory structure
+// ═══════════════════════════════════════════════════════════════════════════
+
+use crate::boot_kind::{name_matches, BootDescriptor, BootKind, BootloaderType};
+
+/// Walk the ISO root directory and identify the distro family by checking
+/// for well-known directories and files:
+///   /casper/ → Casper (Ubuntu, Mint, Pop!_OS)
+///   /live/   → DebianLive
+///   /LiveOS/ → FedoraLive (Fedora, RHEL, CentOS)
+///   /arch/   → ArchIso
+///   /apks/ or /.alpine-release → Alpine
+///   /sources/boot.wim → WindowsPE
+///
+/// Also checks for a GRUB config at standard paths to determine the
+/// bootloader type.
+pub fn scan_iso_structure(
+    bio_ref: &BlockIoProtocol,
+    bio_ptr: *mut BlockIoProtocol,
+    mid: u32,
+    iso_lba: u64,
+    _bs: &mut BootServices,
+) -> Option<BootDescriptor> {
+    let mut pvd = [0u8; 2048];
+    if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, 16, &mut pvd) {
+        return None;
+    }
+    if pvd[0] != 1 || &pvd[1..6] != b"CD001" {
+        return None;
+    }
+    let root_lba = u32::from_le_bytes(pvd[158..162].try_into().unwrap());
+    let root_size = u32::from_le_bytes(pvd[166..170].try_into().unwrap());
+
+    let mut boot_kind = BootKind::Unknown;
+    let mut scratch = [0u8; 2048];
+    let total_sectors = ((root_size as u64 + 2047) / 2048) as u32;
+
+    for s in 0..total_sectors {
+        if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, root_lba + s, &mut scratch) {
+            break;
+        }
+        let mut offset: usize = 0;
+        while offset + 34 <= 2048 && offset < (root_size as usize).saturating_sub(s as usize * 2048) {
+            let record_len = scratch[offset] as usize;
+            if record_len == 0 { break; }
+            if offset + record_len > 2048 { break; }
+            let name_len = scratch[offset + 32] as usize;
+            let name_offset = offset + 33;
+            if name_offset + name_len > 2048 { break; }
+            let flags = scratch[offset + 25];
+            let is_dir = flags & 0x02 != 0;
+
+            let eff_len = if name_len >= 2 && scratch[name_offset + name_len - 2] == b';' {
+                name_len - 2
+            } else {
+                name_len
+            };
+            let name = &scratch[name_offset..name_offset + eff_len];
+
+            if boot_kind == BootKind::Unknown {
+                if is_dir {
+                         if name_matches(name, b"CASPER")  { boot_kind = BootKind::Casper; }
+                    else if name_matches(name, b"LIVE")    { boot_kind = BootKind::DebianLive; }
+                    else if name_matches(name, b"LIVEOS")  { boot_kind = BootKind::FedoraLive; }
+                    else if name_matches(name, b"ARCH")    { boot_kind = BootKind::ArchIso; }
+                    else if name_matches(name, b"APKS")    { boot_kind = BootKind::Alpine; }
+                } else {
+                         if name_matches(name, b".ALPINE-RELEASE") { boot_kind = BootKind::Alpine; }
+                    else if name_matches(name, b".ALPINE_RELEASE") { boot_kind = BootKind::Alpine; }
+                    else if name_matches(name, b"BOOT.WIM")        { boot_kind = BootKind::WindowsPE; }
+                }
+            }
+            offset += record_len;
+        }
+    }
+
+    let mut bootloader = BootloaderType::Grub;
+    let grub_paths: [&[&[u8]]; 3] = [
+        &[b"BOOT", b"GRUB",  b"GRUB.CFG"],
+        &[b"BOOT", b"GRUB2", b"GRUB.CFG"],
+        &[b"EFI",  b"BOOT",  b"GRUB.CFG"],
+    ];
+    let mut found_grub = false;
+    for path in &grub_paths {
+        if path_exists(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, path, &mut scratch) {
+            found_grub = true;
+            break;
+        }
+    }
+    if !found_grub {
+        bootloader = BootloaderType::None_;
+    }
+
+    Some(BootDescriptor { boot_kind, bootloader })
+}
+
+fn path_exists(
+    bio_ref: &BlockIoProtocol,
+    bio_ptr: *mut BlockIoProtocol,
+    mid: u32,
+    iso_lba: u64,
+    root_lba: u32,
+    root_size: u32,
+    components: &[&[u8]],
+    scratch: &mut [u8; 2048],
+) -> bool {
+    let (mut cur_lba, mut cur_size) = (root_lba, root_size);
+    for &comp in components {
+        match find_in_dir(bio_ref, bio_ptr, mid, iso_lba, cur_lba, cur_size, comp, scratch) {
+            Some((lba, size)) => { cur_lba = lba; cur_size = size; }
+            None => return false,
+        }
+    }
+    true
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -991,32 +1096,32 @@ fn uefi_chainload_iso(
         }
     };
 
-    // ── Build premount cpio (fixup type depends on strategy) ──────────
-    let premount_bundle = if !sfs_instance.is_null() {
-        let ctx = unsafe { &(*sfs_instance).ctx };
-        let fixup = crate::strategy::get_fixup_type(ctx);
+    // ── Scan ISO directory structure for boot kind detection ──────────
+    let boot_desc = scan_iso_structure(bio_ref, bio_ptr, mid, iso_lba, bs);
+    if let Some(ref desc) = boot_desc {
+        if !sfs_instance.is_null() {
+            let sfs = unsafe { &mut *sfs_instance };
+            sfs.ctx.boot_kind = desc.boot_kind;
+        }
+    }
+    let boot_kind = boot_desc.as_ref().map_or(crate::boot_kind::BootKind::Unknown, |d| d.boot_kind);
+
+    // ── Build premount cpio (fixup type depends on boot_kind) ────────
+    let premount_bundle = {
+        let fixup = boot_kind.fixup_type();
         match fixup {
-            crate::strategy::FixupType::Alpine =>
+            crate::boot_kind::FixupType::Alpine =>
                 crate::premount::prepare_alpine_initrd(bs, iso_lba - part1_lba, iso_name),
-            crate::strategy::FixupType::AlpinePremount => {
-                // AlpinePremount uses the standard premount initrd
-                // (casper-style hook) instead of a custom /init.choosable.
-                crate::premount::prepare_premount_initrd(bs, iso_lba - part1_lba, false, iso_name)
-            }
-            crate::strategy::FixupType::Arch => {
-                // ArchISO: premount initrd mounts ISO at /run/archiso/bootmnt
-                // after the initramfs has already started.  The kernel
-                // cmdline archisodevice=... handles the rest.
-                crate::premount::prepare_premount_initrd(bs, iso_lba - part1_lba, false, iso_name)
-            }
-            crate::strategy::FixupType::WindowsPE => None,
+            crate::boot_kind::FixupType::AlpinePremount =>
+                crate::premount::prepare_premount_initrd(bs, iso_lba - part1_lba, false, iso_name),
+            crate::boot_kind::FixupType::Arch =>
+                crate::premount::prepare_premount_initrd(bs, iso_lba - part1_lba, false, iso_name),
+            crate::boot_kind::FixupType::WindowsPE => None,
             _ => {
-                let needs_sr = crate::strategy::needs_sr_mod(ctx);
+                let needs_sr = boot_kind.needs_sr_mod();
                 crate::premount::prepare_premount_initrd(bs, iso_lba - part1_lba, needs_sr, iso_name)
             }
         }
-    } else {
-        crate::premount::prepare_premount_initrd(bs, iso_lba - part1_lba, true, iso_name)
     };
     if premount_bundle.is_none() {
         print_raw(st, b"[premount] allocation failed, skipping\r\n\0");
@@ -1165,7 +1270,7 @@ fn uefi_chainload_iso(
     let iso_loc = locator.locate();
 
     patch_grub_cfg_blockio(st, bs, vbio_ptr, sfs_instance, bio_ref, bio_ptr, mid, iso_lba, iso_name,
-        &live_uuid, Some(&iso_loc));
+        Some(&iso_loc), boot_kind);
 
     let (efi_lba, efi_size, efi_filename) = match find_efi_boot(st, bio_ref, bio_ptr, mid, iso_lba) {
         Some(v) => v,

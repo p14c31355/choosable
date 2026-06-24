@@ -44,6 +44,9 @@ pub struct IsoFsCtx {
     /// ISO9660 name used as premount injection target (e.g. "MD5SUM.TXT")
     pub premount_target_name: [u8; 16],
     pub premount_target_name_len: usize,
+    /// Detected distro family (set after scanning ISO directory structure).
+    pub boot_kind: crate::boot_kind::BootKind,
+    pub bootloader_type: crate::boot_kind::BootloaderType,
 }
 
 #[repr(C)]
@@ -362,7 +365,14 @@ unsafe extern "efiapi" fn file_open(
                     let r = read_extent_data(ctx, child_lba, child_size, total as u64, &mut tmp[total..total + ((orig_size - total).min(2048))]);
                     if r == 0 { break; } total += r;
                 }
-                if let Some(p) = crate::strategy::patch_grub_cfg(ctx, &tmp[..total], ctx.bs, None) {
+                if let Some(p) = crate::strategy::patch_grub_cfg(
+                    &tmp[..total],
+                    ctx.boot_kind,
+                    &ctx.iso_name[..ctx.iso_name_len],
+                    None,
+                    &ctx.premount_target_name[..ctx.premount_target_name_len],
+                    ctx.bs,
+                ) {
                     vf2.patched_buf = p.buf; vf2.patched_size = p.size as u64; vf2.patched = true;
                 }
                 unsafe { (bs.free_pool)(tmp_ptr); }
@@ -645,6 +655,8 @@ pub fn create_iso_fs(
         premount_cpio_buf, premount_cpio_size,
         premount_target_name: [0u8; 16],
         premount_target_name_len: 0,
+        boot_kind: crate::boot_kind::BootKind::Unknown,
+        bootloader_type: crate::boot_kind::BootloaderType::Grub,
     };
     if let Some((rlb, rsz)) = parse_pvd(&instance.ctx) { instance.ctx.root_lba = rlb; instance.ctx.root_size = rsz; }
     else { unsafe { (bs.free_pool)(ptr); } return core::ptr::null_mut(); }

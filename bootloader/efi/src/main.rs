@@ -2,6 +2,7 @@
 #![no_main]
 
 mod boot_context;
+mod boot_kind;
 mod boot_stage;
 mod disk;
 mod fs;

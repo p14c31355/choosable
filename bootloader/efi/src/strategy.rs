@@ -1,11 +1,20 @@
 // ═══════════════════════════════════════════════════════════════════════════
-//  ISO Boot Strategy — patches grub.cfg for filesystem-independent boot
+//  GRUB config patcher — injects kernel cmdline arguments and premount initrd
 // ═══════════════════════════════════════════════════════════════════════════
+//
+//  This module has been slimmed-down.  The heavyweight `BootStrategy` trait
+//  and its name-based detection are gone — they live in `boot_kind.rs` now.
+//  The only remaining public entry point is `patch_grub_cfg()` which takes
+//  a `BootKind` determined by scanning the ISO directory structure.
 
 use core::ffi::c_void;
-use crate::iso_fs::IsoFsCtx;
+use crate::boot_kind::BootKind;
 use crate::locator::IsoLocation;
 use crate::protocol::{BootServices, MemoryType, EFI_SUCCESS};
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Input / output types
+// ═══════════════════════════════════════════════════════════════════════════
 
 pub struct PatchInput<'a> {
     pub original: &'a [u8],
@@ -21,41 +30,9 @@ pub struct PatchOutput {
     pub size: usize,
 }
 
-pub struct HookTargetSet {
-    pub live: bool,
-    pub live_premount: bool,
-    pub casper_premount: bool,
-    pub casper_bottom: bool,
-}
-
-/// Identifies which initrd builder to use for the early-boot fixup.
-#[derive(Clone, Copy, PartialEq)]
-pub enum FixupType {
-    /// initramfs-tools casper-premount hooks (Ubuntu, Mint, Pop)
-    Casper,
-    /// initramfs-tools live-premount hooks (Debian Live)
-    LiveBoot,
-    /// dracut premount hook (Fedora, RHEL, CentOS)
-    Dracut,
-    /// archiso copytoram hook (Arch Linux)
-    Arch,
-    /// No initrd fixup needed (Windows PE)
-    WindowsPE,
-    /// Custom /init.choosable (Alpine Linux — no hook mechanism; legacy path)
-    Alpine,
-    /// Alpine using casper-style premount hook (unified path)
-    AlpinePremount,
-}
-
-pub trait BootStrategy: Sync {
-    fn detect(&self, ctx: &IsoFsCtx) -> bool;
-    fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> { let _ = inp; None }
-    fn hook_targets(&self) -> HookTargetSet {
-        HookTargetSet { live: true, live_premount: true, casper_premount: true, casper_bottom: true }
-    }
-    fn needs_sr_mod(&self) -> bool { false }
-    fn fixup_type(&self) -> FixupType { FixupType::Casper }
-}
+// ═══════════════════════════════════════════════════════════════════════════
+//  Internal helpers
+// ═══════════════════════════════════════════════════════════════════════════
 
 fn allocate_output(bs: &mut BootServices, orig_len: usize, extra: usize) -> Option<(*mut u8, usize)> {
     let new_size = orig_len + extra + 256;
@@ -86,16 +63,44 @@ fn count_matching_lines(orig: &[u8]) -> (usize, usize) {
     (linux_count, initrd_count)
 }
 
+fn find_second_arg_end(line_start: usize, out: &[u8], dst: usize) -> usize {
+    let mut pos = line_start;
+    while pos < dst && (out[pos] == b' ' || out[pos] == b'\t') { pos += 1; }
+    while pos < dst && out[pos] != b' ' && out[pos] != b'\t' && out[pos] != b'\n' && out[pos] != b'\r' { pos += 1; }
+    while pos < dst && (out[pos] == b' ' || out[pos] == b'\t') { pos += 1; }
+    while pos < dst && out[pos] != b' ' && out[pos] != b'\t' && out[pos] != b'\n' && out[pos] != b'\r' { pos += 1; }
+    pos
+}
+
+fn shift_and_inject(out: &mut [u8], inject_at: usize, dst: &mut usize, data: &[u8]) {
+    let suffix_len = *dst - inject_at;
+    for i in (0..suffix_len).rev() {
+        out[inject_at + data.len() + i] = out[inject_at + i];
+    }
+    out[inject_at..inject_at + data.len()].copy_from_slice(data);
+    *dst += data.len();
+}
+
+fn matches_any_lower(name: &[u8], patterns: &[&[u8]]) -> bool {
+    patterns.iter().any(|pat| name.windows(pat.len()).any(|w| {
+        w.iter().zip(pat.iter()).all(|(&a, &b)| (a | 0x20) == b)
+    }))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Core patching engine
+// ═══════════════════════════════════════════════════════════════════════════
+
 fn patch_grub_cfg_impl(
     inp: &PatchInput,
     linux_extra: &[u8],
     linux_eol_extra: &[u8],
-    premount_target_name: &[u8],
+    premount_target_name_p: &[u8],
 ) -> Option<PatchOutput> {
     let bs = unsafe { &mut *inp.bs };
     let orig = inp.original;
 
-    let effective_target: &[u8] = if premount_target_name.is_empty() { b"PREMOUNT.CPIO" } else { premount_target_name };
+    let effective_target: &[u8] = if premount_target_name_p.is_empty() { b"PREMOUNT.CPIO" } else { premount_target_name_p };
 
     let mut initrd_extra_buf = [0u8; 32];
     initrd_extra_buf[0] = b' '; initrd_extra_buf[1] = b'/';
@@ -159,7 +164,6 @@ fn patch_grub_cfg_impl(
                 let inject_at = find_second_arg_end(line_start, out, dst);
                 shift_and_inject(out, inject_at, &mut dst, linux_extra);
                 if needs_eol {
-                    // Handle \r\n line endings: inject before \r if present.
                     if dst > 0 && out[dst - 1] == b'\n' {
                         let mut inject_at = dst - 1;
                         if dst > 1 && out[dst - 2] == b'\r' { inject_at -= 1; }
@@ -188,293 +192,44 @@ fn patch_grub_cfg_impl(
     Some(PatchOutput { buf: out_ptr, size: dst })
 }
 
-fn find_second_arg_end(line_start: usize, out: &[u8], dst: usize) -> usize {
-    let mut pos = line_start;
-    while pos < dst && (out[pos] == b' ' || out[pos] == b'\t') { pos += 1; }
-    while pos < dst && out[pos] != b' ' && out[pos] != b'\t' && out[pos] != b'\n' && out[pos] != b'\r' { pos += 1; }
-    while pos < dst && (out[pos] == b' ' || out[pos] == b'\t') { pos += 1; }
-    while pos < dst && out[pos] != b' ' && out[pos] != b'\t' && out[pos] != b'\n' && out[pos] != b'\r' { pos += 1; }
-    pos
-}
-
-fn shift_and_inject(out: &mut [u8], inject_at: usize, dst: &mut usize, data: &[u8]) {
-    let suffix_len = *dst - inject_at;
-    for i in (0..suffix_len).rev() {
-        out[inject_at + data.len() + i] = out[inject_at + i];
-    }
-    out[inject_at..inject_at + data.len()].copy_from_slice(data);
-    *dst += data.len();
-}
-
-fn matches_any_lower(name: &[u8], patterns: &[&[u8]]) -> bool {
-    patterns.iter().any(|pat| name.windows(pat.len()).any(|w| {
-        w.iter().zip(pat.iter()).all(|(&a, &b)| (a | 0x20) == b)
-    }))
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
-//  CasperStrategy (Ubuntu, Mint, Pop!_OS)
+//  Public entry point — replaces old BootStrategy dispatch
 // ═══════════════════════════════════════════════════════════════════════════
 
-pub struct CasperStrategy;
+/// Patch a GRUB configuration file to inject the kernel cmdline arguments and
+/// premount initrd required for filesystem-independent boot.
+///
+/// * `original` — raw content of the grub.cfg file.
+/// * `boot_kind` — detected distro family; controls which cmdline is injected.
+/// * `iso_name` — ISO filename (used for Pop!_OS toram detection only).
+/// * `iso_location` — where the ISO lives on disk (for choosable.iso_offset=).
+/// * `premount_target_name` — filename of the injected premount CPIO in the
+///    ISO root directory (e.g. "MD5SUM.TXT" or "PREMOUNT.CPIO").
+/// * `bs` — UEFI boot services.
+pub fn patch_grub_cfg(
+    original: &[u8],
+    boot_kind: BootKind,
+    iso_name: &[u8],
+    iso_location: Option<&IsoLocation>,
+    premount_target_name: &[u8],
+    bs: *mut BootServices,
+) -> Option<PatchOutput> {
+    let is_popos = boot_kind == BootKind::Casper
+        && matches_any_lower(iso_name, &[b"pop", b"pop-os", b"popos"]);
 
-impl BootStrategy for CasperStrategy {
-    fn detect(&self, ctx: &IsoFsCtx) -> bool {
-        matches_any_lower(&ctx.iso_name[..ctx.iso_name_len], &[b"ubuntu", b"mint", b"pop", b"pop-os", b"popos"])
-    }
+    let linux_extra = boot_kind.linux_extra(is_popos);
+    let linux_eol_extra = boot_kind.linux_eol_extra();
 
-    fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> {
-        // Premount hook mounts ISO at /cdrom via losetup BEFORE casper.
-        // Casper auto-detects /cdrom when boot=casper is set.
-        // live-media=LABEL=Choosable acts as a hint so casper knows which
-        // device to scan if the premount hook fails for any reason.
-        // toram is only appended for Pop!_OS which may need it for Live session.
-        // Do NOT inject iso-scan/filename= — it forces casper's 20iso_scan
-        // to mount the real partition (fails on exFAT/NTFS).
-        let is_popos = matches_any_lower(inp.iso_name, &[b"pop", b"pop-os", b"popos"]);
-        let linux_args: &[u8] = if is_popos {
-            b" boot=casper live-media=LABEL=Choosable toram"
-        } else {
-            b" boot=casper live-media=LABEL=Choosable"
-        };
-        patch_grub_cfg_impl(
-            inp,
-            linux_args,
-            b" choosable.iso_offset=",
-            inp.premount_target_name,
-        )
-    }
+    let mut live_media_uuid = [0u8; 10];
 
-    fn needs_sr_mod(&self) -> bool { true }
-
-    fn fixup_type(&self) -> FixupType { FixupType::Casper }
-
-    fn hook_targets(&self) -> HookTargetSet {
-        HookTargetSet { live: false, live_premount: false, casper_premount: true, casper_bottom: true }
-    }
-}
-
-unsafe impl Sync for CasperStrategy {}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  LiveBootStrategy (Debian Live)
-// ═══════════════════════════════════════════════════════════════════════════
-
-pub struct LiveBootStrategy;
-
-impl BootStrategy for LiveBootStrategy {
-    fn detect(&self, ctx: &IsoFsCtx) -> bool {
-        matches_any_lower(&ctx.iso_name[..ctx.iso_name_len], &[b"debian"])
-    }
-
-    fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> {
-        patch_grub_cfg_impl(
-            inp,
-            b" boot=live live-media=removable choosable.iso_offset=",
-            b" findiso=",
-            inp.premount_target_name,
-        )
-    }
-
-    fn needs_sr_mod(&self) -> bool { false }
-
-    fn fixup_type(&self) -> FixupType { FixupType::LiveBoot }
-
-    fn hook_targets(&self) -> HookTargetSet {
-        HookTargetSet { live: true, live_premount: true, casper_premount: false, casper_bottom: false }
-    }
-}
-
-unsafe impl Sync for LiveBootStrategy {}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  LiveOSStrategy
-// ═══════════════════════════════════════════════════════════════════════════
-
-pub struct LiveOSStrategy;
-
-impl BootStrategy for LiveOSStrategy {
-    fn detect(&self, ctx: &IsoFsCtx) -> bool {
-        matches_any_lower(&ctx.iso_name[..ctx.iso_name_len], &[b"fedora", b"rhel", b"centos"])
-    }
-
-    fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> {
-        // Dracut-based live boot (Fedora, RHEL, CentOS).
-        // root=live:LABEL=... tells dracut where the LiveOS/ tree lives.
-        // rd.live.overlay= specifies the overlay partition.
-        // rootdelay=30 gives enough time for the premount hook to
-        // attach the loop device and for udev to settle.
-        patch_grub_cfg_impl(
-            inp,
-            b" rd.live.image root=live:LABEL=Choosable rd.live.overlay=LABEL=Choosable rootdelay=30",
-            b" choosable.iso_offset=",
-            inp.premount_target_name,
-        )
-    }
-
-    fn fixup_type(&self) -> FixupType { FixupType::Dracut }
-}
-
-unsafe impl Sync for LiveOSStrategy {}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  AlpineStrategy — Alpine Linux (custom initramfs, no casper/live hooks)
-// ═══════════════════════════════════════════════════════════════════════════
-
-pub struct AlpineStrategy;
-
-impl BootStrategy for AlpineStrategy {
-    fn detect(&self, ctx: &IsoFsCtx) -> bool {
-        matches_any_lower(&ctx.iso_name[..ctx.iso_name_len], &[b"alpine"])
-    }
-
-    fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> {
-        // Alpine's initramfs does NOT use initramfs-tools hooks.  We must
-        // launch a custom init (/init.choosable) that creates the loop
-        // device and then exec's the original /init.
-        patch_grub_cfg_impl(
-            inp,
-            b" init=/init.choosable modules=loop,iso9660",
-            b" choosable.iso_offset=",
-            inp.premount_target_name,
-        )
-    }
-
-    fn hook_targets(&self) -> HookTargetSet {
-        HookTargetSet {
-            live: false,
-            live_premount: false,
-            casper_premount: false,
-            casper_bottom: false,
-        }
-    }
-
-    fn needs_sr_mod(&self) -> bool { false }
-
-    fn fixup_type(&self) -> FixupType { FixupType::Alpine }
-}
-
-unsafe impl Sync for AlpineStrategy {}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  AlpinePremountStrategy — Alpine Linux via unified premount hook
-// ═══════════════════════════════════════════════════════════════════════════
-//
-//  Alpine's initramfs has no casper/live hook mechanism, but we can still
-//  inject a premount initrd overlay that mounts the ISO at /cdrom before
-//  the distro's /init runs.  This avoids relying on the fragile
-//  /init.choosable script inside the ISO's own initramfs.
-
-pub struct AlpinePremountStrategy;
-
-impl BootStrategy for AlpinePremountStrategy {
-    fn detect(&self, ctx: &IsoFsCtx) -> bool {
-        matches_any_lower(&ctx.iso_name[..ctx.iso_name_len], &[b"alpine"])
-    }
-
-    fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> {
-        // Use the standard premount approach — inject PREMOUNT.CPIO into
-        // initrd and let the premount script mount the ISO.
-        // modules=loop,iso9660 ensures /init.choosable is not needed.
-        patch_grub_cfg_impl(
-            inp,
-            b" modules=loop,iso9660",
-            b" choosable.iso_offset=",
-            inp.premount_target_name,
-        )
-    }
-
-    fn hook_targets(&self) -> HookTargetSet {
-        HookTargetSet {
-            live: false,
-            live_premount: false,
-            casper_premount: true, // treat alpine premount like casper-premount
-            casper_bottom: false,
-        }
-    }
-
-    fn needs_sr_mod(&self) -> bool { false }
-
-    fn fixup_type(&self) -> FixupType { FixupType::AlpinePremount }
-}
-
-unsafe impl Sync for AlpinePremountStrategy {}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  ArchStrategy — Arch Linux (archiso initramfs)
-// ═══════════════════════════════════════════════════════════════════════════
-
-pub struct ArchStrategy;
-
-impl BootStrategy for ArchStrategy {
-    fn detect(&self, ctx: &IsoFsCtx) -> bool {
-        matches_any_lower(&ctx.iso_name[..ctx.iso_name_len], &[b"arch"])
-    }
-
-    fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> {
-        // ArchISO uses archisodevice= and archisobasedir= to locate
-        // the ISO.  LABEL=Choosable matches the virtual CD-ROM label.
-        // copytoram copies the squashfs to RAM for faster operation.
-        patch_grub_cfg_impl(
-            inp,
-            b" archisodevice=LABEL=Choosable archisobasedir=arch copytoram",
-            b" choosable.iso_offset=",
-            inp.premount_target_name,
-        )
-    }
-
-    fn hook_targets(&self) -> HookTargetSet {
-        HookTargetSet {
-            live: false,
-            live_premount: false,
-            casper_premount: false, // archiso has its own hook; premount is for /cdrom accessibility
-            casper_bottom: false,
-        }
-    }
-
-    fn needs_sr_mod(&self) -> bool { false }
-
-    fn fixup_type(&self) -> FixupType { FixupType::Arch }
-}
-
-unsafe impl Sync for ArchStrategy {}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  Registry
-// ═══════════════════════════════════════════════════════════════════════════
-
-static STRATEGIES: &[&dyn BootStrategy] = &[
-    &LiveOSStrategy,
-    &CasperStrategy,
-    &LiveBootStrategy,
-    &AlpineStrategy,
-    &AlpinePremountStrategy,
-    &ArchStrategy,
-];
-
-pub fn patch_grub_cfg(ctx: &IsoFsCtx, original: &[u8], bs: *mut BootServices, iso_location: Option<&IsoLocation>) -> Option<PatchOutput> {
-    let strategy: &dyn BootStrategy = STRATEGIES.iter().find(|s| s.detect(ctx)).copied().unwrap_or(&CasperStrategy);
-    strategy.patch(&PatchInput {
+    let inp = PatchInput {
         original,
-        iso_name: &ctx.iso_name[..ctx.iso_name_len],
+        iso_name,
         bs,
-        live_media_uuid: &ctx.live_media_uuid,
+        live_media_uuid: &live_media_uuid,
         iso_location,
-        premount_target_name: &ctx.premount_target_name[..ctx.premount_target_name_len],
-    })
-}
+        premount_target_name,
+    };
 
-pub fn get_hook_targets(ctx: &IsoFsCtx) -> HookTargetSet {
-    let strategy: &dyn BootStrategy = STRATEGIES.iter().find(|s| s.detect(ctx)).copied().unwrap_or(&CasperStrategy);
-    strategy.hook_targets()
-}
-
-pub fn needs_sr_mod(ctx: &IsoFsCtx) -> bool {
-    let strategy: &dyn BootStrategy = STRATEGIES.iter().find(|s| s.detect(ctx)).copied().unwrap_or(&CasperStrategy);
-    strategy.needs_sr_mod()
-}
-
-pub fn get_fixup_type(ctx: &IsoFsCtx) -> FixupType {
-    let strategy: &dyn BootStrategy = STRATEGIES.iter().find(|s| s.detect(ctx)).copied().unwrap_or(&CasperStrategy);
-    strategy.fixup_type()
+    patch_grub_cfg_impl(&inp, linux_extra, linux_eol_extra, premount_target_name)
 }
