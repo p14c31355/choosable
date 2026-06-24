@@ -760,7 +760,13 @@ fn build_iso_device_path(bs: &mut BootServices, iso_size_bytes: u64) -> *mut c_v
     unsafe {
         dp.copy_from_nonoverlapping(CDROM_NODE.as_ptr(), CDROM_NODE.len());
         *(dp.add(8) as *mut u64) = 0u64.to_le();
-        *(dp.add(16) as *mut u64) = (iso_size_bytes / 2048).to_le();
+        // Partition Start — 0 for virtual CD-ROM backed by an ISO file.
+        // On physical CD-ROM this is typically 16 (after the System Area).
+        // Some firmware rejects the DevicePath if this field is set to the
+        // ISO size (as was done previously), causing LoadImage to return
+        // EFI_UNSUPPORTED.
+        let partition_start = 0u64;
+        *(dp.add(16) as *mut u64) = partition_start.to_le();
         let mut off = 24usize;
         dp.add(off).write_volatile(0x04u8); off += 1;
         dp.add(off).write_volatile(0x04u8); off += 1;

@@ -352,7 +352,11 @@ pub fn create_virtual_cdrom(
     unsafe {
         dp.copy_from_nonoverlapping(CDROM_NODE.as_ptr(), CDROM_NODE.len());
         *(dp.add(8) as *mut u64) = 0u64.to_le();
-        *(dp.add(16) as *mut u64) = (iso_size_bytes / 2048).to_le();
+        // Partition Start — must be 0 for virtual ISO-backed CD-ROM.
+        // Some firmware rejects the DevicePath if this is set to the
+        // volume size / last_block value.
+        let partition_start = 0u64;
+        *(dp.add(16) as *mut u64) = partition_start.to_le();
         dp.add(CDROM_NODE.len())
             .copy_from_nonoverlapping(END_NODE.as_ptr(), END_NODE.len());
     }
