@@ -784,10 +784,10 @@ pub fn scan_iso_structure(
                     else if name_matches(name, b"LIVE")    { boot_kind = BootKind::DebianLive; }
                     else if name_matches(name, b"LIVEOS")  { boot_kind = BootKind::FedoraLive; }
                     else if name_matches(name, b"ARCH")    { boot_kind = BootKind::ArchIso; }
-                    else if name_matches(name, b"APKS")    { boot_kind = BootKind::Alpine; }
+                    else if name_matches(name, b"APKS")    { boot_kind = BootKind::AlpinePremount; }
                 } else {
-                         if name_matches(name, b".ALPINE-RELEASE") { boot_kind = BootKind::Alpine; }
-                    else if name_matches(name, b".ALPINE_RELEASE") { boot_kind = BootKind::Alpine; }
+                         if name_matches(name, b".ALPINE-RELEASE") { boot_kind = BootKind::AlpinePremount; }
+                    else if name_matches(name, b".ALPINE_RELEASE") { boot_kind = BootKind::AlpinePremount; }
                     else if name_matches(name, b"BOOT.WIM")        { boot_kind = BootKind::WindowsPE; }
                 }
             }
@@ -1115,7 +1115,7 @@ fn uefi_chainload_iso(
             crate::boot_kind::FixupType::AlpinePremount =>
                 crate::premount::prepare_premount_initrd(bs, iso_lba - part1_lba, false, iso_name),
             crate::boot_kind::FixupType::Arch =>
-                crate::premount::prepare_premount_initrd(bs, iso_lba - part1_lba, false, iso_name),
+                crate::premount::prepare_arch_initrd(bs, iso_lba - part1_lba, iso_name),
             crate::boot_kind::FixupType::WindowsPE => None,
             _ => {
                 let needs_sr = boot_kind.needs_sr_mod();

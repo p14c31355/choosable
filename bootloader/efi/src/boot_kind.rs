@@ -77,16 +77,16 @@ impl BootKind {
     pub fn linux_extra(&self, _toram: bool) -> &'static [u8] {
         match self {
             BootKind::Casper => {
-                b" boot=casper live-media=LABEL=Choosable"
+                b" boot=casper"
             }
             BootKind::DebianLive => {
-                b" boot=live live-media=removable choosable.iso_offset="
+                b" boot=live live-media=removable"
             }
             BootKind::FedoraLive => {
-                b" rd.live.image root=live:LABEL=Choosable rd.live.overlay=LABEL=Choosable rootdelay=30"
+                b" rd.live.image rootdelay=10"
             }
             BootKind::ArchIso => {
-                b" archisodevice=LABEL=Choosable archisobasedir=arch copytoram"
+                b" archisobasedir=arch copytoram"
             }
             BootKind::Alpine => {
                 b" init=/init.choosable modules=loop,iso9660"
@@ -100,7 +100,8 @@ impl BootKind {
 
     /// Extra kernel args appended at the end of linux lines (before newline).
     /// For DebianLive this is `findiso=` (appended with the ISO path);
-    /// for everything else it is `choosable.iso_offset=` (appended with offset).
+    /// Casper/FedoraLive/ArchIso/Alpine/AlpinePremount don't need any EOL extra
+    /// because the premount initramfs hook handles ISO discovery independently.
     pub fn linux_eol_extra(&self) -> &'static [u8] {
         match self {
             BootKind::DebianLive => b" findiso=",
