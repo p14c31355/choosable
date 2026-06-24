@@ -20,9 +20,9 @@ pub trait EarlyBootFixup {
 pub struct CasperFixup;
 impl EarlyBootFixup for CasperFixup {
     fn build_initrd(&self, ctx: &BootContext, bs: &mut BootServices) -> Option<PremountBundle> {
-        let iso = ctx.selected_iso()?;
-        let rel = iso.file_start_lba - ctx.partition_start_lba;
-        let name_bytes = &iso.name[..iso.name_len.min(iso.name.len())];
+        let p = ctx.selected_payload()?;
+        let rel = p.file_start_lba - ctx.partition_start_lba;
+        let name_bytes = &p.name[..p.name_len.min(p.name.len())];
         prepare_premount_initrd(bs, rel, true, name_bytes)
     }
 }
@@ -30,9 +30,9 @@ impl EarlyBootFixup for CasperFixup {
 pub struct LiveBootFixup;
 impl EarlyBootFixup for LiveBootFixup {
     fn build_initrd(&self, ctx: &BootContext, bs: &mut BootServices) -> Option<PremountBundle> {
-        let iso = ctx.selected_iso()?;
-        let rel = iso.file_start_lba - ctx.partition_start_lba;
-        let name_bytes = &iso.name[..iso.name_len.min(iso.name.len())];
+        let p = ctx.selected_payload()?;
+        let rel = p.file_start_lba - ctx.partition_start_lba;
+        let name_bytes = &p.name[..p.name_len.min(p.name.len())];
         prepare_premount_initrd(bs, rel, false, name_bytes)
     }
 }
@@ -40,10 +40,31 @@ impl EarlyBootFixup for LiveBootFixup {
 pub struct DracutFixup;
 impl EarlyBootFixup for DracutFixup {
     fn build_initrd(&self, ctx: &BootContext, bs: &mut BootServices) -> Option<PremountBundle> {
-        let iso = ctx.selected_iso()?;
-        let rel = iso.file_start_lba - ctx.partition_start_lba;
-        let name_bytes = &iso.name[..iso.name_len.min(iso.name.len())];
+        let p = ctx.selected_payload()?;
+        let rel = p.file_start_lba - ctx.partition_start_lba;
+        let name_bytes = &p.name[..p.name_len.min(p.name.len())];
         prepare_premount_initrd(bs, rel, false, name_bytes)
+    }
+}
+
+/// ArchISO fixup — mounts ISO at /run/archiso/bootmnt for archiso initramfs hook.
+pub struct ArchFixup;
+impl EarlyBootFixup for ArchFixup {
+    fn build_initrd(&self, ctx: &BootContext, bs: &mut BootServices) -> Option<PremountBundle> {
+        let p = ctx.selected_payload()?;
+        let rel = p.file_start_lba - ctx.partition_start_lba;
+        let name_bytes = &p.name[..p.name_len.min(p.name.len())];
+        prepare_premount_initrd(bs, rel, false, name_bytes)
+    }
+}
+
+/// Windows PE fixup — no premount initrd needed (WinPE uses boot.sdi + boot.wim via BCD).
+pub struct WindowsPEFixup;
+impl EarlyBootFixup for WindowsPEFixup {
+    fn build_initrd(&self, _ctx: &BootContext, _bs: &mut BootServices) -> Option<PremountBundle> {
+        // Windows PE does not use the Linux initramfs mechanism.
+        // WinPE's boot.wim is loaded directly by the Windows Boot Manager.
+        None
     }
 }
 
@@ -96,17 +117,17 @@ fn build_premount_script(offset_bytes: u64, needs_sr_mod: bool) -> [u8; 4096] {
         b""
     };
 
-    // Close stdout and stderr IMMEDIATELY to prevent ANY output to /dev/console.
-    // This is a kernel-internal operation — no /dev/null dependency.
     let src_template = b"\
 #!/bin/sh
-exec 1>&- 2>&-
-modprobe loop;modprobe iso9660
+mkdir -p /tmp 2>/dev/null
+exec >/tmp/choosable.log 2>&1
+echo 'choosable: starting premount' >/dev/console
+modprobe loop 2>/dev/null;modprobe iso9660 2>/dev/null
 SRMOD
-for i in 0 1 2 3 4 5 6 7;do [ -b /dev/loop$i ]||mknod /dev/loop$i b 7 $i;done
-[ -d /cdrom ]||mkdir -p /cdrom /lib/live/mount/medium
+for i in 0 1 2 3 4 5 6 7;do [ -b /dev/loop$i ]||mknod /dev/loop$i b 7 $i 2>/dev/null;done
+[ -d /cdrom ]||mkdir -p /cdrom /lib/live/mount/medium 2>/dev/null
 N=0;while [ $N -lt 30 ];do N=$((N+1))
-while read a b c d;do case $d in loop*|ram*|dm-*|sr*)continue;;*[0-9]);;*)continue;;esac
+while read -r a b c d;do case $d in loop*|ram*|dm-*|sr*)continue;;*[0-9]);;*)continue;;esac
 dev=/dev/$d;[ -b $dev ]||continue
 LOOP=;for i in 0 1 2 3 4 5 6 7;do L=/dev/loop$i
 losetup $L >/dev/null 2>&1&&continue
@@ -115,14 +136,15 @@ LOOP=$L;break;done;[ -n \"$LOOP\" ]||continue
 mount -t iso9660 -ro $LOOP /cdrom 2>/dev/null||{ losetup -d $LOOP 2>/dev/null;continue;}
 mount --make-rshared /cdrom 2>/dev/null
 mount -o bind /cdrom /lib/live/mount/medium 2>/dev/null
-[ -f /cdrom/casper/filesystem.squashfs ]&&exit 0
-[ -f /cdrom/live/filesystem.squashfs ]&&exit 0
-[ -f /cdrom/LiveOS/squashfs.img ]&&exit 0
+[ -f /cdrom/casper/filesystem.squashfs ]&&return 0
+[ -f /cdrom/live/filesystem.squashfs ]&&return 0
+[ -f /cdrom/LiveOS/squashfs.img ]&&return 0
 umount /lib/live/mount/medium 2>/dev/null
 umount /cdrom 2>/dev/null
 losetup -d $LOOP 2>/dev/null
 done</proc/partitions
 sleep 1;done
+echo 'choosable: gave up - no ISO found on any partition' >/dev/console
 ";
 
     let off_str = format_decimal_u64(offset_bytes);

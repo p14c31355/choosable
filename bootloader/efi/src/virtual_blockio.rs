@@ -102,9 +102,75 @@ impl VirtualMedia for IsoMedia {
         2048
     }
 
-    fn media_type(&self) -> &'static str {
-        "ISO"
+    fn media_type(&self) -> &'static str { "ISO" }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  RawMedia — raw disk image (.img) backed by a physical disk extent
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub struct RawMedia {
+    pub start_lba: u64,
+    pub total_blocks: u64,
+    pub real_bio_ptr: *mut BlockIoProtocol,
+    pub real_media_id: u32,
+    pub sector_size: u32,
+}
+
+impl VirtualMedia for RawMedia {
+    fn read_block(&self, block_lba: u64, dst: &mut [u8], dst_offset: usize) -> bool {
+        if block_lba >= self.total_blocks { return false; }
+        let bs = if self.sector_size == 0 { 512 } else { self.sector_size };
+        if dst_offset > dst.len() || dst.len() - dst_offset < bs as usize { return false; }
+        let disk_lba = self.start_lba + block_lba * (bs as u64 / 512);
+        unsafe {
+            ((*self.real_bio_ptr).read_blocks)(
+                self.real_bio_ptr, self.real_media_id,
+                disk_lba, bs as usize,
+                dst.as_mut_ptr().add(dst_offset) as *mut c_void,
+            ) == EFI_SUCCESS
+        }
     }
+    fn block_count(&self) -> u64 { self.total_blocks }
+    fn block_size(&self) -> u32 { if self.sector_size == 0 { 512 } else { self.sector_size } }
+    fn media_type(&self) -> &'static str { "IMG" }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  VhdMedia — fixed VHD / dynamic VHDX backed by a physical disk extent
+// ═══════════════════════════════════════════════════════════════════════════
+//
+//  For fixed VHD: the data starts at the file LBA, sectors are 512 bytes.
+//  For VHDX: the file begins with a 1 MiB header, then the data starts
+//  at a configurable offset (usually 1 MiB).  The `data_lba` field holds
+//  the absolute disk LBA where the virtual disk data begins.
+//  VHDX log/replay is NOT implemented — the image must be clean.
+
+pub struct VhdMedia {
+    pub data_lba: u64,
+    pub total_blocks: u64,
+    pub real_bio_ptr: *mut BlockIoProtocol,
+    pub real_media_id: u32,
+    pub sector_size: u32,
+}
+
+impl VirtualMedia for VhdMedia {
+    fn read_block(&self, block_lba: u64, dst: &mut [u8], dst_offset: usize) -> bool {
+        if block_lba >= self.total_blocks { return false; }
+        let bs = if self.sector_size == 0 { 512 } else { self.sector_size };
+        if dst_offset > dst.len() || dst.len() - dst_offset < bs as usize { return false; }
+        let disk_lba = self.data_lba + block_lba * (bs as u64 / 512);
+        unsafe {
+            ((*self.real_bio_ptr).read_blocks)(
+                self.real_bio_ptr, self.real_media_id,
+                disk_lba, bs as usize,
+                dst.as_mut_ptr().add(dst_offset) as *mut c_void,
+            ) == EFI_SUCCESS
+        }
+    }
+    fn block_count(&self) -> u64 { self.total_blocks }
+    fn block_size(&self) -> u32 { if self.sector_size == 0 { 512 } else { self.sector_size } }
+    fn media_type(&self) -> &'static str { "VHD" }
 }
 
 /// ReadBlocks implementation for the virtual CD-ROM.

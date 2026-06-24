@@ -20,7 +20,8 @@ use core::panic::PanicInfo;
 use boot_context::BootContext;
 use boot_stage::{
     BootPipeline, BootStage, DiscoverDiskStage, DiscoverPartitionStage,
-    DiscoverPayloadStage, ExecuteBootStage, MountFilesystemStage, SelectPayloadStage,
+    DiscoverPayloadStage, ExecuteBootStage, MountFilesystemStage,
+    NetworkPayloadLocatorStage, SelectPayloadStage,
 };
 
 #[no_mangle]
@@ -28,19 +29,30 @@ extern "efiapi" fn efi_main(
     image_handle: *mut c_void,
     system_table: *mut protocol::SystemTable,
 ) -> ! {
-    // ── Initialize boot context ─────────────────────────────────────
     let mut ctx = BootContext::new(image_handle, system_table);
 
-    // ── Assemble pipeline ───────────────────────────────────────────
+    // ── Customize pipeline here ─────────────────────────────────────
+    //
+    // Default local-boot pipeline:
+    //   DiscoverDisk → DiscoverPartition → MountFilesystem
+    //   → DiscoverPayload → SelectPayload
+    //
+    // Replace DiscoverPayloadStage with NetworkPayloadLocatorStage
+    // for PXE/HTTP boot:
+    //   let mut stage4 = NetworkPayloadLocatorStage { url: None };
+    //
+    // Replace SelectPayloadStage with ExecuteBootStage { index: N }
+    // for unattended boot.
+    //
+    // Additional stages (e.g. SecureBootEnforceStage) can be inserted
+    // anywhere in the pipeline.
+
     let mut stage1 = DiscoverDiskStage;
     let mut stage2 = DiscoverPartitionStage;
     let mut stage3 = MountFilesystemStage;
     let mut stage4 = DiscoverPayloadStage;
     let mut stage5 = SelectPayloadStage;
 
-    // Note: SelectPayloadStage calls iso::show_menu which internally
-    // handles user interaction and chainloads.  It never returns.
-    // ExecuteBootStage is used when auto-booting without a menu.
     let stages: &mut [&mut dyn BootStage] = &mut [
         &mut stage1,
         &mut stage2,
@@ -51,7 +63,6 @@ extern "efiapi" fn efi_main(
 
     BootPipeline::run(&mut ctx, stages);
 
-    // If we ever get here (shouldn't, because SelectPayload diverges):
     loop {
         unsafe { core::arch::asm!("hlt") }
     }

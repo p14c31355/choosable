@@ -12,7 +12,7 @@
 use core::ffi::c_void;
 
 use crate::disk::read_sector;
-use crate::fs::{IsoEntry, FsCtx};
+use crate::fs::{FsCtx, PayloadEntry, PayloadType, PAYLOAD_SLOT_COUNT};
 use crate::output::{format_u64_buf, halt_or_reboot, print_dec, print_hex, print_raw};
 use crate::protocol::{
     BlockIoProtocol, BootServices, LoadedImageProtocol, MemoryType, SystemTable,
@@ -746,6 +746,146 @@ fn build_iso_device_path(bs: &mut BootServices, iso_size_bytes: u64) -> *mut c_v
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  Boot dispatcher — routes to the correct boot method by payload type
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn boot_payload_by_type(
+    st: &mut SystemTable,
+    image_handle: *mut c_void,
+    disk_handle: *mut c_void,
+    part1_lba: u64,
+    payloads: &[PayloadEntry; PAYLOAD_SLOT_COUNT],
+    idx: usize,
+    bio_ref: &BlockIoProtocol,
+    bio_ptr: *mut BlockIoProtocol,
+    mid: u32,
+) -> ! {
+    if idx >= payloads.len() {
+        print_raw(st, b"ERROR: payload index out of range.\r\n\0");
+        halt_or_reboot(st);
+    }
+    let p = &payloads[idx];
+    match p.payload_type {
+        PayloadType::Iso => uefi_chainload_iso(st, image_handle, part1_lba, payloads, idx, bio_ref, bio_ptr, mid),
+        PayloadType::Wim => boot_wim_payload(st, image_handle, part1_lba, payloads, idx, bio_ref, bio_ptr, mid),
+        PayloadType::Vhd | PayloadType::Vhdx => boot_vhd_payload(st, image_handle, part1_lba, payloads, idx, bio_ref, bio_ptr, mid),
+        PayloadType::Img => boot_img_payload(st, image_handle, part1_lba, payloads, idx, bio_ref, bio_ptr, mid),
+        PayloadType::Efi => boot_efi_payload(st, image_handle, payloads, idx, bio_ref, bio_ptr, mid),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Generic payload boot stubs — full implementations to be added as needed
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn boot_wim_payload(
+    st: &mut SystemTable,
+    _image_handle: *mut c_void,
+    _part1_lba: u64,
+    _payloads: &[PayloadEntry; PAYLOAD_SLOT_COUNT],
+    _idx: usize,
+    _bio_ref: &BlockIoProtocol,
+    _bio_ptr: *mut BlockIoProtocol,
+    _mid: u32,
+) -> ! {
+    print_raw(st, b"WIM boot: not yet implemented.\r\n\0");
+    print_raw(st, b"  Windows PE / WIM boot requires a Windows Boot Manager\r\n\0");
+    print_raw(st, b"  (bootmgfw.efi) on the ESP.  Place boot.wim and boot.sdi\r\n\0");
+    print_raw(st, b"  alongside the WIM file and configure BCD manually.\r\n\0");
+    halt_or_reboot(st);
+}
+
+fn boot_vhd_payload(
+    st: &mut SystemTable,
+    _image_handle: *mut c_void,
+    _part1_lba: u64,
+    _payloads: &[PayloadEntry; PAYLOAD_SLOT_COUNT],
+    _idx: usize,
+    _bio_ref: &BlockIoProtocol,
+    _bio_ptr: *mut BlockIoProtocol,
+    _mid: u32,
+) -> ! {
+    print_raw(st, b"VHD/VHDX boot: not yet implemented.\r\n\0");
+    print_raw(st, b"  Virtual-disk boot requires converting the VHD to\r\n\0");
+    print_raw(st, b"  a virtual BlockIo and chainloading a VHD-aware OS.\r\n\0");
+    halt_or_reboot(st);
+}
+
+fn boot_img_payload(
+    st: &mut SystemTable,
+    _image_handle: *mut c_void,
+    _part1_lba: u64,
+    _payloads: &[PayloadEntry; PAYLOAD_SLOT_COUNT],
+    _idx: usize,
+    _bio_ref: &BlockIoProtocol,
+    _bio_ptr: *mut BlockIoProtocol,
+    _mid: u32,
+) -> ! {
+    print_raw(st, b"IMG boot: not yet implemented.\r\n\0");
+    print_raw(st, b"  Raw disk-image boot requires creating a virtual BlockIo\r\n\0");
+    print_raw(st, b"  and chainloading the image's EFI bootloader.\r\n\0");
+    halt_or_reboot(st);
+}
+
+fn boot_efi_payload(
+    st: &mut SystemTable,
+    image_handle: *mut c_void,
+    payloads: &[PayloadEntry; PAYLOAD_SLOT_COUNT],
+    idx: usize,
+    bio_ref: &BlockIoProtocol,
+    bio_ptr: *mut BlockIoProtocol,
+    mid: u32,
+) -> ! {
+    let p = &payloads[idx];
+    let bs = unsafe { &mut *st.boot_services };
+    let sector_count = ((p.file_size + 511) / 512) as usize;
+    let buf_size = sector_count * 512;
+    let mut buf_ptr: *mut c_void = core::ptr::null_mut();
+    if unsafe { (bs.allocate_pool)(MemoryType::EfiLoaderData, buf_size, &mut buf_ptr) } != EFI_SUCCESS || buf_ptr.is_null() {
+        print_raw(st, b"ERROR: Out of memory for EFI payload.\r\n\0");
+        halt_or_reboot(st);
+    }
+    let status = unsafe {
+        (bio_ref.read_blocks)(bio_ptr, mid, p.file_start_lba, buf_size, buf_ptr)
+    };
+    if status != EFI_SUCCESS {
+        print_raw(st, b"ERROR: Failed to read EFI payload.\r\n\0");
+        unsafe { (bs.free_pool)(buf_ptr); }
+        halt_or_reboot(st);
+    }
+
+    print_raw(st, b"Booting EFI payload: \0");
+    print_raw(st, &p.name[..p.name_len.min(120)]);
+    print_raw(st, b" ...\r\n\0");
+
+    let mut child_handle: *mut c_void = core::ptr::null_mut();
+    let load_status = unsafe {
+        (bs.load_image)(false, image_handle, core::ptr::null_mut(),
+            buf_ptr as *const u8, p.file_size, &mut child_handle)
+    };
+    if load_status != EFI_SUCCESS {
+        print_hex(st, b"ERROR: LoadImage failed, status=0x", load_status as u64);
+        print_raw(st, b"\r\n\0");
+        unsafe { (bs.free_pool)(buf_ptr); }
+        halt_or_reboot(st);
+    }
+    unsafe { (bs.free_pool)(buf_ptr); }
+
+    let mut lip: *mut LoadedImageProtocol = core::ptr::null_mut();
+    if unsafe { (bs.handle_protocol)(child_handle, &LOADED_IMAGE_PROTOCOL_GUID, &mut lip as *mut _ as _) } == EFI_SUCCESS && !lip.is_null() {
+        unsafe {
+            (*lip).device_handle = image_handle;
+            (*lip).parent_handle = image_handle;
+        }
+    }
+    print_raw(st, b"Starting EFI payload...\r\n\0");
+    let result = unsafe { (bs.start_image)(child_handle, &mut 0u64, &mut core::ptr::null_mut::<u16>()) };
+    print_hex(st, b"StartImage returned 0x", result as u64);
+    print_raw(st, b"\r\n\0");
+    halt_or_reboot(st);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  Main chainload entry
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -753,7 +893,7 @@ fn uefi_chainload_iso(
     st: &mut SystemTable,
     image_handle: *mut c_void,
     part1_lba: u64,
-    files: &[IsoEntry; 64],
+    files: &[PayloadEntry; PAYLOAD_SLOT_COUNT],
     idx: usize,
     bio_ref: &BlockIoProtocol,
     bio_ptr: *mut BlockIoProtocol,
@@ -894,7 +1034,7 @@ fn uefi_chainload_iso(
         }
     }
 
-    let locator = FileBackedIsoLocator::from_iso_entry(
+    let locator = FileBackedIsoLocator::from_payload_entry(
         &files[idx],
         crate::protocol::Guid { d1: 0, d2: 0, d3: 0, d4: [0u8; 8] },
         1, part1_lba,
@@ -1012,7 +1152,7 @@ pub fn boot_iso(
     image_handle: *mut c_void,
     _disk_handle: *mut c_void,
     part1_lba: u64,
-    files: &[IsoEntry; 64],
+    files: &[PayloadEntry; PAYLOAD_SLOT_COUNT],
     idx: usize,
     bio_ref: &BlockIoProtocol,
     bio_ptr: *mut BlockIoProtocol,
@@ -1022,13 +1162,13 @@ pub fn boot_iso(
     uefi_chainload_iso(st, image_handle, part1_lba, files, idx, bio_ref, bio_ptr, mid);
 }
 
-use crate::fs::scan_directory;
+use crate::fs::scan_payloads;
 
-pub fn show_menu(
+pub fn show_payload_menu(
     st: &mut SystemTable,
     image_handle: *mut c_void,
     disk_handle: *mut c_void,
-    files: &[IsoEntry; 64],
+    payloads: &[PayloadEntry; PAYLOAD_SLOT_COUNT],
     count: usize,
     ctx: &FsCtx,
     bio_ref: &BlockIoProtocol,
@@ -1036,18 +1176,27 @@ pub fn show_menu(
     mid: u32,
 ) -> ! {
     if count == 0 {
-        print_raw(st, b"\r\nNo ISO files found on partition 1.\r\n\0");
+        print_raw(st, b"\r\nNo bootable payloads found on partition 1.\r\n\0");
         halt_or_reboot(st);
     }
     print_raw(st, b"\r\n=== Choosable UEFI Boot Menu ===\r\n\0");
     for i in 0..count.min(20) {
         let (sb, sl) = format_u64_buf((i + 1) as u64);
         print_raw(st, b" "); print_raw(st, &sb[20 - sl..]); print_raw(st, b". ");
-        if files[i].name_len > 0 && files[i].name[0] != 0 {
-            print_raw(st, &files[i].name[..files[i].name_len]);
+        if payloads[i].name_len > 0 && payloads[i].name[0] != 0 {
+            print_raw(st, &payloads[i].name[..payloads[i].name_len]);
         }
-        let size_mb = files[i].file_size / (1024 * 1024);
+        let type_str: &[u8] = match payloads[i].payload_type {
+            PayloadType::Iso => b" ISO ",
+            PayloadType::Wim => b" WIM ",
+            PayloadType::Vhd => b" VHD ",
+            PayloadType::Vhdx => b" VHDX",
+            PayloadType::Img => b" IMG ",
+            PayloadType::Efi => b" EFI ",
+        };
+        let size_mb = payloads[i].file_size / (1024 * 1024);
         let (sb2, sl2) = format_u64_buf(size_mb);
+        print_raw(st, type_str);
         print_raw(st, b" ("); print_raw(st, &sb2[20 - sl2..]); print_raw(st, b" MiB)\r\n\0");
     }
     print_raw(st, b"Enter number to boot (or 'r' to scan): \0");
@@ -1065,19 +1214,19 @@ pub fn show_menu(
         if (b'1'..=b'9').contains(&ch) {
             let idx = (ch - b'1') as usize;
             if idx < count {
-                boot_iso(st, image_handle, disk_handle, ctx.part1_lba, files, idx, bio_ref, bio_ptr, mid);
-                halt_or_reboot(st); // boot_iso returned — fatal error
+                boot_payload_by_type(st, image_handle, disk_handle, ctx.part1_lba, payloads, idx, bio_ref, bio_ptr, mid);
             }
         } else if ch == b'0' && count >= 10 {
-            boot_iso(st, image_handle, disk_handle, ctx.part1_lba, files, 9, bio_ref, bio_ptr, mid);
-            halt_or_reboot(st); // boot_iso returned — fatal error
+            boot_payload_by_type(st, image_handle, disk_handle, ctx.part1_lba, payloads, 9, bio_ref, bio_ptr, mid);
         } else if ch == b'r' || ch == b'R' {
             print_raw(st, b"\r\nRe-scanning...\r\n\0");
-            let mut new_files: [IsoEntry; 64] = unsafe { core::mem::zeroed() };
+            let mut new_payloads: [PayloadEntry; PAYLOAD_SLOT_COUNT] = [PayloadEntry {
+                name: [0; 256], name_len: 0, file_start_lba: 0, file_size: 0,
+                payload_type: PayloadType::Iso,
+            }; PAYLOAD_SLOT_COUNT];
             let mut new_count: usize = 0;
-            scan_directory(bio_ref, bio_ptr, mid, ctx, &mut new_files, &mut new_count);
-            show_menu(st, image_handle, disk_handle, &new_files, new_count, ctx, bio_ref, bio_ptr, mid);
+            scan_payloads(bio_ref, bio_ptr, mid, ctx, &mut new_payloads, &mut new_count);
+            show_payload_menu(st, image_handle, disk_handle, &new_payloads, new_count, ctx, bio_ref, bio_ptr, mid);
         }
     }
-    halt_or_reboot(st)
 }

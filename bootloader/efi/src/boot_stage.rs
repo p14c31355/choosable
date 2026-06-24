@@ -2,9 +2,12 @@
 //  Boot Stage — trait and concrete stage implementations
 // ═══════════════════════════════════════════════════════════════════════════
 
+use core::ffi::c_void;
+
 use crate::boot_context::BootContext;
 use crate::disk;
 use crate::fs;
+use crate::fs::{PayloadType, PAYLOAD_SLOT_COUNT};
 use crate::iso;
 use crate::output::{banner, die, halt_or_reboot, print_hex, print_raw};
 use crate::protocol::{BlockIoProtocol, BootServices, SystemTable, BLOCK_IO_PROTOCOL_GUID, EFI_SUCCESS};
@@ -306,11 +309,11 @@ impl BootStage for DiscoverPayloadStage {
 
         let fs_ctx_ref = ctx.fs_ctx.as_ref().expect("fs_ctx must be set");
 
-        fs::scan_directory(bio_ref, bio_ptr, mid, fs_ctx_ref, &mut ctx.iso_files, &mut ctx.iso_count);
+        fs::scan_payloads(bio_ref, bio_ptr, mid, fs_ctx_ref, &mut ctx.payloads, &mut ctx.payload_count);
 
-        if ctx.iso_count == 0 {
+        if ctx.payload_count == 0 {
             let st = unsafe { &mut *st_from_ctx(ctx) };
-            print_raw(st, b"\r\nNo ISO files found on partition 1.\r\n\0");
+            print_raw(st, b"\r\nNo bootable payloads found on partition 1.\r\n\0");
             halt_or_reboot(st);
             loop { unsafe { core::arch::asm!("hlt") } }
         }
@@ -329,28 +332,26 @@ impl BootStage for SelectPayloadStage {
     fn name(&self) -> &'static str { "SelectPayload" }
 
     fn execute(&mut self, ctx: &mut BootContext) -> StageResult {
-        // Derive all raw values from ctx while we can still borrow it.
         let image_handle = ctx.image_handle;
         let disk_handle = ctx.disk_handle.expect("disk_handle must be set");
         let bio_ptr = ctx.block_io.expect("block_io must be set");
         let bio_ref = unsafe { &*bio_ptr };
         let mid = ctx.media_id;
         let fs_ctx_ref = ctx.fs_ctx.as_ref().expect("fs_ctx must be set");
-        let iso_count = ctx.iso_count;
+        let payload_count = ctx.payload_count;
         let st = unsafe { &mut *ctx.system_table };
 
-        iso::show_menu(
+        iso::show_payload_menu(
             st,
             image_handle,
             disk_handle,
-            &ctx.iso_files,
-            iso_count,
+            &ctx.payloads,
+            payload_count,
             fs_ctx_ref,
             bio_ref,
             bio_ptr,
             mid,
         );
-        // show_menu never returns.
         loop { unsafe { core::arch::asm!("hlt") } }
     }
 }
@@ -367,10 +368,9 @@ impl BootStage for ExecuteBootStage {
     fn name(&self) -> &'static str { "ExecuteBoot" }
 
     fn execute(&mut self, ctx: &mut BootContext) -> StageResult {
-        // Validate selected index before proceeding
-        if ctx.iso_count == 0 || self.selected_index >= ctx.iso_count || self.selected_index >= 64 {
+        if ctx.payload_count == 0 || self.selected_index >= ctx.payload_count || self.selected_index >= PAYLOAD_SLOT_COUNT {
             let st = unsafe { &mut *st_from_ctx(ctx) };
-            print_raw(st, b"ERROR: Invalid ISO selection index.\r\n\0");
+            print_raw(st, b"ERROR: Invalid payload selection index.\r\n\0");
             halt_or_reboot(st);
             loop { unsafe { core::arch::asm!("hlt") } }
         }
@@ -386,24 +386,71 @@ impl BootStage for ExecuteBootStage {
         let selected_index = self.selected_index;
         let st = unsafe { &mut *ctx.system_table };
 
-        iso::boot_iso(
+        iso::boot_payload_by_type(
             st,
             image_handle,
             disk_handle,
             partition_start_lba,
-            &ctx.iso_files,
+            &ctx.payloads,
             selected_index,
             bio_ref,
             bio_ptr,
             mid,
         );
-        // boot_iso chainloads and never returns.
         loop { unsafe { core::arch::asm!("hlt") } }
     }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Boot Pipeline
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  NetworkPayloadLocatorStage — downloads payload via HTTP/TFTP/PXE
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Stage that retrieves a boot payload from a network source.
+///
+/// This stage replaces `DiscoverPayloadStage` when network booting.
+/// It downloads an ISO/IMG/EFI payload into memory and populates the
+/// `ctx.payloads` array so the pipeline can continue to `SelectPayloadStage`.
+///
+/// For PXE: the DHCP-offered filename is used.
+/// For HTTP(S): the URL is provided at stage construction.
+pub struct NetworkPayloadLocatorStage {
+    pub url: Option<&'static [u8]>,
+}
+
+impl BootStage for NetworkPayloadLocatorStage {
+    fn name(&self) -> &'static str { "NetworkPayloadLocator" }
+
+    fn execute(&mut self, ctx: &mut BootContext) -> StageResult {
+        let st = unsafe { &mut *ctx.system_table };
+        let bs = unsafe { &mut *st.boot_services };
+
+        print_raw(st, b"[NetworkPayloadLocator] Network boot not yet implemented.\r\n\0");
+        print_raw(st, b"  URL config: \0");
+        if let Some(url) = self.url {
+            print_raw(st, url);
+        } else {
+            print_raw(st, b"(DHCP / PXE)");
+        }
+        print_raw(st, b"\r\n\0");
+
+        // TODO: Implement network download via UEFI HTTP/SIMPLE_NETWORK protocols.
+        // For now, fall through with empty payloads so the pipeline continues
+        // to the next stage or halts gracefully.
+        if ctx.payload_count == 0 {
+            print_raw(st, b"[NetworkPayloadLocator] No network payload loaded.\r\n\0");
+            halt_or_reboot(st);
+        }
+
+        StageResult::Continue
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Boot Pipeline and Builder
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub struct BootPipeline;
@@ -418,3 +465,11 @@ impl BootPipeline {
         }
     }
 }
+
+// Pipeline assembly is done inline in `main.rs` to avoid lifetime issues
+// with returning references to local stage objects.
+//
+// Example custom pipeline (in main.rs):
+//   let mut stage4 = NetworkPayloadLocatorStage { url: None };
+//   let stages = &mut [&mut stage1, &mut stage2, &mut stage3,
+//                      &mut stage4, &mut stage5] as &mut [&mut dyn BootStage];

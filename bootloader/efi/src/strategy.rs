@@ -206,11 +206,13 @@ impl BootStrategy for CasperStrategy {
     fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> {
         // Premount hook mounts ISO at /cdrom via losetup BEFORE casper.
         // Casper auto-detects /cdrom when boot=casper is set.
+        // live-media=LABEL=Choosable acts as a hint so casper knows which
+        // device to scan if the premount hook fails for any reason.
         // Do NOT inject iso-scan/filename= — it forces casper's 20iso_scan
         // to mount the real partition (fails on exFAT/NTFS).
         patch_grub_cfg_impl(
             inp,
-            b" boot=casper",
+            b" boot=casper live-media=LABEL=Choosable",
             b"", // no eol override — premount handles /cdrom, casper auto-detects it
             inp.premount_target_name,
         )
