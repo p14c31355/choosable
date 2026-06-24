@@ -346,6 +346,16 @@ unsafe extern "efiapi" fn vblock_read(
             dst[off + 80..off + 84].copy_from_slice(&new_vol_size.to_le_bytes());
             dst[off + 84..off + 88].copy_from_slice(&new_vol_size.to_be_bytes());
 
+            // Override Volume ID to "CHOOSABLE" (space-padded to 32 bytes)
+            // so that LABEL=Choosable kernel cmdline parameters
+            // (live-media, archisodevice, rd.live.image, etc.) work.
+            // ISO9660 Volume Identifier: bytes 40-71 (32 bytes, space-padded).
+            {
+                let label = b"CHOOSABLE                       ";
+                // label is exactly 32 bytes
+                dst[off + 40..off + 72].copy_from_slice(&label[0..32]);
+            }
+
             // If premount entry was injected (not patched over existing),
             // also update the root directory record data length in PVD
             // so GRUB walks past the synthetic PREMOUNT.CPIO record.

@@ -447,8 +447,8 @@ static STRATEGIES: &[&dyn BootStrategy] = &[
     &LiveOSStrategy,
     &CasperStrategy,
     &LiveBootStrategy,
-    &AlpinePremountStrategy,
     &AlpineStrategy,
+    &AlpinePremountStrategy,
     &ArchStrategy,
 ];
 

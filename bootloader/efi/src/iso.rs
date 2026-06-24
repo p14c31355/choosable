@@ -788,6 +788,32 @@ fn build_iso_device_path(bs: &mut BootServices, iso_size_bytes: u64, efi_filenam
     ptr
 }
 
+/// Build a CD-ROM-only DevicePath (Media + End nodes, no File Path).
+/// Used as a fallback when firmware rejects the synthetic file path node
+/// but requires a DevicePath to locate the virtual CD-ROM handle.
+fn build_cdrom_only_device_path(bs: &mut BootServices, _iso_size_bytes: u64) -> *mut c_void {
+    const CDROM_NODE: [u8; 24] = {
+        let mut n = [0u8; 24];
+        n[0] = 0x04; n[1] = 0x02; n[2] = 24; n[3] = 0;
+        n
+    };
+    const END_NODE: [u8; 4] = [0x7F, 0xFF, 0x04, 0x00];
+    let total = CDROM_NODE.len() + END_NODE.len();
+    let mut ptr: *mut c_void = core::ptr::null_mut();
+    if unsafe { (bs.allocate_pool)(MemoryType::EfiLoaderData, total, &mut ptr) } != EFI_SUCCESS || ptr.is_null() {
+        return core::ptr::null_mut();
+    }
+    let dp = ptr as *mut u8;
+    unsafe {
+        dp.copy_from_nonoverlapping(CDROM_NODE.as_ptr(), CDROM_NODE.len());
+        *(dp.add(8) as *mut u64) = 0u64.to_le();
+        *(dp.add(16) as *mut u64) = 0u64.to_le(); // Partition Start = 0
+        dp.add(CDROM_NODE.len())
+            .copy_from_nonoverlapping(END_NODE.as_ptr(), END_NODE.len());
+    }
+    ptr
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Boot dispatcher — routes to the correct boot method by payload type
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1134,7 +1160,9 @@ fn uefi_chainload_iso(
 
     // Most firmware accepts the synthetic DevicePath; some (InsydeH2O)
     // reject it and require NULL when SourceBuffer is set.  Try the
-    // DevicePath first, then retry with NULL on EFI_UNSUPPORTED.
+    // DevicePath first, then retry with NULL on EFI_UNSUPPORTED, and
+    // finally retry with a CD-ROM-only DevicePath (no file path node)
+    // which some firmware prefers over NULL.
     let mut child_handle: *mut c_void = core::ptr::null_mut();
     let mut load_status = unsafe {
         (bs.load_image)(false, image_handle,
@@ -1147,6 +1175,22 @@ fn uefi_chainload_iso(
             (bs.load_image)(false, image_handle, core::ptr::null_mut(),
                 buf_ptr, buf_len as u64, &mut child_handle)
         };
+    }
+    if load_status == crate::protocol::EFI_INVALID_PARAMETER || load_status == crate::protocol::EFI_UNSUPPORTED {
+        // Retry with CD-ROM-only DevicePath (no file path node).
+        // Some firmware needs a real DevicePath to locate the
+        // device, but rejects the synthetic file path.
+        let cdrom_only_dp = build_cdrom_only_device_path(bs, iso_size);
+        if !cdrom_only_dp.is_null() {
+            load_status = unsafe {
+                (bs.load_image)(false, image_handle,
+                    cdrom_only_dp as *mut crate::protocol::DevicePathProtocol,
+                    buf_ptr, buf_len as u64, &mut child_handle)
+            };
+            if load_status != EFI_SUCCESS {
+                unsafe { (bs.free_pool)(cdrom_only_dp); }
+            }
+        }
     }
     if load_status != EFI_SUCCESS {
         print_hex(st, b"ERROR: LoadImage failed, status=0x", load_status as u64);
