@@ -237,8 +237,8 @@ fn sanitize_filename(input: &[u8]) -> ([u8; 320], usize) {
 //  Premount script
 // ═══════════════════════════════════════════════════════════════════════════
 
-fn build_premount_script(offset_bytes: u64, needs_sr_mod: bool) -> [u8; 4096] {
-    let mut script = [0u8; 4096];
+fn build_premount_script(offset_bytes: u64, needs_sr_mod: bool) -> [u8; 8192] {
+    let mut script = [0u8; 8192];
 
     let sr_mod_line: &[u8] = if needs_sr_mod {
         b"modprobe sr_mod 2>/dev/null\n"
@@ -281,6 +281,7 @@ losetup -d $LOOP 2>/dev/null
 done</proc/partitions
 sleep 1;done
 echo 'choosable: gave up - no ISO found on any partition' >/dev/console
+return 0
 ";
 
     let off_str = format_decimal_u64(offset_bytes);
@@ -292,6 +293,7 @@ echo 'choosable: gave up - no ISO found on any partition' >/dev/console
     let mut pos = 0usize;
     let bytes = src_template;
     let sr_mod_len = sr_mod_line.len();
+    let buf_cap = script.len() - 1; // 8191
     let mut i = 0;
     while i < bytes.len() {
         if i + 5 <= bytes.len()
@@ -300,7 +302,7 @@ echo 'choosable: gave up - no ISO found on any partition' >/dev/console
             && bytes[i+4] == b'D'
         {
             for j in 0..sr_mod_len {
-                if pos < 4095 { script[pos] = sr_mod_line[j]; pos += 1; }
+                if pos < buf_cap { script[pos] = sr_mod_line[j]; pos += 1; }
             }
             i += 5;
         } else if i + 6 <= bytes.len()
@@ -308,11 +310,11 @@ echo 'choosable: gave up - no ISO found on any partition' >/dev/console
             && bytes[i+3] == b'S' && bytes[i+4] == b'E' && bytes[i+5] == b'T'
         {
             for j in 0..off_slice.len() {
-                if pos < 4095 { script[pos] = off_slice[j]; pos += 1; }
+                if pos < buf_cap { script[pos] = off_slice[j]; pos += 1; }
             }
             i += 6;
         } else {
-            if pos < 4095 { script[pos] = bytes[i]; pos += 1; }
+            if pos < buf_cap { script[pos] = bytes[i]; pos += 1; }
             i += 1;
         }
     }
@@ -426,7 +428,7 @@ pub fn prepare_premount_initrd(
     let offset_bytes = relative_sector_offset * 512;
 
     let premount_script = build_premount_script(offset_bytes, needs_sr_mod);
-    let premount_len = premount_script.iter().position(|&c| c == 0).unwrap_or(4095);
+    let premount_len = premount_script.iter().position(|&c| c == 0).unwrap_or(8191);
 
     let bottom_script = build_bottom_script(iso_name);
     let bottom_len = bottom_script.iter().position(|&c| c == 0).unwrap_or(2047);

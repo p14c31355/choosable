@@ -240,7 +240,7 @@ impl BootStrategy for CasperStrategy {
         patch_grub_cfg_impl(
             inp,
             linux_args,
-            b"", // no eol override — premount handles /cdrom, casper auto-detects it
+            b" choosable.iso_offset=",
             inp.premount_target_name,
         )
     }
@@ -270,7 +270,7 @@ impl BootStrategy for LiveBootStrategy {
     fn patch(&self, inp: &PatchInput) -> Option<PatchOutput> {
         patch_grub_cfg_impl(
             inp,
-            b" boot=live live-media=removable",
+            b" boot=live live-media=removable choosable.iso_offset=",
             b" findiso=",
             inp.premount_target_name,
         )
@@ -307,7 +307,7 @@ impl BootStrategy for LiveOSStrategy {
         patch_grub_cfg_impl(
             inp,
             b" rd.live.image root=live:LABEL=Choosable rd.live.overlay=LABEL=Choosable rootdelay=30",
-            b"",
+            b" choosable.iso_offset=",
             inp.premount_target_name,
         )
     }
@@ -335,7 +335,7 @@ impl BootStrategy for AlpineStrategy {
         patch_grub_cfg_impl(
             inp,
             b" init=/init.choosable modules=loop,iso9660",
-            b"",
+            b" choosable.iso_offset=",
             inp.premount_target_name,
         )
     }
@@ -379,7 +379,7 @@ impl BootStrategy for AlpinePremountStrategy {
         patch_grub_cfg_impl(
             inp,
             b" modules=loop,iso9660",
-            b"",
+            b" choosable.iso_offset=",
             inp.premount_target_name,
         )
     }
@@ -418,7 +418,7 @@ impl BootStrategy for ArchStrategy {
         patch_grub_cfg_impl(
             inp,
             b" archisodevice=LABEL=Choosable archisobasedir=arch copytoram",
-            b"",
+            b" choosable.iso_offset=",
             inp.premount_target_name,
         )
     }

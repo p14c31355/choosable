@@ -311,10 +311,16 @@ unsafe extern "efiapi" fn vblock_read(
         }
 
         if is_premount_injected {
-            // The sector may already have been read by is_dir_patched
-            // or is_premount_patched above; only read it if neither
-            // of them has populated the buffer yet.
-            if !is_dir_patched && !is_premount_patched {
+            // For injected entries past the original ISO end
+            // (premount_redirect_root), the sector must be served
+            // purely from memory; the real disk has no data there.
+            let past_iso_end = block_lba > vbio.media.bim_lb.saturating_sub(
+                vbio.premount_file_sectors as u64 + vbio.patched_file_sectors as u64
+            );
+            if vbio.premount_redirect_root || past_iso_end {
+                // Zero-fill the sector, then stamp the blob.
+                for j in 0..2048 { dst[block_offset + j] = 0; }
+            } else if !is_dir_patched && !is_premount_patched {
                 if !read_real_iso_sector(vbio, block_lba, dst, block_offset) { return EFI_DEVICE_ERROR; }
             }
             // Overwrite with the pre-built synthetic directory record
@@ -363,6 +369,17 @@ unsafe extern "efiapi" fn vblock_read(
                 // Root Dir Record Data Length: bytes 166-169 (LE), 170-173 (BE)
                 dst[off + 166..off + 170].copy_from_slice(&vbio.premount_new_root_size.to_le_bytes());
                 dst[off + 170..off + 174].copy_from_slice(&vbio.premount_new_root_size.to_be_bytes());
+            }
+
+            // If root directory was redirected to a new injection sector,
+            // update PVD Root Dir Record to point to the new sector.
+            if vbio.premount_redirect_root && vbio.premount_root_lba > 0 {
+                // Root Dir Record Extent: bytes 158-161 (LE), 162-165 (BE)
+                dst[off + 158..off + 162].copy_from_slice(&vbio.premount_root_lba.to_le_bytes());
+                dst[off + 162..off + 166].copy_from_slice(&vbio.premount_root_lba.to_be_bytes());
+                // Root Dir Record Data Length: bytes 166-169 (LE), 170-173 (BE)
+                dst[off + 166..off + 170].copy_from_slice(&vbio.premount_root_size.to_le_bytes());
+                dst[off + 170..off + 174].copy_from_slice(&vbio.premount_root_size.to_be_bytes());
             }
         }
     }
@@ -487,6 +504,9 @@ pub fn create_virtual_cdrom(
     vbio.premount_entry_injected_blob = [0u8; 128];
     vbio.premount_entry_injected_size = 0;
     vbio.premount_new_root_size = 0;
+    vbio.premount_redirect_root = false;
+    vbio.premount_root_lba = 0;
+    vbio.premount_root_size = 0;
 
     // ═════════════════════════════════════════════════════════════
     // 3. Install BlockIO protocol (creates the handle)

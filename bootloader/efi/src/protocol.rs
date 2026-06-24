@@ -337,6 +337,15 @@ pub struct VirtualBlockIo {
     /// directory size (original EOD position + injected record size).
     /// PVD sector 16 root dir record size is patched to this value.
     pub premount_new_root_size: u32,
+    /// When true, the PVD root directory record (bytes 158-173) is
+    /// redirected to a new sector that contains the synthetic
+    /// PREMOUNT.CPIO entry.  Used when the original root directory
+    /// has no free space for EOD injection.
+    pub premount_redirect_root: bool,
+    /// New root directory LBA when premount_redirect_root is true.
+    pub premount_root_lba: u32,
+    /// New root directory size in bytes when premount_redirect_root is true.
+    pub premount_root_size: u32,
 }
 
 pub const DEVICE_PATH_PROTOCOL_GUID: Guid = Guid {

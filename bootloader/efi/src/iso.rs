@@ -1117,12 +1117,41 @@ fn uefi_chainload_iso(
                     print_dec(st, eod_offset as u64);
                     print_raw(st, b"\r\n\0");
                 } else {
+                    // Root directory is full (no free space for EOD injection
+                    // and no safe file to overwrite).  Extend the virtual
+                    // media by 1 sector and inject the synthetic entry there.
+                    // The vblock_read handler will serve this sector from
+                    // memory rather than reading past the original ISO.
+                    let injection_sector = (vb.media.bim_lb + 1) as u32;
+                    vb.media.bim_lb += 1;
+
+                    let mut blob = [0u8; 128];
+                    let blob_len = build_premount_cpio_entry(
+                        &mut blob,
+                        vb.premount_file_sector,
+                        bundle.cpio_size as u32,
+                    );
+                    vb.premount_entry_sector = injection_sector;
+                    vb.premount_entry_offset = 0;
+                    vb.premount_entry_injected_blob = blob;
+                    vb.premount_entry_injected_size = blob_len;
+                    vb.premount_entry_injected = true;
+                    // Redirect PVD root directory to the new injection sector
+                    vb.premount_redirect_root = true;
+                    vb.premount_root_lba = injection_sector;
+                    vb.premount_root_size = blob_len;
+
                     if !sfs_instance.is_null() {
                         let sfs = unsafe { &mut *sfs_instance };
                         sfs.ctx.premount_cpio_buf = bundle.cpio_buf;
                         sfs.ctx.premount_cpio_size = bundle.cpio_size;
+                        sfs.ctx.premount_target_name = *b"PREMOUNT.CPIO___";
+                        sfs.ctx.premount_target_name_len = 13;
                     }
-                    print_raw(st, b"[premount] WARNING: no EOD marker in root dir (SFS-only)\r\n\0");
+
+                    print_raw(st, b"[premount] forced injection at new sector=\0");
+                    print_dec(st, injection_sector as u64);
+                    print_raw(st, b"\r\n\0");
                 }
             }
         }

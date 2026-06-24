@@ -13,7 +13,6 @@
 #   DEBIAN*       — referenced by Debian GRUB as /DEBIAN sentinel file
 #   POP*          — referenced by Pop!_OS GRUB as /POP sentinel file
 #   AUTORUN.INF   — Windows autorun, occasionally checked
-#   .ALPINE_RELEASE — Alpine Linux requires this file to detect the live medium
 
 MD5SUM*
 README*
@@ -23,4 +22,3 @@ POP*
 AUTORUN.INF
 EFI.IMG
 SHA256SUM.TXT
-.ALPINE_RELEASE
