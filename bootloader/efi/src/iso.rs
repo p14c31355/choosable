@@ -1223,43 +1223,70 @@ fn uefi_chainload_iso(
                     print_raw(st, b"\r\n\0");
                 } else {
                     // Root directory is full (no free space for EOD injection
-                    // and no safe file to overwrite).  Extend the virtual
-                    // media by 1 sector and inject the synthetic entry there.
-                    // The vblock_read handler will serve this sector from
-                    // memory rather than reading past the original ISO.
-                    let injection_sector = (vb.media.bim_lb + 1) as u32;
-                    vb.media.bim_lb += 1;
+                    // and no safe file to overwrite).  Relocate the entire
+                    // root directory to a new contiguous extent at the end of
+                    // the virtual CD-ROM, appending the synthetic PREMOUNT.CPIO
+                    // entry.  GRUB's ISO9660 driver reads directories sequentially,
+                    // so the relocated extent must be contiguous.
+                    let root_sectors = ((root_size as u64 + 2047) / 2048) as u32;
+                    // Extra sector for the synthetic entry if needed
+                    let extra_sectors = if root_size % 2048 == 0 || root_size % 2048 + 47 > 2048 { 1u32 } else { 0u32 };
+                    let relocated_sectors = root_sectors + extra_sectors;
+                    let relocated_bytes = relocated_sectors as usize * 2048;
 
-                    let mut blob = [0u8; 128];
-                    let blob_len = build_premount_cpio_entry(
-                        &mut blob,
-                        vb.premount_file_sector,
-                        bundle.cpio_size as u32,
-                    );
-                    vb.premount_entry_sector = injection_sector;
-                    vb.premount_entry_offset = 0;
-                    vb.premount_entry_injected_blob = blob;
-                    vb.premount_entry_injected_size = blob_len;
-                    vb.premount_entry_injected = true;
-                    // Instead of redirecting the PVD root directory (which
-                    // would hide all existing entries from GRUB), append
-                    // one extra sector to the virtual CD-ROM.  The PVD
-                    // root_lba stays the same; only root_size (and volume
-                    // size) are updated to include the extra sector.
-                    vb.premount_root_extended = true;
-                    vb.premount_new_root_size = root_size.saturating_add(2048);
+                    let mut relocated_ptr: *mut c_void = core::ptr::null_mut();
+                    if unsafe { (bs.allocate_pool)(MemoryType::EfiLoaderData, relocated_bytes, &mut relocated_ptr) } != EFI_SUCCESS || relocated_ptr.is_null() {
+                        print_raw(st, b"[premount] relocation alloc failed\r\n\0");
+                    } else {
+                        let reloc = unsafe { core::slice::from_raw_parts_mut(relocated_ptr as *mut u8, relocated_bytes) };
+                        // Zero-fill first
+                        for b in reloc.iter_mut() { *b = 0; }
+                        // Copy all original root directory sectors
+                        for s in 0..root_sectors {
+                            let mut sec = [0u8; 2048];
+                            if read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, root_lba + s, &mut sec) {
+                                let off = s as usize * 2048;
+                                let copy = ((root_size as usize).saturating_sub(off)).min(2048);
+                                reloc[off..off + copy].copy_from_slice(&sec[..copy]);
+                            }
+                        }
+                        // Build the synthetic entry at the end of the relocated data
+                        let insert_off = root_size as usize;
+                        let mut blob = [0u8; 128];
+                        let blob_len = build_premount_cpio_entry(
+                            &mut blob,
+                            vb.premount_file_sector,
+                            bundle.cpio_size as u32,
+                        );
+                        reloc[insert_off..insert_off + blob_len as usize].copy_from_slice(&blob[..blob_len as usize]);
+                        let new_root_size = insert_off as u32 + blob_len;
 
-                    if !sfs_instance.is_null() {
-                        let sfs = unsafe { &mut *sfs_instance };
-                        sfs.ctx.premount_cpio_buf = bundle.cpio_buf;
-                        sfs.ctx.premount_cpio_size = bundle.cpio_size;
-                        sfs.ctx.premount_target_name = *b"PREMOUNT.CPIO___";
-                        sfs.ctx.premount_target_name_len = 13;
+                        let relocated_start = (vb.media.bim_lb + 1) as u32;
+                        vb.media.bim_lb = relocated_start as u64 + relocated_sectors as u64 - 1;
+                        vb.premount_root_relocated = true;
+                        vb.premount_root_buf = relocated_ptr as *mut u8;
+                        vb.premount_root_buf_size = relocated_bytes;
+                        vb.premount_root_sectors = relocated_sectors;
+                        vb.premount_root_start_sector = relocated_start;
+                        vb.premount_new_root_size = new_root_size;
+                        vb.premount_entry_injected = false; // synthetic entry is in reloc, not a separate injected sector
+
+                        if !sfs_instance.is_null() {
+                            let sfs = unsafe { &mut *sfs_instance };
+                            sfs.ctx.premount_cpio_buf = bundle.cpio_buf;
+                            sfs.ctx.premount_cpio_size = bundle.cpio_size;
+                            sfs.ctx.premount_target_name = *b"PREMOUNT.CPIO___";
+                            sfs.ctx.premount_target_name_len = 13;
+                        }
+
+                        print_raw(st, b"[premount] root dir relocated to sector=\0");
+                        print_dec(st, relocated_start as u64);
+                        print_raw(st, b" sectors=\0");
+                        print_dec(st, relocated_sectors as u64);
+                        print_raw(st, b" new_root_size=\0");
+                        print_dec(st, new_root_size as u64);
+                        print_raw(st, b"\r\n\0");
                     }
-
-                    print_raw(st, b"[premount] root dir full -- extended by 1 sector at sector=\0");
-                    print_dec(st, injection_sector as u64);
-                    print_raw(st, b"\r\n\0");
                 }
             }
         }

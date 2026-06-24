@@ -311,15 +311,15 @@ unsafe extern "efiapi" fn vblock_read(
         }
 
         if is_premount_injected {
-            // When premount_root_extended is true, the injected sector
-            // lives beyond the original ISO end and must be served
-            // purely from memory.  The injected blob is a complete
-            // ISO9660 sector containing only the synthetic
-            // PREMOUNT.CPIO directory record + EOD marker.
-            if vbio.premount_root_extended {
-                for j in 0..2048 { dst[block_offset + j] = 0; }
-            } else if !is_dir_patched && !is_premount_patched {
+            // The injected sector lives beyond the original ISO end
+            // and must be served purely from memory (unless it was
+            // injected within the existing root directory via EOD).
+            // When root_relocated is true, the injected entry is part
+            // of the relocated root buf, so this path should not fire.
+            if !is_dir_patched && !is_premount_patched && !vbio.premount_root_relocated {
                 if !read_real_iso_sector(vbio, block_lba, dst, block_offset) { return EFI_DEVICE_ERROR; }
+            } else {
+                for j in 0..2048 { dst[block_offset + j] = 0; }
             }
             // Overwrite with the pre-built synthetic directory record
             let off = vbio.premount_entry_offset as usize;
@@ -332,7 +332,8 @@ unsafe extern "efiapi" fn vblock_read(
 
         if sect_handled { continue; }
 
-        if serve_memory_sector(vbio.premount_file_buf, vbio.premount_file_sectors, vbio.premount_file_sector, block_lba, dst, block_offset)
+        if serve_memory_sector(vbio.premount_root_buf, vbio.premount_root_sectors, vbio.premount_root_start_sector, block_lba, dst, block_offset)
+            || serve_memory_sector(vbio.premount_file_buf, vbio.premount_file_sectors, vbio.premount_file_sector, block_lba, dst, block_offset)
             || serve_memory_sector(vbio.patched_file_buf, vbio.patched_file_sectors, vbio.patched_file_sector, block_lba, dst, block_offset)
         {
             continue;
@@ -369,10 +370,17 @@ unsafe extern "efiapi" fn vblock_read(
                 dst[off + 170..off + 174].copy_from_slice(&vbio.premount_new_root_size.to_be_bytes());
             }
 
-            // When root directory is extended (new sector appended past
-            // original ISO end), the PVD root_lba stays the same; only
-            // root_size needs to reflect the extra sector (done above
-            // via premount_new_root_size).  No LBA redirection needed.
+            // When root directory is relocated (copied to a new
+            // contiguous extent at the end of the virtual CD-ROM),
+            // redirect PVD root_lba and root_size to the relocated extent.
+            if vbio.premount_root_relocated && vbio.premount_root_start_sector > 0 {
+                // Root Dir Record Extent: bytes 158-161 (LE), 162-165 (BE)
+                dst[off + 158..off + 162].copy_from_slice(&vbio.premount_root_start_sector.to_le_bytes());
+                dst[off + 162..off + 166].copy_from_slice(&vbio.premount_root_start_sector.to_be_bytes());
+                // Root Dir Record Data Length: bytes 166-169 (LE), 170-173 (BE)
+                dst[off + 166..off + 170].copy_from_slice(&vbio.premount_new_root_size.to_le_bytes());
+                dst[off + 170..off + 174].copy_from_slice(&vbio.premount_new_root_size.to_be_bytes());
+            }
         }
     }
 
@@ -496,7 +504,11 @@ pub fn create_virtual_cdrom(
     vbio.premount_entry_injected_blob = [0u8; 128];
     vbio.premount_entry_injected_size = 0;
     vbio.premount_new_root_size = 0;
-    vbio.premount_root_extended = false;
+    vbio.premount_root_relocated = false;
+    vbio.premount_root_buf = core::ptr::null_mut();
+    vbio.premount_root_buf_size = 0;
+    vbio.premount_root_sectors = 0;
+    vbio.premount_root_start_sector = 0;
 
     // ═════════════════════════════════════════════════════════════
     // 3. Install BlockIO protocol (creates the handle)

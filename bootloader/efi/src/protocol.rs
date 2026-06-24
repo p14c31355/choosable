@@ -337,13 +337,22 @@ pub struct VirtualBlockIo {
     /// directory size (original EOD position + injected record size).
     /// PVD sector 16 root dir record size is patched to this value.
     pub premount_new_root_size: u32,
-    /// When true, the root directory has been extended by one 2048-byte
-    /// sector past the original ISO end to accommodate the synthetic
-    /// PREMOUNT.CPIO entry.  Unlike the old redirect_root approach,
-    /// this preserves all existing directory entries and only appends.
-    /// PVD root_size is updated to include the extra sector; root_lba
-    /// remains unchanged.
-    pub premount_root_extended: bool,
+    /// When true, the entire root directory has been relocated to a new
+    /// contiguous extent at the end of the virtual CD-ROM.  All original
+    /// directory records are copied, and the synthetic PREMOUNT.CPIO entry
+    /// is appended.  PVD root_lba and root_size are updated to point to
+    /// the relocated extent served from premount_root_buf.
+    pub premount_root_relocated: bool,
+    /// Pool-allocated buffer containing the relocated root directory
+    /// (original entries + PREMOUNT.CPIO + EOD).  Zero-filled to sector
+    /// alignment.
+    pub premount_root_buf: *mut u8,
+    /// Size of the relocated root directory in bytes.
+    pub premount_root_buf_size: usize,
+    /// Number of 2048-byte sectors in the relocated root directory.
+    pub premount_root_sectors: u32,
+    /// Absolute ISO sector where the relocated root directory starts.
+    pub premount_root_start_sector: u32,
 }
 
 pub const DEVICE_PATH_PROTOCOL_GUID: Guid = Guid {

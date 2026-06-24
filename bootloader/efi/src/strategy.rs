@@ -113,18 +113,32 @@ fn patch_grub_cfg_impl(
     dedup_buf[1..1 + name_len].copy_from_slice(&effective_target[..name_len]);
     let dedup_slice = &dedup_buf[..1 + name_len];
 
-    let iso_path: Option<&[u8]> = inp.iso_location.map(|loc| loc.path());
+    // Build the dynamic value for choosable.iso_offset=  (or findiso= for DebianLive).
+    // choosable.iso_offset= needs the decimal byte offset, not the file path.
+    // DebianLive findiso= needs the file path.
     let mut eol_buf = [0u8; 320];
     let eol_extra_dynamic: &[u8] = if !linux_eol_extra.is_empty() && linux_eol_extra.ends_with(b"=") {
-        if let Some(path) = iso_path {
+        if let Some(loc) = inp.iso_location {
             let plen = linux_eol_extra.len();
-            if plen < 320 {
+            if linux_eol_extra == b" findiso=" {
+                let path = loc.path();
                 let pl = path.len().min(320 - plen);
                 eol_buf[..plen].copy_from_slice(linux_eol_extra);
                 eol_buf[plen..plen + pl].copy_from_slice(&path[..pl]);
                 &eol_buf[..plen + pl]
             } else {
-                linux_eol_extra
+                // choosable.iso_offset=  — needs decimal byte offset
+                let offset = loc.offset_bytes();
+                let mut off_str = [0u8; 21];
+                let mut v = offset;
+                let mut pos = 20;
+                if v == 0 { off_str[20] = b'0'; }
+                else { loop { off_str[pos] = b'0' + (v % 10) as u8; v /= 10; if v == 0 { break; } pos -= 1; } }
+                let off_len = 21 - pos;
+                eol_buf[..plen].copy_from_slice(linux_eol_extra);
+                let pl = off_len.min(320 - plen);
+                eol_buf[plen..plen + pl].copy_from_slice(&off_str[pos..pos + pl]);
+                &eol_buf[..plen + pl]
             }
         } else { linux_eol_extra }
     } else { linux_eol_extra };

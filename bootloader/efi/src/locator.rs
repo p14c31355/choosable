@@ -48,6 +48,12 @@ impl IsoLocation {
         &self.file_path[..self.file_path_len]
     }
 
+    /// Returns the byte offset of the ISO file relative to partition start.
+    /// This is `(iso_lba - part1_lba) * 512`.
+    pub fn offset_bytes(&self) -> u64 {
+        (self.iso_lba - self.part1_lba) * 512
+    }
+
     /// Returns just the file name (everything after the last `/`).
     pub fn file_name(&self) -> &[u8] {
         let path = self.path();
