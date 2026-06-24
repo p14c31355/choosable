@@ -337,15 +337,13 @@ pub struct VirtualBlockIo {
     /// directory size (original EOD position + injected record size).
     /// PVD sector 16 root dir record size is patched to this value.
     pub premount_new_root_size: u32,
-    /// When true, the PVD root directory record (bytes 158-173) is
-    /// redirected to a new sector that contains the synthetic
-    /// PREMOUNT.CPIO entry.  Used when the original root directory
-    /// has no free space for EOD injection.
-    pub premount_redirect_root: bool,
-    /// New root directory LBA when premount_redirect_root is true.
-    pub premount_root_lba: u32,
-    /// New root directory size in bytes when premount_redirect_root is true.
-    pub premount_root_size: u32,
+    /// When true, the root directory has been extended by one 2048-byte
+    /// sector past the original ISO end to accommodate the synthetic
+    /// PREMOUNT.CPIO entry.  Unlike the old redirect_root approach,
+    /// this preserves all existing directory entries and only appends.
+    /// PVD root_size is updated to include the extra sector; root_lba
+    /// remains unchanged.
+    pub premount_root_extended: bool,
 }
 
 pub const DEVICE_PATH_PROTOCOL_GUID: Guid = Guid {
@@ -453,6 +451,7 @@ pub const EFI_DEVICE_ERROR: usize         = 0x80000000_00000007usize;
 pub const EFI_NO_MEDIA: usize             = 0x80000000_00000014usize;
 pub const EFI_WRITE_PROTECTED: usize      = 0x80000000_00000011usize;
 pub const EFI_OUT_OF_RESOURCES: usize     = 0x80000000_00000009usize;
+pub const EFI_SECURITY_VIOLATION: usize   = 0x80000000_0000001Ausize;
 
 pub const BLOCK_IO_PROTOCOL_GUID: Guid = Guid {
     d1: 0x964e5b21,

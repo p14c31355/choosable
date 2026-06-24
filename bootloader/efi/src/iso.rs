@@ -1241,10 +1241,13 @@ fn uefi_chainload_iso(
                     vb.premount_entry_injected_blob = blob;
                     vb.premount_entry_injected_size = blob_len;
                     vb.premount_entry_injected = true;
-                    // Redirect PVD root directory to the new injection sector
-                    vb.premount_redirect_root = true;
-                    vb.premount_root_lba = injection_sector;
-                    vb.premount_root_size = blob_len;
+                    // Instead of redirecting the PVD root directory (which
+                    // would hide all existing entries from GRUB), append
+                    // one extra sector to the virtual CD-ROM.  The PVD
+                    // root_lba stays the same; only root_size (and volume
+                    // size) are updated to include the extra sector.
+                    vb.premount_root_extended = true;
+                    vb.premount_new_root_size = root_size.saturating_add(2048);
 
                     if !sfs_instance.is_null() {
                         let sfs = unsafe { &mut *sfs_instance };
@@ -1254,7 +1257,7 @@ fn uefi_chainload_iso(
                         sfs.ctx.premount_target_name_len = 13;
                     }
 
-                    print_raw(st, b"[premount] forced injection at new sector=\0");
+                    print_raw(st, b"[premount] root dir full -- extended by 1 sector at sector=\0");
                     print_dec(st, injection_sector as u64);
                     print_raw(st, b"\r\n\0");
                 }
@@ -1292,25 +1295,42 @@ fn uefi_chainload_iso(
     print_dec(st, buf_len as u64);
     print_raw(st, b" bytes\r\n\0");
 
-    // Most firmware accepts the synthetic DevicePath; some (InsydeH2O)
-    // reject it and require NULL when SourceBuffer is set.  Try the
-    // DevicePath first, then retry with NULL on EFI_UNSUPPORTED, and
-    // finally retry with a CD-ROM-only DevicePath (no file path node)
-    // which some firmware prefers over NULL.
+    // Most firmware accepts the synthetic DevicePath; some (InsydeH2O,
+    // APTIO V) reject it and require NULL when SourceBuffer is set.
+    // Try the DevicePath first, then retry with NULL, then retry with
+    // a CD-ROM-only DevicePath (no file path node) which some firmware
+    // prefers over NULL.  Also retry on EFI_SECURITY_VIOLATION (some
+    // firmware refuses external EFI binaries unless explicitly allowed).
     let mut child_handle: *mut c_void = core::ptr::null_mut();
-    let mut load_status = unsafe {
+    let mut load_status: usize;
+
+    // Check whether a LoadImage status code is a "soft" error that
+    // warrants retrying with a different DevicePath.
+    fn is_soft_load_error(status: usize) -> bool {
+        status == crate::protocol::EFI_INVALID_PARAMETER
+            || status == crate::protocol::EFI_UNSUPPORTED
+            || status == crate::protocol::EFI_SECURITY_VIOLATION
+    }
+
+    load_status = unsafe {
         (bs.load_image)(false, image_handle,
             device_path as *mut crate::protocol::DevicePathProtocol,
             buf_ptr, buf_len as u64, &mut child_handle)
     };
-    if load_status == crate::protocol::EFI_INVALID_PARAMETER || load_status == crate::protocol::EFI_UNSUPPORTED {
+    print_hex(st, b"[LoadImage #1 (synthetic DP)] status=0x", load_status as u64);
+    print_raw(st, b"\r\n\0");
+
+    if is_soft_load_error(load_status) {
         // Retry with NULL DevicePath (firmware rejects synthetic path).
         load_status = unsafe {
             (bs.load_image)(false, image_handle, core::ptr::null_mut(),
                 buf_ptr, buf_len as u64, &mut child_handle)
         };
+        print_hex(st, b"[LoadImage #2 (NULL DP)] status=0x", load_status as u64);
+        print_raw(st, b"\r\n\0");
     }
-    if load_status == crate::protocol::EFI_INVALID_PARAMETER || load_status == crate::protocol::EFI_UNSUPPORTED {
+
+    if is_soft_load_error(load_status) {
         // Retry with CD-ROM-only DevicePath (no file path node).
         // Some firmware needs a real DevicePath to locate the
         // device, but rejects the synthetic file path.
@@ -1321,13 +1341,27 @@ fn uefi_chainload_iso(
                     cdrom_only_dp as *mut crate::protocol::DevicePathProtocol,
                     buf_ptr, buf_len as u64, &mut child_handle)
             };
+            print_hex(st, b"[LoadImage #3 (CD-ROM DP)] status=0x", load_status as u64);
+            print_raw(st, b"\r\n\0");
             if load_status != EFI_SUCCESS {
                 unsafe { (bs.free_pool)(cdrom_only_dp); }
             }
         }
     }
+
+    if is_soft_load_error(load_status) {
+        // Last resort: try loading without SourceBuffer and DevicePath
+        // both NULL (some firmware requires pure file-based discovery).
+        load_status = unsafe {
+            (bs.load_image)(false, image_handle, core::ptr::null_mut(),
+                core::ptr::null(), 0, &mut child_handle)
+        };
+        print_hex(st, b"[LoadImage #4 (NULL DP, no buffer)] status=0x", load_status as u64);
+        print_raw(st, b"\r\n\0");
+    }
+
     if load_status != EFI_SUCCESS {
-        print_hex(st, b"ERROR: LoadImage failed, status=0x", load_status as u64);
+        print_hex(st, b"ERROR: LoadImage failed after all retries, status=0x", load_status as u64);
         print_raw(st, b"\r\nEFI size=\0");
         print_dec(st, buf_len as u64);
         print_raw(st, b" bytes\r\n\0");

@@ -74,11 +74,8 @@ pub enum BootKind {
 
 impl BootKind {
     /// Kernel cmdline arguments to inject after the second argument on linux lines.
-    pub fn linux_extra(&self, toram: bool) -> &'static [u8] {
+    pub fn linux_extra(&self, _toram: bool) -> &'static [u8] {
         match self {
-            BootKind::Casper if toram => {
-                b" boot=casper live-media=LABEL=Choosable toram"
-            }
             BootKind::Casper => {
                 b" boot=casper live-media=LABEL=Choosable"
             }

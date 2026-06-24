@@ -253,12 +253,13 @@ exec >/tmp/choosable.log 2>&1
 echo 'choosable: starting premount' >/dev/console
 modprobe loop 2>/dev/null;modprobe iso9660 2>/dev/null
 modprobe exfat 2>/dev/null;modprobe ntfs3 2>/dev/null
+modprobe virtio_blk 2>/dev/null;modprobe virtio_pci 2>/dev/null
 SRMOD
 for i in 0 1 2 3 4 5 6 7;do [ -b /dev/loop$i ]||mknod /dev/loop$i b 7 $i 2>/dev/null;done
 [ -d /cdrom ]||mkdir -p /cdrom /lib/live/mount/medium 2>/dev/null
 # Wait for udev to settle and partition devices to appear
-sleep 2
-N=0;while [ $N -lt 30 ];do N=$((N+1))
+sleep 5
+N=0;while [ $N -lt 60 ];do N=$((N+1))
 while read -r a b c d;do case $d in loop*|ram*|dm-*|sr*)continue;;*[0-9]);;*)continue;;esac
 dev=/dev/$d;[ -b $dev ]||continue
 LOOP=;for i in 0 1 2 3 4 5 6 7;do L=/dev/loop$i
