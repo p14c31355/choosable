@@ -228,12 +228,18 @@ impl BootStrategy for CasperStrategy {
         // Casper auto-detects /cdrom when boot=casper is set.
         // live-media=LABEL=Choosable acts as a hint so casper knows which
         // device to scan if the premount hook fails for any reason.
-        // toram is appended for Pop!_OS which may need it for Live session.
+        // toram is only appended for Pop!_OS which may need it for Live session.
         // Do NOT inject iso-scan/filename= — it forces casper's 20iso_scan
         // to mount the real partition (fails on exFAT/NTFS).
+        let is_popos = matches_any_lower(inp.iso_name, &[b"pop", b"pop-os", b"popos"]);
+        let linux_args: &[u8] = if is_popos {
+            b" boot=casper live-media=LABEL=Choosable toram"
+        } else {
+            b" boot=casper live-media=LABEL=Choosable"
+        };
         patch_grub_cfg_impl(
             inp,
-            b" boot=casper live-media=LABEL=Choosable toram",
+            linux_args,
             b"", // no eol override — premount handles /cdrom, casper auto-detects it
             inp.premount_target_name,
         )

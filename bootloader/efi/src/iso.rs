@@ -403,7 +403,7 @@ fn find_efi_boot(
     bio_ptr: *mut BlockIoProtocol,
     mid: u32,
     iso_lba: u64,
-) -> Option<(u32, u32)> {
+) -> Option<(u32, u32, &'static [u8])> {
     let mut scratch = [0u8; 2048];
     let (root_lba, root_size) = get_root_dir(st, bio_ref, bio_ptr, mid, iso_lba)?;
 
@@ -430,7 +430,7 @@ fn find_efi_boot(
     let efi_names: &[&[u8]] = &[b"BOOTX64.EFI", b"BOOTIA32.EFI", b"GRUBX64.EFI", b"SHIMX64.EFI"];
     for &name in efi_names {
         if let Some(v) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, boot_lba, boot_size, name, &mut scratch) {
-            return Some(v);
+            return Some((v.0, v.1, name));
         }
     }
 
@@ -734,23 +734,33 @@ fn recursive_find_cfg_with_loc(
 //  DevicePath builder
 // ═══════════════════════════════════════════════════════════════════════════
 
-fn build_iso_device_path(bs: &mut BootServices, iso_size_bytes: u64) -> *mut c_void {
+fn build_iso_device_path(bs: &mut BootServices, iso_size_bytes: u64, efi_filename: &[u8]) -> *mut c_void {
     const CDROM_NODE: [u8; 24] = {
         let mut n = [0u8; 24];
         n[0] = 0x04; n[1] = 0x02; n[2] = 24; n[3] = 0;
         n
     };
-    let file_name: [u16; 22] = [
-        b'\\' as u16, b'E' as u16, b'F' as u16, b'I' as u16,
-        b'\\' as u16, b'B' as u16, b'O' as u16, b'O' as u16, b'T' as u16,
-        b'\\' as u16,
-        b'B' as u16, b'O' as u16, b'O' as u16, b'T' as u16, b'X' as u16,
-        b'6' as u16, b'4' as u16, b'.' as u16, b'E' as u16, b'F' as u16, b'I' as u16,
-        0x0000,
-    ];
+
+    // Build UTF-16 path dynamically from the matched EFI filename
+    let mut file_name = [0u16; 32];
+    let mut idx = 0;
+    // \EFI\BOOT\
+    for &ch in b"\\EFI\\BOOT\\" {
+        file_name[idx] = ch as u16;
+        idx += 1;
+    }
+    // Append the EFI filename (e.g., BOOTX64.EFI, BOOTIA32.EFI)
+    for i in 0..efi_filename.len().min(32 - idx - 1) {
+        file_name[idx] = efi_filename[i] as u16;
+        idx += 1;
+    }
+    // Null terminator
+    file_name[idx] = 0;
+    idx += 1;
+
     const END_NODE: [u8; 4] = [0x7F, 0xFF, 0x04, 0x00];
 
-    let file_body_bytes = file_name.len() * 2;
+    let file_body_bytes = idx * 2;
     let total = CDROM_NODE.len() + 4 + file_body_bytes + END_NODE.len();
     let mut ptr: *mut c_void = core::ptr::null_mut();
     if unsafe { (bs.allocate_pool)(MemoryType::EfiLoaderData, total, &mut ptr) } != EFI_SUCCESS || ptr.is_null() {
@@ -1102,7 +1112,7 @@ fn uefi_chainload_iso(
     patch_grub_cfg_blockio(st, bs, vbio_ptr, sfs_instance, bio_ref, bio_ptr, mid, iso_lba, iso_name,
         &live_uuid, Some(&iso_loc));
 
-    let (efi_lba, efi_size) = match find_efi_boot(st, bio_ref, bio_ptr, mid, iso_lba) {
+    let (efi_lba, efi_size, efi_filename) = match find_efi_boot(st, bio_ref, bio_ptr, mid, iso_lba) {
         Some(v) => v,
         None => {
             print_raw(st, b"ERROR: /EFI/BOOT/BOOTX64.EFI not found in ISO.\r\n\0");
@@ -1116,7 +1126,7 @@ fn uefi_chainload_iso(
             halt_or_reboot(st);
         }
     };
-    let device_path = build_iso_device_path(bs, iso_size);
+    let device_path = build_iso_device_path(bs, iso_size, efi_filename);
     print_raw(st, b"Loading EFI image...\r\n\0");
     print_raw(st, b"EFI image size=\0");
     print_dec(st, buf_len as u64);

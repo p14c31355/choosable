@@ -82,7 +82,19 @@ impl VirtualMedia for IsoMedia {
         if dst_offset > dst.len() || dst.len() - dst_offset < 2048 {
             return false;
         }
-        let disk_lba = self.iso_lba + block_lba * 4;
+        // Validate that 2048-byte ISO sectors are an exact multiple of backing block size
+        let backing_block_size = unsafe {
+            if (*self.real_bio_ptr).media.is_null() {
+                512
+            } else {
+                (*(*self.real_bio_ptr).media).bim_bs
+            }
+        };
+        if backing_block_size == 0 || 2048 % backing_block_size != 0 {
+            return false;
+        }
+        let sectors_per_iso_block = 2048 / backing_block_size;
+        let disk_lba = self.iso_lba + block_lba * sectors_per_iso_block as u64;
         unsafe {
             ((*self.real_bio_ptr).read_blocks)(
                 self.real_bio_ptr,
@@ -123,7 +135,18 @@ impl VirtualMedia for RawMedia {
         let sector_size = self.sector_size.max(512) as u64;
         if sector_size > 65536 { return false; }
         if dst_offset as u64 + sector_size > dst.len() as u64 { return false; }
-        let sectors_per_block = sector_size / 512;
+        // Validate that virtual sector size is an exact multiple of backing block size
+        let backing_block_size = unsafe {
+            if (*self.real_bio_ptr).media.is_null() {
+                512
+            } else {
+                (*(*self.real_bio_ptr).media).bim_bs
+            }
+        } as u64;
+        if backing_block_size == 0 || sector_size % backing_block_size != 0 {
+            return false;
+        }
+        let sectors_per_block = sector_size / backing_block_size;
         let disk_lba = match block_lba
             .checked_mul(sectors_per_block)
             .and_then(|off| self.start_lba.checked_add(off))
@@ -168,7 +191,18 @@ impl VirtualMedia for VhdMedia {
         let sector_size = self.sector_size.max(512) as u64;
         if sector_size > 65536 { return false; }
         if dst_offset as u64 + sector_size > dst.len() as u64 { return false; }
-        let sectors_per_block = sector_size / 512;
+        // Validate that virtual sector size is an exact multiple of backing block size
+        let backing_block_size = unsafe {
+            if (*self.real_bio_ptr).media.is_null() {
+                512
+            } else {
+                (*(*self.real_bio_ptr).media).bim_bs
+            }
+        } as u64;
+        if backing_block_size == 0 || sector_size % backing_block_size != 0 {
+            return false;
+        }
+        let sectors_per_block = sector_size / backing_block_size;
         let disk_lba = match block_lba
             .checked_mul(sectors_per_block)
             .and_then(|off| self.data_lba.checked_add(off))
@@ -199,9 +233,21 @@ fn patch_dir_entry(entry: &mut [u8], off: usize, new_extent: u32, new_size: u32)
     entry[off + 14..off + 18].copy_from_slice(&new_size.to_be_bytes());
 }
 
-/// Helper: read one ISO sector (4 × 512B) from real disk into dst at offset
+/// Helper: read one ISO sector (2048B) from real disk into dst at offset
 fn read_real_iso_sector(vbio: &VirtualBlockIo, iso_sector: u64, dst: &mut [u8], dst_off: usize) -> bool {
-    let disk_lba = vbio.iso_lba + iso_sector * 4;
+    // Get backing media block size
+    let backing_block_size = unsafe {
+        if (*vbio.real_bio_ptr).media.is_null() {
+            512
+        } else {
+            (*(*vbio.real_bio_ptr).media).bim_bs
+        }
+    };
+    if backing_block_size == 0 || 2048 % backing_block_size != 0 {
+        return false;
+    }
+    let sectors_per_iso_block = 2048 / backing_block_size;
+    let disk_lba = vbio.iso_lba + iso_sector * sectors_per_iso_block as u64;
     unsafe {
         ((*vbio.real_bio_ptr).read_blocks)(
             vbio.real_bio_ptr,
