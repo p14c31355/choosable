@@ -196,13 +196,54 @@ pub struct BootDescriptor {
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub(crate) fn name_matches(iso_name: &[u8], pattern: &[u8]) -> bool {
-    if iso_name.len() != pattern.len() {
-        return false;
+    iso_name.len() == pattern.len()
+        && iso_name.iter().zip(pattern.iter()).all(|(&a, &b)| (a | 0x20) == (b | 0x20))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_name_matches() {
+        assert!(name_matches(b"CASPER", b"casper"));
+        assert!(name_matches(b"casper", b"CASPER"));
+        assert!(name_matches(b"LiveOS", b"liveos"));
+        assert!(name_matches(b"BOOTX64.EFI", b"bootx64.efi"));
     }
-    for i in 0..iso_name.len() {
-        if (iso_name[i] | 0x20) != (pattern[i] | 0x20) {
-            return false;
+
+    #[test]
+    fn test_name_matches_fails() {
+        assert!(!name_matches(b"CASPER", b"caspe"));
+        assert!(!name_matches(b"live", b"lives"));
+        assert!(!name_matches(b"BOOT", b"BOOTX"));
+    }
+
+    #[test]
+    fn test_boot_kind_linux_extra_no_panic() {
+        // Verify all variants produce valid UTF-8 sequences
+        for k in &[BootKind::Casper, BootKind::DebianLive, BootKind::FedoraLive,
+                   BootKind::ArchIso, BootKind::Alpine, BootKind::AlpinePremount,
+                   BootKind::WindowsPE, BootKind::Unknown] {
+            let _ = k.linux_extra(false);
+            let _ = k.linux_eol_extra();
+            let _ = k.hook_targets();
+            let _ = k.needs_sr_mod();
+            let _ = k.fixup_type();
         }
     }
-    true
+
+    #[test]
+    fn test_boot_kind_linux_extra_values() {
+        assert_eq!(BootKind::Casper.linux_extra(false), b" boot=casper");
+        assert_eq!(BootKind::WindowsPE.linux_extra(false), b"");
+        assert_eq!(BootKind::DebianLive.linux_eol_extra(), b" findiso=");
+        assert!(!BootKind::Casper.linux_eol_extra().is_empty());
+    }
+
+    #[test]
+    fn test_boot_kind_equality() {
+        assert_eq!(BootKind::Casper, BootKind::Casper);
+        assert_ne!(BootKind::Casper, BootKind::DebianLive);
+    }
 }

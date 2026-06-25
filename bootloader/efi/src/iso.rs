@@ -13,7 +13,7 @@ use core::ffi::c_void;
 
 use crate::disk::read_sector;
 use crate::fs::{FsCtx, PayloadEntry, PayloadType, PAYLOAD_SLOT_COUNT};
-use crate::output::{format_u64_buf, halt_or_reboot, print_dec, print_hex, print_raw};
+use crate::output::{format_u64_buf, halt_or_reboot, print_dec, print_hex, print_raw, wait_for_keypress};
 use crate::protocol::{
     BlockIoProtocol, BootServices, LoadedImageProtocol, MemoryType, SystemTable,
     DevicePathProtocol, VirtualBlockIo, EFI_SUCCESS, LOADED_IMAGE_PROTOCOL_GUID,
@@ -1458,20 +1458,7 @@ fn uefi_chainload_iso(
             (*lip).parent_handle = image_handle;
         }
     }
-    print_raw(st, b"Press any key to start...\r\n\0");
-    {
-        let bs_ref = unsafe { &mut *st.boot_services };
-        if !st.con_in.is_null() {
-            let ci = unsafe { &mut *(st.con_in as *mut crate::protocol::SimpleTextInput) };
-            loop {
-                let mut k = crate::protocol::Key { sc: 0, uc: 0 };
-                if unsafe { (ci.read_key_stroke)(ci as *mut _, &mut k) } == EFI_SUCCESS {
-                    break;
-                }
-                unsafe { (bs_ref.stall)(100_000) };
-            }
-        }
-    }
+    wait_for_keypress(st, Some(b"Press any key to start...\r\n\0"), 100_000);
     print_raw(st, b"Starting (try #1, with DeviceHandle)...\r\n\0");
     let mut status = unsafe { (bs.start_image)(child_handle, &mut 0u64, &mut core::ptr::null_mut::<u16>()) };
 
@@ -1481,42 +1468,15 @@ fn uefi_chainload_iso(
         print_raw(st, b"StartImage #1 returned UNSUPPORTED, retrying without DeviceHandle...\r\n\0");
         let mut lip2: *mut LoadedImageProtocol = core::ptr::null_mut();
         if unsafe { (bs.handle_protocol)(child_handle, &LOADED_IMAGE_PROTOCOL_GUID, &mut lip2 as *mut _ as _) } == EFI_SUCCESS && !lip2.is_null() {
-            unsafe {
-                (*lip2).device_handle = core::ptr::null_mut();
-            }
+            unsafe { (*lip2).device_handle = core::ptr::null_mut(); }
         }
         status = unsafe { (bs.start_image)(child_handle, &mut 0u64, &mut core::ptr::null_mut::<u16>()) };
     }
     print_hex(st, b"StartImage returned 0x\0", status as u64);
     print_raw(st, b"\r\n\0");
     // Wait for key press so user can read the return value before possible reset
-    print_raw(st, b"Press any key...\r\n\0");
-    {
-        let bs_ref = unsafe { &mut *st.boot_services };
-        if !st.con_in.is_null() {
-            let ci = unsafe { &mut *(st.con_in as *mut crate::protocol::SimpleTextInput) };
-            loop {
-                let mut k = crate::protocol::Key { sc: 0, uc: 0 };
-                if unsafe { (ci.read_key_stroke)(ci as *mut _, &mut k) } == EFI_SUCCESS {
-                    break;
-                }
-                unsafe { (bs_ref.stall)(100_000) };
-            }
-        }
-    }
+    wait_for_keypress(st, Some(b"Press any key...\r\n\0"), 100_000);
     if status != EFI_SUCCESS {
-        print_raw(st, b"Press any key to reboot...\r\n\0");
-        let bs_ref = unsafe { &mut *st.boot_services };
-        if !st.con_in.is_null() {
-            let ci = unsafe { &mut *(st.con_in as *mut crate::protocol::SimpleTextInput) };
-            loop {
-                let mut k = crate::protocol::Key { sc: 0, uc: 0 };
-                if unsafe { (ci.read_key_stroke)(ci as *mut _, &mut k) } == EFI_SUCCESS {
-                    break;
-                }
-                unsafe { (bs_ref.stall)(100_000) };
-            }
-        }
         halt_or_reboot(st);
     }
     // Child called ExitBootServices.  Never reboot.

@@ -2,7 +2,7 @@
 //  Console output helpers
 // ═══════════════════════════════════════════════════════════════════════════
 
-use crate::protocol::{Key, ResetType, RuntimeServices, SimpleTextInput, SimpleTextOutput, SystemTable, EFI_SUCCESS};
+use crate::protocol::{Key, ResetType, SimpleTextInput, SimpleTextOutput, SystemTable, EFI_SUCCESS};
 
 pub fn prints(co: &mut SimpleTextOutput, s: &[u8]) {
     let mut buf = [0u16; 256];
@@ -16,10 +16,7 @@ pub fn prints(co: &mut SimpleTextOutput, s: &[u8]) {
 
 pub fn print_raw(st: &mut SystemTable, s: &[u8]) {
     if !st.con_out.is_null() {
-        prints(
-            unsafe { &mut *(st.con_out as *mut SimpleTextOutput) },
-            s,
-        );
+        prints(unsafe { &mut *(st.con_out as *mut SimpleTextOutput) }, s);
     }
 }
 
@@ -31,10 +28,7 @@ pub fn die(st: &mut SystemTable, s: &[u8]) -> ! {
 pub fn print_hex(st: &mut SystemTable, prefix: &[u8], val: u64) {
     print_raw(st, prefix);
     for i in (0..16).rev() {
-        print_raw(
-            st,
-            &[b"0123456789ABCDEF"[((val >> (i * 4)) & 0xF) as usize]],
-        );
+        print_raw(st, &[b"0123456789ABCDEF"[((val >> (i * 4)) & 0xF) as usize]]);
     }
 }
 
@@ -63,45 +57,70 @@ pub fn format_u64_buf(v: u64) -> ([u8; 20], usize) {
     (buf, 20 - pos)
 }
 
-pub fn wait_for_key(st: &mut SystemTable) {
-    let bs = unsafe { &mut *st.boot_services };
-    if !st.con_in.is_null() {
-        let ci = unsafe { &mut *(st.con_in as *mut SimpleTextInput) };
-        loop {
-            let mut k = Key { sc: 0, uc: 0 };
-            if unsafe { (ci.read_key_stroke)(ci as *mut _, &mut k) } == EFI_SUCCESS {
-                break;
-            }
-            unsafe { (bs.stall)(10_000) };
-        }
-    }
-}
-
-fn system_reset(st: &mut SystemTable) -> ! {
-    let rt = unsafe { &mut *st.runtime_services };
-    unsafe { (rt.reset_system)(ResetType::ResetCold, 0, 0, core::ptr::null_mut()) };
-    loop {
-        unsafe { core::arch::asm!("hlt") }
-    }
-}
-
 pub fn print_dec(st: &mut SystemTable, v: u64) {
     let (buf, len) = format_u64_buf(v);
     print_raw(st, &buf[20 - len..]);
 }
 
-pub fn halt_or_reboot(st: &mut SystemTable) -> ! {
+/// Shared key-wait helper — polls for a keystroke with configurable
+/// stall interval.  Used by `wait_for_key`, `halt_or_reboot`,
+/// and the key-wait loops in `uefi_chainload_iso`.
+pub fn wait_for_keypress(st: &mut SystemTable, message: Option<&[u8]>, stall_us: usize) {
     let bs = unsafe { &mut *st.boot_services };
     if !st.con_in.is_null() {
         let ci = unsafe { &mut *(st.con_in as *mut SimpleTextInput) };
-        print_raw(st, b"Press any key to reboot.\r\n\0");
-        for _ in 0..300 {
-            unsafe { (bs.stall)(100_000) };
+        if let Some(msg) = message { print_raw(st, msg); }
+        loop {
             let mut k = Key { sc: 0, uc: 0 };
-            if unsafe { (ci.read_key_stroke)(ci as *mut _, &mut k) } == EFI_SUCCESS {
-                system_reset(st);
-            }
+            if unsafe { (ci.read_key_stroke)(ci as *mut _, &mut k) } == EFI_SUCCESS { break; }
+            unsafe { (bs.stall)(stall_us) };
         }
     }
+}
+
+pub fn wait_for_key(st: &mut SystemTable) {
+    wait_for_keypress(st, None, 10_000);
+}
+
+fn system_reset(st: &mut SystemTable) -> ! {
+    let rt = unsafe { &mut *st.runtime_services };
+    unsafe { (rt.reset_system)(ResetType::ResetCold, 0, 0, core::ptr::null_mut()) };
+    loop { unsafe { core::arch::asm!("hlt") } }
+}
+
+pub fn halt_or_reboot(st: &mut SystemTable) -> ! {
+    wait_for_keypress(st, Some(b"Press any key to reboot.\r\n\0"), 100_000);
     system_reset(st);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_u64_buf_zero() {
+        let (buf, len) = format_u64_buf(0);
+        assert_eq!(&buf[..len], b"0");
+    }
+
+    #[test]
+    fn test_format_u64_buf_small() {
+        let (buf, len) = format_u64_buf(42);
+        let result = &buf[20 - len..];
+        assert_eq!(core::str::from_utf8(result).unwrap(), "42");
+    }
+
+    #[test]
+    fn test_format_u64_buf_large() {
+        let (buf, len) = format_u64_buf(1234567890);
+        let result = &buf[20 - len..];
+        assert_eq!(core::str::from_utf8(result).unwrap(), "1234567890");
+    }
+
+    #[test]
+    fn test_format_u64_buf_max() {
+        let (buf, len) = format_u64_buf(u64::MAX);
+        assert!(len > 0 && len <= 20);
+        assert!(buf[20 - len] != 0);
+    }
 }

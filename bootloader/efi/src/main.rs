@@ -1,5 +1,7 @@
-#![no_std]
-#![no_main]
+#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), no_main)]
+
+#![cfg_attr(test, allow(unused_imports))]
 
 mod boot_context;
 mod boot_kind;
@@ -25,6 +27,7 @@ use boot_stage::{
     NetworkPayloadLocatorStage, SelectPayloadStage,
 };
 
+#[cfg(not(test))]
 #[no_mangle]
 extern "efiapi" fn efi_main(
     image_handle: *mut c_void,
@@ -69,6 +72,7 @@ extern "efiapi" fn efi_main(
     }
 }
 
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_: &PanicInfo) -> ! {
     loop {
