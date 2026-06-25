@@ -1231,17 +1231,22 @@ fn uefi_chainload_iso(
     let boot_kind = boot_desc.as_ref().map_or(crate::boot_kind::BootKind::Unknown, |d| d.boot_kind);
 
     // ── Build premount cpio (fixup type depends on boot_kind) ────────
-    // Only Alpine needs premount CPIO — it injects /init.choosable.
-    // Other distros use native ISO discovery: iso-scan/filename= (Casper),
-    // findiso= (DebianLive), root=live:CDLABEL= (Fedora),
-    // archisodevice=LABEL= (Arch).  No premount CPIO needed.
     let premount_bundle = {
         let fixup = boot_kind.fixup_type();
         match fixup {
-            crate::boot_kind::FixupType::Alpine
-            | crate::boot_kind::FixupType::AlpinePremount =>
+            crate::boot_kind::FixupType::Alpine =>
                 crate::premount::prepare_alpine_initrd(bs, iso_lba - part1_lba, iso_name),
-            _ => None,
+            crate::boot_kind::FixupType::AlpinePremount =>
+                crate::premount::prepare_alpine_initrd(bs, iso_lba - part1_lba, iso_name),
+            crate::boot_kind::FixupType::Dracut =>
+                crate::premount::prepare_dracut_initrd(bs, iso_lba - part1_lba, iso_name),
+            crate::boot_kind::FixupType::Arch =>
+                crate::premount::prepare_arch_initrd(bs, iso_lba - part1_lba, iso_name),
+            crate::boot_kind::FixupType::WindowsPE => None,
+            _ => {
+                let needs_sr = boot_kind.needs_sr_mod();
+                crate::premount::prepare_premount_initrd(bs, iso_lba - part1_lba, needs_sr, iso_name)
+            }
         }
     };
     if premount_bundle.is_none() {
@@ -1284,6 +1289,11 @@ fn uefi_chainload_iso(
                 vb.premount_entry_new_extent = vb.premount_file_sector;
                 vb.premount_entry_new_size = bundle.cpio_size as u32;
                 vb.premount_entry_patched = true;
+                // Also patch the directory entry's NAME to "PREMOUNT.CPIO"
+                // so GRUB can find it at the path referenced in grub.cfg.
+                // The original entry keeps its name otherwise, which doesn't
+                // match "/PREMOUNT.CPIO" and causes initrd load failure.
+                vb.premount_entry_rename = true;
 
                 if !sfs_instance.is_null() {
                     let sfs = unsafe { &mut *sfs_instance };

@@ -33,7 +33,8 @@ macro_rules! fixup {
     };
 }
 
-fixup!(GenericFixup,        prepare_generic_initrd);
+fixup!(CasperFixup,         prepare_premount_initrd, true);
+fixup!(LiveBootFixup,       prepare_premount_initrd, false);
 fixup!(DracutFixup,         prepare_dracut_initrd);
 fixup!(AlpinePremountFixup, prepare_alpine_initrd);
 fixup!(ArchFixup,           prepare_arch_initrd);
@@ -627,10 +628,12 @@ fn build_cpio(
     data: &[&[u8]],
     offset_bytes: u64,
 ) -> Option<PremountBundle> {
+    // Each entry has a header (110 + padded_name), data, and up to 3 bytes
+    // of padding for 4-byte alignment.  Add 8 bytes margin per entry.
     let estimate = names.iter().zip(data.iter())
-        .map(|(&n, &d)| cpio_entry_size(n.len(), d.len()))
+        .map(|(&n, &d)| cpio_entry_size(n.len(), d.len()) + 8)
         .sum::<usize>()
-        + cpio_entry_size(10, 0);
+        + cpio_entry_size(10, 0) + 8;
     let alloc_size = (estimate + 2047) & !2047;
 
     let mut cpio_ptr: *mut c_void = core::ptr::null_mut();

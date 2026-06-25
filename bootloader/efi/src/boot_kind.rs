@@ -20,11 +20,10 @@
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FixupType {
-    /// Generic /init.choosable wrapper — mounts ISO on /cdrom then execs real /init.
-    /// Used for Casper (Ubuntu, Mint, Pop), LiveBoot (Debian), and Unknown fallback.
-    /// initramfs-tools hook directories are unreliable because casper uses a custom
-    /// init that doesn't execute /scripts/casper-premount/.
-    Generic,
+    /// initramfs-tools casper-premount hooks (Ubuntu, Mint, Pop)
+    Casper,
+    /// initramfs-tools live-premount hooks (Debian Live)
+    LiveBoot,
     /// dracut premount hook (Fedora, RHEL, CentOS)
     Dracut,
     /// archiso copytoram hook (Arch Linux)
@@ -107,13 +106,10 @@ impl BootKind {
     }
 
     /// Extra kernel args appended at the end of linux lines (before newline).
-    /// Casper uses `iso-scan/filename=` (native casper ISO scanner);
     /// DebianLive uses `findiso=` (native live-boot ISO scanner).
-    /// Other boot kinds don't need EOL injection — they use LABEL-based
-    /// discovery or premount initrd.
+    /// Other boot kinds use premount initrd for ISO discovery — no EOL needed.
     pub fn linux_eol_extra(&self) -> &'static [u8] {
         match self {
-            BootKind::Casper | BootKind::Unknown => b" iso-scan/filename=",
             BootKind::DebianLive => b" findiso=",
             _ => b"",
         }
@@ -172,14 +168,14 @@ impl BootKind {
     /// `EarlyBootFixup` implementation.
     pub fn fixup_type(&self) -> FixupType {
         match self {
-            BootKind::Casper => FixupType::Generic,
-            BootKind::DebianLive => FixupType::Generic,
+            BootKind::Casper => FixupType::Casper,
+            BootKind::DebianLive => FixupType::LiveBoot,
             BootKind::FedoraLive => FixupType::Dracut,
             BootKind::ArchIso => FixupType::Arch,
             BootKind::Alpine => FixupType::Alpine,
             BootKind::AlpinePremount => FixupType::Alpine,
             BootKind::WindowsPE => FixupType::WindowsPE,
-            BootKind::Unknown => FixupType::Generic,
+            BootKind::Unknown => FixupType::Casper,
         }
     }
 }
