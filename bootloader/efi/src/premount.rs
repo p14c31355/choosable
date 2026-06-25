@@ -141,39 +141,33 @@ mount --make-rshared /cdrom 2>/dev/null
 mount -o bind /cdrom /lib/live/mount/medium 2>/dev/null
 if [ -d /cdrom/casper ]||[ -d /cdrom/pop-os ];then
 echo 'choosable (generic): CASPER/POP found' >/dev/console
-[ -x /init.real ]&&exec /init.real \"$@\"
-[ -x /init.orig ]&&exec /init.orig \"$@\"
+[ -x /init ]&&exec /init \"$@\"
 exec /bin/sh
 fi
 if [ -d /cdrom/live ];then
 echo 'choosable (generic): LIVE found' >/dev/console
-[ -x /init.real ]&&exec /init.real \"$@\"
-[ -x /init.orig ]&&exec /init.orig \"$@\"
+[ -x /init ]&&exec /init \"$@\"
 exec /bin/sh
 fi
 if [ -d /cdrom/LiveOS ];then
 echo 'choosable (generic): LiveOS found' >/dev/console
-[ -x /init.real ]&&exec /init.real \"$@\"
-[ -x /init.orig ]&&exec /init.orig \"$@\"
+[ -x /init ]&&exec /init \"$@\"
 exec /bin/sh
 fi
 if [ -f /cdrom/.alpine-release ]||[ -f /cdrom/.ALPINE_RELEASE ];then
 echo 'choosable (generic): Alpine found' >/dev/console
-[ -x /init.real ]&&exec /init.real \"$@\"
-[ -x /init.orig ]&&exec /init.orig \"$@\"
+[ -x /init ]&&exec /init \"$@\"
 exec /bin/sh
 fi
 if [ -d /cdrom/arch ];then
 echo 'choosable (generic): Arch found' >/dev/console
 mkdir -p /run/archiso/bootmnt 2>/dev/null
 mount -o bind /cdrom /run/archiso/bootmnt 2>/dev/null
-[ -x /init.real ]&&exec /init.real \"$@\"
-[ -x /init.orig ]&&exec /init.orig \"$@\"
+[ -x /init ]&&exec /init \"$@\"
 exec /bin/sh
 fi
 echo 'choosable (generic): no distro marker, mount anyway' >/dev/console
-[ -x /init.real ]&&exec /init.real \"$@\"
-[ -x /init.orig ]&&exec /init.orig \"$@\"
+[ -x /init ]&&exec /init \"$@\"
 exec /bin/sh
 umount /lib/live/mount/medium 2>/dev/null
 umount /cdrom 2>/dev/null
@@ -181,8 +175,7 @@ losetup -d $LOOP 2>/dev/null
 done</proc/partitions
 sleep 1;done
 echo 'choosable (generic): gave up' >/dev/console
-[ -x /init.real ]&&exec /init.real \"$@\"
-[ -x /init.orig ]&&exec /init.orig \"$@\"
+[ -x /init ]&&exec /init \"$@\"
 exec /bin/sh
 ";
     let dec = format_decimal_u64(offset_bytes);
@@ -192,10 +185,11 @@ exec /bin/sh
     let tmp_len = subst_template(&mut tmp, wrapper_src, b"OFFSET_FROM_CMDLINE", CMDLINE_OFFSET_SNIPPET, 8191);
     let wrapper_len = subst_template(&mut wrapper, &tmp[..tmp_len], b"OFFSET", off_slice, 8191);
 
-    // Place /init in the CPIO — this shadows casper's /init when
-    // GRUB concatenates our CPIO AFTER the original initrd.
-    // No init= kernel param needed; the kernel runs /init by default.
-    let names: &[&[u8]] = &[b"init"];
+    // Place /init.choosable in the CPIO — kernel invokes it via
+    // init=/init.choosable on the cmdline.  We mount the ISO, then
+    // exec the real /init (casper/dracut/archiso) from the original
+    // initrd which is still intact because we didn't shadow it.
+    let names: &[&[u8]] = &[b"init.choosable"];
     let data: &[&[u8]] = &[&wrapper[..wrapper_len]];
     build_cpio(bs, names, data, offset_bytes)
 }
@@ -462,8 +456,6 @@ fn build_premount_script(offset_bytes: u64, needs_sr_mod: bool) -> [u8; 8192] {
     // if the partition table was remapped by the kernel.
     let src = b"\
 #!/bin/sh
-mkdir -p /tmp 2>/dev/null
-exec >/tmp/choosable.log 2>&1
 echo 'choosable: starting premount' >/dev/console
 modprobe loop 2>/dev/null;modprobe iso9660 2>/dev/null
 modprobe exfat 2>/dev/null;modprobe ntfs3 2>/dev/null
@@ -484,28 +476,28 @@ LOOP=$L;break;done;[ -n \"$LOOP\" ]||continue
 mount -t iso9660 -o ro $LOOP /cdrom 2>/dev/null||{ losetup -d $LOOP 2>/dev/null;continue;}
 mount --make-rshared /cdrom 2>/dev/null
 mount -o bind /cdrom /lib/live/mount/medium 2>/dev/null
-    [ -f /cdrom/casper/filesystem.squashfs ]&&return 0
-    [ -f /cdrom/casper/filesystem.* ]&&return 0
-    [ -f /cdrom/casper/vmlinuz ]&&return 0
-    [ -d /cdrom/casper ]&&return 0
-    [ -d /cdrom/pop-os ]&&return 0
-    [ -f /cdrom/live/filesystem.squashfs ]&&return 0
-    [ -f /cdrom/LiveOS/squashfs.img ]&&return 0
-    [ -f /cdrom/.alpine-release ]&&return 0
-    [ -f /cdrom/.ALPINE_RELEASE ]&&return 0
-    [ -d /cdrom/apks ]&&return 0
-    [ -d /cdrom/arch ]&&{ mkdir -p /run/archiso/bootmnt 2>/dev/null;mount -o bind /cdrom /run/archiso/bootmnt 2>/dev/null;return 0;}
-    [ -f /cdrom/.disk/info ]&&return 0
-    [ -d /cdrom/distros ]&&return 0
-    [ -d /cdrom/dists ]&&return 0
-    [ -d /cdrom/pool ]&&return 0
+    [ -f /cdrom/casper/filesystem.squashfs ]&&exit 0
+    [ -f /cdrom/casper/filesystem.* ]&&exit 0
+    [ -f /cdrom/casper/vmlinuz ]&&exit 0
+    [ -d /cdrom/casper ]&&exit 0
+    [ -d /cdrom/pop-os ]&&exit 0
+    [ -f /cdrom/live/filesystem.squashfs ]&&exit 0
+    [ -f /cdrom/LiveOS/squashfs.img ]&&exit 0
+    [ -f /cdrom/.alpine-release ]&&exit 0
+    [ -f /cdrom/.ALPINE_RELEASE ]&&exit 0
+    [ -d /cdrom/apks ]&&exit 0
+    [ -d /cdrom/arch ]&&{ mkdir -p /run/archiso/bootmnt 2>/dev/null;mount -o bind /cdrom /run/archiso/bootmnt 2>/dev/null;exit 0;}
+    [ -f /cdrom/.disk/info ]&&exit 0
+    [ -d /cdrom/distros ]&&exit 0
+    [ -d /cdrom/dists ]&&exit 0
+    [ -d /cdrom/pool ]&&exit 0
 umount /lib/live/mount/medium 2>/dev/null
 umount /cdrom 2>/dev/null
 losetup -d $LOOP 2>/dev/null
 done</proc/partitions
 sleep 1;done
 echo 'choosable: gave up - no ISO found on any partition' >/dev/console
-return 0
+exit 0
 ";
     let mut pos = 0;
     let mut i = 0;

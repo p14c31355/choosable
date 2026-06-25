@@ -1243,6 +1243,9 @@ fn uefi_chainload_iso(
             crate::boot_kind::FixupType::Arch =>
                 crate::premount::prepare_arch_initrd(bs, iso_lba - part1_lba, iso_name),
             crate::boot_kind::FixupType::WindowsPE => None,
+            crate::boot_kind::FixupType::Casper |
+            crate::boot_kind::FixupType::LiveBoot =>
+                crate::premount::prepare_generic_initrd(bs, iso_lba - part1_lba, iso_name),
             _ => {
                 let needs_sr = boot_kind.needs_sr_mod();
                 crate::premount::prepare_premount_initrd(bs, iso_lba - part1_lba, needs_sr, iso_name)

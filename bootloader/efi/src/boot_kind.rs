@@ -79,13 +79,13 @@ impl BootKind {
         match self {
             BootKind::Casper => {
                 if is_popos {
-                    b" boot=casper casper_path=pop-os maybe-ubiquity"
+                    b" boot=casper casper_path=pop-os maybe-ubiquity init=/init.choosable"
                 } else {
-                    b" boot=casper maybe-ubiquity"
+                    b" boot=casper maybe-ubiquity init=/init.choosable"
                 }
             }
             BootKind::DebianLive => {
-                b" boot=live live-media=removable"
+                b" boot=live live-media=removable init=/init.choosable"
             }
             BootKind::FedoraLive => {
                 // CDLABEL=CHOOSABLE works because PVD Volume ID is patched.
@@ -101,7 +101,7 @@ impl BootKind {
                 b" init=/init.choosable modules=loop,iso9660"
             }
             BootKind::WindowsPE => b"",
-            BootKind::Unknown => b" boot=casper maybe-ubiquity",
+            BootKind::Unknown => b" boot=casper maybe-ubiquity init=/init.choosable",
         }
     }
 
@@ -246,11 +246,11 @@ mod tests {
 
     #[test]
     fn test_boot_kind_linux_extra_values() {
-        assert_eq!(BootKind::Casper.linux_extra(false), b" boot=casper maybe-ubiquity");
-        assert_eq!(BootKind::Casper.linux_extra(true), b" boot=casper casper_path=pop-os maybe-ubiquity");
+        assert_eq!(BootKind::Casper.linux_extra(false), b" boot=casper maybe-ubiquity init=/init.choosable");
+        assert_eq!(BootKind::Casper.linux_extra(true), b" boot=casper casper_path=pop-os maybe-ubiquity init=/init.choosable");
         assert_eq!(BootKind::WindowsPE.linux_extra(false), b"");
         assert_eq!(BootKind::DebianLive.linux_eol_extra(), b" findiso=");
-        assert!(!BootKind::Casper.linux_eol_extra().is_empty());
+        assert_eq!(BootKind::Casper.linux_eol_extra(), b"");
     }
 
     #[test]
