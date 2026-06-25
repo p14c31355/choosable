@@ -38,3 +38,6 @@ DISTROS
 POP-OS
 SYSTEM
 SOURCES
+# Alpine marker files — scanner relies on these to detect Alpine ISOs
+.ALPINE-RELEASE
+.ALPINE_RELEASE

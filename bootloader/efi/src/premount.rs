@@ -146,12 +146,14 @@ losetup $L >/dev/null 2>&1&&continue
 losetup -o OFFSET $L $dev 2>/dev/null||{ losetup -d $L 2>/dev/null;continue;}
 LOOP=$L;break;done;[ -n \"$LOOP\" ]||continue
 mount -t iso9660 -o ro $LOOP /cdrom 2>/dev/null||{ losetup -d $LOOP 2>/dev/null;continue;}
-[ -d /cdrom/arch ]&&{ mkdir -p /run/archiso/bootmnt 2>/dev/null;mount -o bind /cdrom /run/archiso/bootmnt 2>/dev/null;break;}
+[ -d /cdrom/arch ]&&{ mkdir -p /run/archiso/bootmnt 2>/dev/null;mount -o bind /cdrom /run/archiso/bootmnt 2>/dev/null;break 2;}
 umount /cdrom 2>/dev/null;losetup -d $LOOP 2>/dev/null
 done</proc/partitions
 sleep 1;done
 echo 'choosable (arch): done, exec /init.orig' >/dev/console
-[ -x /init.orig ]&&exec /init.orig \"$@\"
+if [ -x /init.orig ];then exec /init.orig \"$@\"
+else echo 'choosable (arch): /init.orig not found, trying /init' >/dev/console
+[ -x /init ]&&exec /init \"$@\";fi
 exec /bin/sh
 ";
     let off_str = format_decimal_u64(offset_bytes);

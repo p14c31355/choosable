@@ -94,7 +94,8 @@ impl BootKind {
             BootKind::AlpinePremount => {
                 b" modules=loop,iso9660"
             }
-            BootKind::WindowsPE | BootKind::Unknown => b"",
+            BootKind::WindowsPE => b"",
+            BootKind::Unknown => b" boot=casper",
         }
     }
 
@@ -149,7 +150,7 @@ impl BootKind {
 
     /// Whether the premount script should load `sr_mod` (needed for real CD-ROM).
     pub fn needs_sr_mod(&self) -> bool {
-        matches!(self, BootKind::Casper)
+        matches!(self, BootKind::Casper | BootKind::Unknown)
     }
 
     /// The `FixupType` corresponding to this boot kind, used to select the

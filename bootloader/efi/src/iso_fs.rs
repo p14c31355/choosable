@@ -352,32 +352,16 @@ unsafe extern "efiapi" fn file_open(
     let _ = open_mode;
 
     // Eagerly patch .cfg
+    // NOTE: We skip patching here because IsoLocation is not available
+    // at SFS open time. The BlockIO patching flow (patch_grub_cfg_blockio)
+    // handles the real location-dependent patching when the full ISO
+    // context is available. This prevents partial/inconsistent patches
+    // where findiso= or choosable.iso_offset= would be left empty.
     if is_cfg {
         let vf2 = unsafe { &mut *(fp as *mut VirtualFile) };
-        if !vf2.patched {
-            let orig_size = vf2.extent_size as usize;
-            let bs = unsafe { &mut *ctx.bs };
-            let mut tmp_ptr: *mut c_void = core::ptr::null_mut();
-            if unsafe { (bs.allocate_pool)(crate::protocol::MemoryType::EfiLoaderData, orig_size, &mut tmp_ptr) } == EFI_SUCCESS && !tmp_ptr.is_null() {
-                let tmp = unsafe { core::slice::from_raw_parts_mut(tmp_ptr as *mut u8, orig_size) };
-                let mut total = 0;
-                while total < orig_size {
-                    let r = read_extent_data(ctx, child_lba, child_size, total as u64, &mut tmp[total..total + ((orig_size - total).min(2048))]);
-                    if r == 0 { break; } total += r;
-                }
-                if let Some(p) = crate::strategy::patch_grub_cfg(
-                    &tmp[..total],
-                    ctx.boot_kind,
-                    &ctx.iso_name[..ctx.iso_name_len],
-                    None,
-                    &ctx.premount_target_name[..ctx.premount_target_name_len],
-                    ctx.bs,
-                ) {
-                    vf2.patched_buf = p.buf; vf2.patched_size = p.size as u64; vf2.patched = true;
-                }
-                unsafe { (bs.free_pool)(tmp_ptr); }
-            }
-        }
+        // Mark as needs_grub_patch=true but don't eagerly patch here.
+        // GRUB will read via BlockIO where the full patch can occur.
+        vf2.needs_grub_patch = true;
     }
 
     *new_handle = fp;

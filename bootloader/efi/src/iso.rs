@@ -523,21 +523,13 @@ fn try_patch_candidate(
         }
     }
 
-    // Allow patching even when no explicit 'linux' line is found, as long as
-    // the file contains menuentry blocks.  Alpine's grub.cfg uses 'boot'
-    // without a preceding 'linux' line and relies on the default kernel loaded
-    // by GRUB at an earlier stage.  We still need to inject the premount initrd.
+    // Only patch if the file contains 'linux' or 'linuxefi' lines.
+    // Alpine menuentry-only configs are NOT supported because the current
+    // patching logic only rewrites existing kernel lines — it does not
+    // inject new linux/initrd directives into menuentry blocks.
     let has_linux = (orig.len() >= 6 && orig.windows(6).any(|w| w == b"linux " || w == b"linux\t"))
         || (orig.len() >= 9 && orig.windows(9).any(|w| w == b"linuxefi " || w == b"linuxefi\t"));
-    let has_menuentry = orig.windows(10).any(|w| {
-        (w.starts_with(b"menuentry ") || w.starts_with(b"menuentry\t"))
-    });
-    let is_alpine = boot_kind == crate::boot_kind::BootKind::AlpinePremount
-        || boot_kind == crate::boot_kind::BootKind::Alpine;
-    // For Alpine, we can still try to patch even without has_linux —
-    // strategy::patch_grub_cfg will inject linux/initrd lines into
-    // the first menuentry block.
-    if !has_linux && !(is_alpine && has_menuentry) {
+    if !has_linux {
         unsafe { (bs.free_pool)(orig_ptr as *mut c_void); }
         return false;
     }
@@ -819,6 +811,14 @@ pub fn scan_iso_structure(
                     else if name_matches(name, b"LIVEOS")  { boot_kind = BootKind::FedoraLive; }
                     else if name_matches(name, b"ARCH")    { boot_kind = BootKind::ArchIso; }
                     else if name_matches(name, b"APKS")    { boot_kind = BootKind::AlpinePremount; }
+                    else if name_matches(name, b"SOURCES") {
+                        // Check for /sources/boot.wim (Windows PE)
+                        let extent = u32::from_le_bytes(scratch[offset + 2..offset + 6].try_into().unwrap());
+                        let size = u32::from_le_bytes(scratch[offset + 10..offset + 14].try_into().unwrap());
+                        if let Some(_) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, extent, size, b"BOOT.WIM", &mut scratch) {
+                            boot_kind = BootKind::WindowsPE;
+                        }
+                    }
                 } else {
                          if name_matches(name, b".ALPINE-RELEASE") { boot_kind = BootKind::AlpinePremount; }
                     else if name_matches(name, b".ALPINE_RELEASE") { boot_kind = BootKind::AlpinePremount; }
@@ -1275,15 +1275,24 @@ fn uefi_chainload_iso(
                         let reloc = unsafe { core::slice::from_raw_parts_mut(relocated_ptr as *mut u8, relocated_bytes) };
                         // Zero-fill first
                         for b in reloc.iter_mut() { *b = 0; }
-                        // Copy all original root directory sectors
+                        // Copy all original root directory sectors, tracking success
+                        let mut all_sectors_ok = true;
                         for s in 0..root_sectors {
                             let mut sec = [0u8; 2048];
                             if read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, root_lba + s, &mut sec) {
                                 let off = s as usize * 2048;
                                 let copy = ((root_size as usize).saturating_sub(off)).min(2048);
                                 reloc[off..off + copy].copy_from_slice(&sec[..copy]);
+                            } else {
+                                all_sectors_ok = false;
+                                break;
                             }
                         }
+                        if !all_sectors_ok {
+                            // Failed to read the full root directory; abort relocation.
+                            unsafe { (bs.free_pool)(relocated_ptr); }
+                            print_raw(st, b"[premount] relocation read failed\r\n\0");
+                        } else {
                         // Build the synthetic entry at the end of the relocated data
                         let insert_off = root_size as usize;
                         let mut blob = [0u8; 128];
@@ -1320,6 +1329,7 @@ fn uefi_chainload_iso(
                         print_raw(st, b" new_root_size=\0");
                         print_dec(st, new_root_size as u64);
                         print_raw(st, b"\r\n\0");
+                        }
                     }
                 }
             }

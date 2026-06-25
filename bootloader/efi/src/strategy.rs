@@ -116,6 +116,7 @@ fn patch_grub_cfg_impl(
     // Build the dynamic value for choosable.iso_offset=  (or findiso= for DebianLive).
     // choosable.iso_offset= needs the decimal byte offset, not the file path.
     // DebianLive findiso= needs the file path.
+    // If iso_location is None, skip EOL injection entirely to avoid bare "findiso=" or "choosable.iso_offset=".
     let mut eol_buf = [0u8; 320];
     let eol_extra_dynamic: &[u8] = if !linux_eol_extra.is_empty() && linux_eol_extra.ends_with(b"=") {
         if let Some(loc) = inp.iso_location {
@@ -140,7 +141,10 @@ fn patch_grub_cfg_impl(
                 eol_buf[plen..plen + pl].copy_from_slice(&off_str[pos..pos + pl]);
                 &eol_buf[..plen + pl]
             }
-        } else { linux_eol_extra }
+        } else {
+            // iso_location is None — skip EOL injection to avoid bare "findiso=" or "choosable.iso_offset="
+            b""
+        }
     } else { linux_eol_extra };
 
     let (linux_count, initrd_count) = count_matching_lines(orig);
