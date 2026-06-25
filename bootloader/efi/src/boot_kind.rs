@@ -88,7 +88,7 @@ impl BootKind {
                 b" boot=live live-media=removable"
             }
             BootKind::FedoraLive => {
-                b" rd.live.image rootdelay=10"
+                b" init=/init.choosable rd.live.image rootdelay=10"
             }
             BootKind::ArchIso => {
                 b" archisobasedir=arch copytoram"

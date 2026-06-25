@@ -238,11 +238,40 @@ fn find_first_file_in_dir(
                     continue;
                 }
 
-                // Skip EFI boot files — needed by the chainloaded shim/GRUB.
+                // Skip EFI boot files — these MUST NOT be overwritten
+                // because the chainloaded EFI binary (shim/GRUB/systemd-boot)
+                // needs to find them on the virtual CD-ROM.  Overwriting a
+                // directory entry with PREMOUNT.CPIO data corrupts the EFI
+                // binary extent reference, causing "UNSUPPORTED" or invalid
+                // image errors on StartImage.
                 let is_efi_boot =
-                    &upper[..cl] == b"BOOTX64.EFI"
-                    || &upper[..cl] == b"BOOTIA32.EFI";
+                    (eff_len >= 4 && {
+                        let ofs = name_offset + eff_len - 4;
+                        scratch[ofs] == b'.' && (scratch[ofs+1] | 0x20) == b'e'
+                            && (scratch[ofs+2] | 0x20) == b'f' && (scratch[ofs+3] | 0x20) == b'i'
+                    })
+                    || &upper[..cl] == b"BOOTX64.EFI"
+                    || &upper[..cl] == b"BOOTIA32.EFI"
+                    || &upper[..cl] == b"GRUBX64.EFI"
+                    || &upper[..cl] == b"SHIMX64.EFI"
+                    || &upper[..cl] == b"SYSTEMD-BOOTX64.EFI"
+                    || &upper[..cl] == b"SYSTEMD-BOOTIA32.EFI"
+                    || &upper[..cl] == b"SHELLX64.EFI"
+                    || &upper[..cl] == b"SHELLIA32.EFI"
+                    || &upper[..cl] == b"MMX64.EFI"
+                    || &upper[..cl] == b"BOOTMGFW.EFI";
                 if is_efi_boot {
+                    offset += record_len;
+                    continue;
+                }
+                // Also skip kernel/initrd payloads used by GRUB —
+                // these filename patterns match known distro conventions.
+                let is_kernel_like =
+                    &upper[..cl] == b"MACH_KERNEL"
+                    || &upper[..cl] == b"VMLINUZ"
+                    || &upper[..cl] == b"VMLINUX"
+                    || (cl >= 6 && &upper[..6] == b"VMLINU" && (upper[6] == b'Z' || upper[6] == b'X' || (upper[6] >= b'0' && upper[6] <= b'9')));
+                if is_kernel_like {
                     offset += record_len;
                     continue;
                 }

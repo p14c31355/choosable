@@ -141,11 +141,12 @@ exec /bin/sh
 ";
     let dec = format_decimal_u64(offset_bytes);
     let off_slice = strip_leading_zeros(&dec);
-    // Substitute OFFSET first
+    // OFFSET_FROM_CMDLINE MUST be substituted BEFORE OFFSET.  Otherwise
+    // OFFSET replacement (e.g. "12345") corrupts the longer marker
+    // ("12345_FROM_CMDLINE" will never match "OFFSET_FROM_CMDLINE").
     let mut tmp = [0u8; 8192];
-    let tmp_len = subst_template(&mut tmp, wrapper_src, b"OFFSET", off_slice, 8191);
-    // Then substitute OFFSET_FROM_CMDLINE with cmdline parsing snippet
-    let wrapper_len = subst_template(&mut wrapper, &tmp[..tmp_len], b"OFFSET_FROM_CMDLINE", CMDLINE_OFFSET_SNIPPET, 8191);
+    let tmp_len = subst_template(&mut tmp, wrapper_src, b"OFFSET_FROM_CMDLINE", CMDLINE_OFFSET_SNIPPET, 8191);
+    let wrapper_len = subst_template(&mut wrapper, &tmp[..tmp_len], b"OFFSET", off_slice, 8191);
 
     let names: &[&[u8]] = &[b"init", b"hooks/choosable", b"scripts/casper-premount/00choosable", b"scripts/casper-bottom/00choosable"];
     let data: &[&[u8]] = &[&wrapper[..wrapper_len], &premount_script[..premount_len], &premount_script[..premount_len], &bottom_script[..bottom_len]];
@@ -262,11 +263,11 @@ exec /bin/sh
 ";
     let dec = format_decimal_u64(offset_bytes);
     let off_slice = strip_leading_zeros(&dec);
-    // Substitute OFFSET first
+    // OFFSET_FROM_CMDLINE MUST be substituted BEFORE OFFSET.  Otherwise
+    // OFFSET replacement corrupts the longer marker.
     let mut tmp = [0u8; 8192];
-    let tmp_len = subst_template(&mut tmp, wrapper_src, b"OFFSET", off_slice, 8191);
-    // Then substitute OFFSET_FROM_CMDLINE with cmdline parsing snippet
-    let wrapper_len = subst_template(&mut wrapper, &tmp[..tmp_len], b"OFFSET_FROM_CMDLINE", CMDLINE_OFFSET_SNIPPET, 8191);
+    let tmp_len = subst_template(&mut tmp, wrapper_src, b"OFFSET_FROM_CMDLINE", CMDLINE_OFFSET_SNIPPET, 8191);
+    let wrapper_len = subst_template(&mut wrapper, &tmp[..tmp_len], b"OFFSET", off_slice, 8191);
 
     // Inject into multiple hook paths:
     //   - /init.choosable (picked up when init= kernel param is not set but initramfs has it)
@@ -397,18 +398,21 @@ return 0
     let mut pos = 0;
     let mut i = 0;
     while i < src.len() {
+        // OFFSET_FROM_CMDLINE must be checked BEFORE OFFSET because
+        // "OFFSET_FROM_CMDLINE" starts with "OFFSET".  Checking OFFSET
+        // first would corrupt the longer marker.
         if i + 5 <= src.len() && &src[i..i+5] == b"SRMOD" {
             let max = sr_mod_line.len().min(8191 - pos);
             script[pos..pos + max].copy_from_slice(&sr_mod_line[..max]);
             pos += max; i += 5;
-        } else if i + 6 <= src.len() && &src[i..i+6] == b"OFFSET" {
-            let max = off_slice.len().min(8191 - pos);
-            script[pos..pos + max].copy_from_slice(&off_slice[..max]);
-            pos += max; i += 6;
         } else if i + 21 <= src.len() && &src[i..i+21] == b"OFFSET_FROM_CMDLINE" {
             let max = CMDLINE_OFFSET_SNIPPET.len().min(8191 - pos);
             script[pos..pos + max].copy_from_slice(&CMDLINE_OFFSET_SNIPPET[..max]);
             pos += max; i += 21;
+        } else if i + 6 <= src.len() && &src[i..i+6] == b"OFFSET" {
+            let max = off_slice.len().min(8191 - pos);
+            script[pos..pos + max].copy_from_slice(&off_slice[..max]);
+            pos += max; i += 6;
         } else {
             if pos < 8191 { script[pos] = src[i]; pos += 1; }
             i += 1;
