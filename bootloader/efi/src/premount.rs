@@ -47,14 +47,16 @@ impl EarlyBootFixup for DracutFixup {
     }
 }
 
-/// ArchISO fixup — mounts ISO at /run/archiso/bootmnt for archiso initramfs hook.
+/// ArchISO fixup — injects premount hook at /hooks/choosable for mkinitcpio-based
+/// initramfs (archiso).  Does NOT rely on initramfs-tools casper-premount hooks,
+/// because Arch uses mkinitcpio which only sources scripts from /hooks/.
 pub struct ArchFixup;
 impl EarlyBootFixup for ArchFixup {
     fn build_initrd(&self, ctx: &BootContext, bs: &mut BootServices) -> Option<PremountBundle> {
         let p = ctx.selected_payload()?;
         let rel = p.file_start_lba - ctx.partition_start_lba;
         let name_bytes = &p.name[..p.name_len.min(p.name.len())];
-        prepare_premount_initrd(bs, rel, false, name_bytes)
+        prepare_arch_initrd(bs, rel, name_bytes)
     }
 }
 
@@ -94,6 +96,127 @@ impl EarlyBootFixup for AlpinePremountFixup {
         // driver dependency; loop+iso9660 are enough.
         prepare_premount_initrd(bs, rel, false, name_bytes)
     }
+}
+
+/// ═══════════════════════════════════════════════════════════════════════════
+///  Arch-specific premount initrd builder — /init wrapper for archiso
+/// ═══════════════════════════════════════════════════════════════════════════
+///
+///  Arch uses mkinitcpio which does NOT auto-execute /hooks/ scripts added
+///  at boot time via CPIO overlay (unlike initramfs-tools).  The only
+///  reliable injection point is /init itself.  We build a wrapper script
+///  that runs the premount logic and then exec's the original archiso /init.
+pub fn prepare_arch_initrd(
+    bs: &mut BootServices,
+    relative_sector_offset: u64,
+    iso_name: &[u8],
+) -> Option<PremountBundle> {
+    let offset_bytes = relative_sector_offset * 512;
+
+    // Build a /init wrapper that:
+    // 1. Runs the premount logic (mount ISO → /run/archiso/bootmnt)
+    // 2. Runs the casper-bottom log script
+    // 3. Execs the original /init (moved to /init.orig by our initrd)
+    let premount_script = build_premount_script(offset_bytes, false);
+    let premount_len = premount_script.iter().position(|&c| c == 0).unwrap_or(8191);
+
+    let bottom_script = build_bottom_script(iso_name);
+    let bottom_len = bottom_script.iter().position(|&c| c == 0).unwrap_or(2047);
+
+    // Build the wrapper: embed the premount script inline and exec /init.orig
+    let mut wrapper = [0u8; 8192];
+    let wrapper_src = b"\
+#!/bin/sh
+# Choosable Arch init wrapper
+# Run premount script inline, then exec the original archiso /init
+mkdir -p /tmp 2>/dev/null
+exec >/tmp/choosable.log 2>&1
+echo 'choosable (arch): premount starting' >/dev/console
+modprobe loop 2>/dev/null;modprobe iso9660 2>/dev/null
+modprobe exfat 2>/dev/null;modprobe ntfs3 2>/dev/null
+modprobe virtio_blk 2>/dev/null;modprobe virtio_pci 2>/dev/null
+for i in 0 1 2 3 4 5 6 7;do [ -b /dev/loop$i ]||mknod /dev/loop$i b 7 $i 2>/dev/null;done
+[ -d /cdrom ]||mkdir -p /cdrom /run/archiso/bootmnt 2>/dev/null
+sleep 5
+N=0;while [ $N -lt 30 ];do N=$((N+1))
+while read -r a b c d;do case $d in loop*|ram*|dm-*|sr*)continue;;*[0-9]);;*)continue;;esac
+dev=/dev/$d;[ -b $dev ]||continue
+LOOP=;for i in 0 1 2 3 4 5 6 7;do L=/dev/loop$i
+losetup $L >/dev/null 2>&1&&continue
+losetup -o OFFSET $L $dev 2>/dev/null||{ losetup -d $L 2>/dev/null;continue;}
+LOOP=$L;break;done;[ -n \"$LOOP\" ]||continue
+mount -t iso9660 -o ro $LOOP /cdrom 2>/dev/null||{ losetup -d $LOOP 2>/dev/null;continue;}
+[ -d /cdrom/arch ]&&{ mkdir -p /run/archiso/bootmnt 2>/dev/null;mount -o bind /cdrom /run/archiso/bootmnt 2>/dev/null;break 2;}
+umount /cdrom 2>/dev/null;losetup -d $LOOP 2>/dev/null
+done</proc/partitions
+sleep 1;done
+echo 'choosable (arch): done, exec /init.orig' >/dev/console
+if [ -x /init.orig ];then exec /init.orig \"$@\"
+else echo 'choosable (arch): /init.orig not found, trying /init' >/dev/console
+[ -x /init ]&&exec /init \"$@\";fi
+exec /bin/sh
+";
+    let off_str = format_decimal_u64(offset_bytes);
+    let mut off_start = 0;
+    while off_start < 20 && off_str[off_start] == b'0' { off_start += 1; }
+    if off_start >= 20 { off_start = 19; }
+    let off_slice = &off_str[off_start..];
+    let mut pos = 0usize;
+    let mut i = 0;
+    let src = wrapper_src;
+    while i < src.len() {
+        if i + 6 <= src.len()
+            && src[i] == b'O' && src[i+1] == b'F' && src[i+2] == b'F'
+            && src[i+3] == b'S' && src[i+4] == b'E' && src[i+5] == b'T'
+        {
+            for j in 0..off_slice.len() { if pos < 8191 { wrapper[pos] = off_slice[j]; pos += 1; } }
+            i += 6;
+        } else {
+            if pos < 8191 { wrapper[pos] = src[i]; pos += 1; }
+            i += 1;
+        }
+    }
+    let wrapper_len = wrapper.iter().position(|&c| c == 0).unwrap_or(8191);
+
+    let entry_size = |name_len: usize, data_len: usize| -> usize {
+        let padded_name_len = ((110 + name_len + 1 + 3) & !3) - 110;
+        110 + padded_name_len + data_len + 3
+    };
+    // Inject /init wrapper + /hooks/choosable and casper-premount paths
+    let cpio_estimate = entry_size(b"init".len(), wrapper_len)
+        + entry_size(b"hooks/choosable".len(), premount_len)
+        + entry_size(b"scripts/casper-premount/00choosable".len(), premount_len)
+        + entry_size(b"scripts/casper-bottom/00choosable".len(), bottom_len)
+        + entry_size(10, 0);
+    let cpio_alloc_size = (cpio_estimate + 2047) & !2047;
+    let mut cpio_ptr: *mut c_void = core::ptr::null_mut();
+    if unsafe { (bs.allocate_pool)(MemoryType::EfiLoaderData, cpio_alloc_size, &mut cpio_ptr) } != EFI_SUCCESS || cpio_ptr.is_null() { return None; }
+    let cpio = unsafe { core::slice::from_raw_parts_mut(cpio_ptr as *mut u8, cpio_alloc_size) };
+    let mut off = 0usize;
+
+    let mut append_entry = |cpio: &mut [u8], off: &mut usize, name: &[u8], data: &[u8], mode: u32| -> bool {
+        let name_len = name.len() + 1;
+        let padded_name_len = ((110 + name_len + 3) & !3) - 110;
+        let hdr_len = 110 + padded_name_len;
+        let pad = (4 - ((*off + hdr_len + data.len()) & 3)) & 3;
+        if *off + hdr_len + data.len() + pad > cpio.len() { return false; }
+        let actual = cpio_newc_header(&mut cpio[*off..], name, data.len() as u32, mode);
+        *off += actual;
+        cpio[*off..*off + data.len()].copy_from_slice(data);
+        *off += data.len();
+        for _ in 0..pad { cpio[*off] = 0; *off += 1; }
+        true
+    };
+
+    // /init wrapper replaces archiso's init (archiso preserves original at /init.orig
+    // because our initrd is prepended before the archiso squashfs is mounted)
+    if !append_entry(cpio, &mut off, b"init", &wrapper[..wrapper_len], 0o100755) { unsafe { (bs.free_pool)(cpio_ptr); } return None; }
+    if !append_entry(cpio, &mut off, b"hooks/choosable", &premount_script[..premount_len], 0o100755) { unsafe { (bs.free_pool)(cpio_ptr); } return None; }
+    if !append_entry(cpio, &mut off, b"scripts/casper-premount/00choosable", &premount_script[..premount_len], 0o100755) { unsafe { (bs.free_pool)(cpio_ptr); } return None; }
+    if !append_entry(cpio, &mut off, b"scripts/casper-bottom/00choosable", &bottom_script[..bottom_len], 0o100755) { unsafe { (bs.free_pool)(cpio_ptr); } return None; }
+    if !append_entry(cpio, &mut off, b"TRAILER!!!", b"", 0) { unsafe { (bs.free_pool)(cpio_ptr); } return None; }
+
+    Some(PremountBundle { cpio_buf: cpio_ptr as *mut u8, cpio_size: off, cpio_alloc_size, iso_offset_bytes: offset_bytes })
 }
 
 /// Build a CPIO with `/init.choosable` that mounts the ISO and then exec's
@@ -237,8 +360,8 @@ fn sanitize_filename(input: &[u8]) -> ([u8; 320], usize) {
 //  Premount script
 // ═══════════════════════════════════════════════════════════════════════════
 
-fn build_premount_script(offset_bytes: u64, needs_sr_mod: bool) -> [u8; 4096] {
-    let mut script = [0u8; 4096];
+fn build_premount_script(offset_bytes: u64, needs_sr_mod: bool) -> [u8; 8192] {
+    let mut script = [0u8; 8192];
 
     let sr_mod_line: &[u8] = if needs_sr_mod {
         b"modprobe sr_mod 2>/dev/null\n"
@@ -253,12 +376,13 @@ exec >/tmp/choosable.log 2>&1
 echo 'choosable: starting premount' >/dev/console
 modprobe loop 2>/dev/null;modprobe iso9660 2>/dev/null
 modprobe exfat 2>/dev/null;modprobe ntfs3 2>/dev/null
+modprobe virtio_blk 2>/dev/null;modprobe virtio_pci 2>/dev/null
 SRMOD
 for i in 0 1 2 3 4 5 6 7;do [ -b /dev/loop$i ]||mknod /dev/loop$i b 7 $i 2>/dev/null;done
 [ -d /cdrom ]||mkdir -p /cdrom /lib/live/mount/medium 2>/dev/null
 # Wait for udev to settle and partition devices to appear
-sleep 2
-N=0;while [ $N -lt 30 ];do N=$((N+1))
+sleep 5
+N=0;while [ $N -lt 60 ];do N=$((N+1))
 while read -r a b c d;do case $d in loop*|ram*|dm-*|sr*)continue;;*[0-9]);;*)continue;;esac
 dev=/dev/$d;[ -b $dev ]||continue
 LOOP=;for i in 0 1 2 3 4 5 6 7;do L=/dev/loop$i
@@ -269,18 +393,24 @@ mount -t iso9660 -o ro $LOOP /cdrom 2>/dev/null||{ losetup -d $LOOP 2>/dev/null;
 mount --make-rshared /cdrom 2>/dev/null
 mount -o bind /cdrom /lib/live/mount/medium 2>/dev/null
 [ -f /cdrom/casper/filesystem.squashfs ]&&return 0
+[ -d /cdrom/pop-os/casper_persist ]&&return 0
+[ -f /cdrom/casper/filesystem.* ]&&return 0
 [ -f /cdrom/live/filesystem.squashfs ]&&return 0
 [ -f /cdrom/LiveOS/squashfs.img ]&&return 0
 [ -f /cdrom/.alpine-release ]&&return 0
 [ -f /cdrom/.ALPINE_RELEASE ]&&return 0
 [ -d /cdrom/apks ]&&return 0
 [ -d /cdrom/arch ]&&{ mkdir -p /run/archiso/bootmnt 2>/dev/null;mount -o bind /cdrom /run/archiso/bootmnt 2>/dev/null;return 0;}
+[ -f /cdrom/.disk/info ]&&return 0
+[ -d /cdrom/distros ]&&return 0
+[ -f /cdrom/casper/vmlinuz ]&&return 0
 umount /lib/live/mount/medium 2>/dev/null
 umount /cdrom 2>/dev/null
 losetup -d $LOOP 2>/dev/null
 done</proc/partitions
 sleep 1;done
 echo 'choosable: gave up - no ISO found on any partition' >/dev/console
+return 0
 ";
 
     let off_str = format_decimal_u64(offset_bytes);
@@ -292,6 +422,7 @@ echo 'choosable: gave up - no ISO found on any partition' >/dev/console
     let mut pos = 0usize;
     let bytes = src_template;
     let sr_mod_len = sr_mod_line.len();
+    let buf_cap = script.len() - 1; // 8191
     let mut i = 0;
     while i < bytes.len() {
         if i + 5 <= bytes.len()
@@ -300,7 +431,7 @@ echo 'choosable: gave up - no ISO found on any partition' >/dev/console
             && bytes[i+4] == b'D'
         {
             for j in 0..sr_mod_len {
-                if pos < 4095 { script[pos] = sr_mod_line[j]; pos += 1; }
+                if pos < buf_cap { script[pos] = sr_mod_line[j]; pos += 1; }
             }
             i += 5;
         } else if i + 6 <= bytes.len()
@@ -308,11 +439,11 @@ echo 'choosable: gave up - no ISO found on any partition' >/dev/console
             && bytes[i+3] == b'S' && bytes[i+4] == b'E' && bytes[i+5] == b'T'
         {
             for j in 0..off_slice.len() {
-                if pos < 4095 { script[pos] = off_slice[j]; pos += 1; }
+                if pos < buf_cap { script[pos] = off_slice[j]; pos += 1; }
             }
             i += 6;
         } else {
-            if pos < 4095 { script[pos] = bytes[i]; pos += 1; }
+            if pos < buf_cap { script[pos] = bytes[i]; pos += 1; }
             i += 1;
         }
     }
@@ -426,7 +557,7 @@ pub fn prepare_premount_initrd(
     let offset_bytes = relative_sector_offset * 512;
 
     let premount_script = build_premount_script(offset_bytes, needs_sr_mod);
-    let premount_len = premount_script.iter().position(|&c| c == 0).unwrap_or(4095);
+    let premount_len = premount_script.iter().position(|&c| c == 0).unwrap_or(8191);
 
     let bottom_script = build_bottom_script(iso_name);
     let bottom_len = bottom_script.iter().position(|&c| c == 0).unwrap_or(2047);
@@ -435,11 +566,15 @@ pub fn prepare_premount_initrd(
         let padded_name_len = ((110 + name_len + 1 + 3) & !3) - 110;
         110 + padded_name_len + data_len + 3
     };
-    let cpio_estimate = entry_size(24, premount_len)
-        + entry_size(33, premount_len)
-        + entry_size(35, premount_len)
-        + entry_size(33, bottom_len)
-        + entry_size(10, 0);
+    // local-premount=33, init-premount=31, live=24, live-premount=33,
+    // casper-premount=35, casper-bottom=33, TRAILER=10
+    let cpio_estimate = entry_size(33, premount_len)  // scripts/local-premount/00choosable
+        + entry_size(31, premount_len)                // scripts/init-premount/00choosable
+        + entry_size(24, premount_len)                // scripts/live/00choosable
+        + entry_size(33, premount_len)                // scripts/live-premount/00choosable
+        + entry_size(35, premount_len)                // scripts/casper-premount/00choosable
+        + entry_size(33, bottom_len)                  // scripts/casper-bottom/00choosable
+        + entry_size(10, 0);                           // TRAILER!!!
     let cpio_alloc_size = (cpio_estimate + 2047) & !2047;
     let mut cpio_ptr: *mut c_void = core::ptr::null_mut();
     if unsafe { (bs.allocate_pool)(MemoryType::EfiLoaderData, cpio_alloc_size, &mut cpio_ptr) } != EFI_SUCCESS || cpio_ptr.is_null() { return None; }
@@ -460,6 +595,12 @@ pub fn prepare_premount_initrd(
         true
     };
 
+    // Inject at multiple hook points — init-premount fires before casper-premount,
+    // and local-premount is the earliest initramfs-tools hook (runs before udev).
+    // These extra hooks ensure the premount script runs before casper tries to
+    // find the live filesystem (fixes Ubuntu "Unable to find medium" error).
+    if !append_entry(cpio, &mut off, b"scripts/local-premount/00choosable", &premount_script[..premount_len], 0o100755) { unsafe { (bs.free_pool)(cpio_ptr); } return None; }
+    if !append_entry(cpio, &mut off, b"scripts/init-premount/00choosable", &premount_script[..premount_len], 0o100755) { unsafe { (bs.free_pool)(cpio_ptr); } return None; }
     if !append_entry(cpio, &mut off, b"scripts/live/00choosable", &premount_script[..premount_len], 0o100755) { unsafe { (bs.free_pool)(cpio_ptr); } return None; }
     if !append_entry(cpio, &mut off, b"scripts/live-premount/00choosable", &premount_script[..premount_len], 0o100755) { unsafe { (bs.free_pool)(cpio_ptr); } return None; }
     if !append_entry(cpio, &mut off, b"scripts/casper-premount/00choosable", &premount_script[..premount_len], 0o100755) { unsafe { (bs.free_pool)(cpio_ptr); } return None; }

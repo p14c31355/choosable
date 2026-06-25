@@ -267,6 +267,23 @@ fn find_first_file_in_dir(
                     continue;
                 }
 
+                // Hardcoded guard: well-known directory names that MUST NOT
+                // be overwritten.  ISO9660 directory flag (bit 1) is not always
+                // reliable on certain ISOs (e.g. Pop!_OS where CASPER appears
+                // to have the wrong flags).  These names are always skipped
+                // regardless of what the directory flag byte says.
+                let known_dirs: &[&[u8]] = &[
+                    b"CASPER", b"LIVE", b"LIVEOS", b"ARCH", b"APKS",
+                    b"DISTROS", b"POP-OS", b"SYSTEM", b"SOURCES",
+                    b"BOOT", b"EFI", b"GRUB", b"GRUB2", b"FEDORA",
+                    b"ISOLINUX", b"SYSLINUX", b"BOOT",
+                ];
+                let is_known_dir = known_dirs.iter().any(|&d| d.len() == cl && d == &upper[..cl]);
+                if is_known_dir {
+                    offset += record_len;
+                    continue;
+                }
+
                 let dir_sector = dir_lba + s;
                 let dir_offset = offset as u32;
                 return Some((dir_sector, dir_offset, upper, eff_len));
@@ -487,7 +504,7 @@ fn try_patch_candidate(
     iso_name: &[u8],
     ext_lba: u32, ext_size: u32, dir_sector: u32, dir_offset: u32,
     iso_location: Option<&crate::locator::IsoLocation>,
-    live_media_uuid: &[u8; 10],
+    boot_kind: crate::boot_kind::BootKind,
 ) -> bool {
     let (orig_ptr, orig_len) = match read_extent(bs, bio_ref, bio_ptr, mid, iso_lba, ext_lba, ext_size) {
         Some(v) => v,
@@ -506,6 +523,10 @@ fn try_patch_candidate(
         }
     }
 
+    // Only patch if the file contains 'linux' or 'linuxefi' lines.
+    // Alpine menuentry-only configs are NOT supported because the current
+    // patching logic only rewrites existing kernel lines — it does not
+    // inject new linux/initrd directives into menuentry blocks.
     let has_linux = (orig.len() >= 6 && orig.windows(6).any(|w| w == b"linux " || w == b"linux\t"))
         || (orig.len() >= 9 && orig.windows(9).any(|w| w == b"linuxefi " || w == b"linuxefi\t"));
     if !has_linux {
@@ -513,26 +534,14 @@ fn try_patch_candidate(
         return false;
     }
 
-    let mut iso_name_arr = [0u8; 128];
-    let nlen = iso_name.len().min(127);
-    iso_name_arr[..nlen].copy_from_slice(&iso_name[..nlen]);
-    let ctx = crate::iso_fs::IsoFsCtx {
-        real_bio_ptr: bio_ptr,
-        real_media_id: mid,
-        iso_lba,
-        iso_size_bytes: (vb.media.bim_lb + 1) * 2048,
-        root_lba: 0, root_size: 0,
-        bs: bs as *mut BootServices,
-        st: core::ptr::null_mut(),
-        iso_name: iso_name_arr, iso_name_len: nlen,
-        live_media_uuid: *live_media_uuid,
-        premount_cpio_buf: core::ptr::null_mut(),
-        premount_cpio_size: 0,
-        premount_target_name,
-        premount_target_name_len,
-    };
-
-    let patch = strategy::patch_grub_cfg(&ctx, orig, bs as *mut BootServices, iso_location);
+    let patch = strategy::patch_grub_cfg(
+        orig,
+        boot_kind,
+        iso_name,
+        iso_location,
+        &premount_target_name[..premount_target_name_len],
+        bs as *mut BootServices,
+    );
 
     let (patched_buf, patched_size) = match patch {
         Some(p) if p.size != (orig_len as usize) || {
@@ -595,8 +604,8 @@ fn patch_grub_cfg_blockio(
     mid: u32,
     iso_lba: u64,
     iso_name: &[u8],
-    live_media_uuid: &[u8; 10],
     iso_location: Option<&crate::locator::IsoLocation>,
+    boot_kind: crate::boot_kind::BootKind,
 ) {
     if vbio.is_null() { return; }
     let vb = unsafe { &mut *vbio };
@@ -614,14 +623,19 @@ fn patch_grub_cfg_blockio(
     }; 8];
     let mut entry_count = 0usize;
 
-    let known_paths: [(&[u8], &[u8], &[u8], &[u8]); 7] = [
+    // Fedora uses /EFI/fedora/grub.cfg; also search Fedora-specific paths.
+    // The recursive scan will find all .cfg files as a fallback.
+    let known_paths: [(&[u8], &[u8], &[u8], &[u8]); 10] = [
         (b"BOOT", b"GRUB",  b"GRUB.CFG",     b"/boot/grub/grub.cfg"),
         (b"BOOT", b"GRUB",  b"LOOPBACK.CFG", b"/boot/grub/loopback.cfg"),
         (b"BOOT", b"GRUB2", b"GRUB.CFG",     b"/boot/grub2/grub.cfg"),
         (b"BOOT", b"GRUB2", b"LOOPBACK.CFG", b"/boot/grub2/loopback.cfg"),
         (b"EFI",  b"BOOT",  b"GRUB.CFG",     b"/EFI/BOOT/grub.cfg"),
+        (b"EFI",  b"FEDORA", b"GRUB.CFG",    b"/EFI/fedora/grub.cfg"),
+        (b"EFI",  b"FEDORA", b"GRUB.CFG",    b"/EFI/Fedora/grub.cfg"),
         (b"",     b"",      b"GRUB.CFG",     b"/grub.cfg"),
         (b"",     b"",      b"GRUB.CFG",     b"/grub2/grub.cfg"),
+        (b"",     b"",      b"GRUB.CFG",     b"/Fedora/grub.cfg"),
     ];
 
     for (dir1, dir2, filename, path) in &known_paths {
@@ -664,7 +678,7 @@ fn patch_grub_cfg_blockio(
         if try_patch_candidate(st, bs, vb, sfs_instance, bio_ref, bio_ptr, mid, iso_lba, iso_name,
             entries[i].ext_lba, entries[i].ext_size,
             entries[i].dir_sector, entries[i].dir_offset,
-            iso_location, live_media_uuid) {
+            iso_location, boot_kind) {
             return;
         }
     }
@@ -728,6 +742,135 @@ fn recursive_find_cfg_with_loc(
             offset += record_len;
         }
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  ISO scanner — detects BootKind from directory structure
+// ═══════════════════════════════════════════════════════════════════════════
+
+use crate::boot_kind::{name_matches, BootDescriptor, BootKind, BootloaderType};
+
+/// Walk the ISO root directory and identify the distro family by checking
+/// for well-known directories and files:
+///   /casper/ → Casper (Ubuntu, Mint, Pop!_OS)
+///   /live/   → DebianLive
+///   /LiveOS/ → FedoraLive (Fedora, RHEL, CentOS)
+///   /arch/   → ArchIso
+///   /apks/ or /.alpine-release → Alpine
+///   /sources/boot.wim → WindowsPE
+///
+/// Also checks for a GRUB config at standard paths to determine the
+/// bootloader type.
+pub fn scan_iso_structure(
+    bio_ref: &BlockIoProtocol,
+    bio_ptr: *mut BlockIoProtocol,
+    mid: u32,
+    iso_lba: u64,
+    _bs: &mut BootServices,
+) -> Option<BootDescriptor> {
+    let mut pvd = [0u8; 2048];
+    if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, 16, &mut pvd) {
+        return None;
+    }
+    if pvd[0] != 1 || &pvd[1..6] != b"CD001" {
+        return None;
+    }
+    let root_lba = u32::from_le_bytes(pvd[158..162].try_into().unwrap());
+    let root_size = u32::from_le_bytes(pvd[166..170].try_into().unwrap());
+
+    let mut boot_kind = BootKind::Unknown;
+    let mut scratch = [0u8; 2048];
+    let total_sectors = ((root_size as u64 + 2047) / 2048) as u32;
+
+    for s in 0..total_sectors {
+        if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, root_lba + s, &mut scratch) {
+            break;
+        }
+        let mut offset: usize = 0;
+        while offset + 34 <= 2048 && offset < (root_size as usize).saturating_sub(s as usize * 2048) {
+            let record_len = scratch[offset] as usize;
+            if record_len == 0 { break; }
+            if offset + record_len > 2048 { break; }
+            let name_len = scratch[offset + 32] as usize;
+            let name_offset = offset + 33;
+            if name_offset + name_len > 2048 { break; }
+            let flags = scratch[offset + 25];
+            let is_dir = flags & 0x02 != 0;
+
+            let eff_len = if name_len >= 2 && scratch[name_offset + name_len - 2] == b';' {
+                name_len - 2
+            } else {
+                name_len
+            };
+            let name = &scratch[name_offset..name_offset + eff_len];
+
+            if boot_kind == BootKind::Unknown {
+                if is_dir {
+                         if name_matches(name, b"CASPER")  { boot_kind = BootKind::Casper; }
+                    else if name_matches(name, b"LIVE")    { boot_kind = BootKind::DebianLive; }
+                    else if name_matches(name, b"LIVEOS")  { boot_kind = BootKind::FedoraLive; }
+                    else if name_matches(name, b"ARCH")    { boot_kind = BootKind::ArchIso; }
+                    else if name_matches(name, b"APKS")    { boot_kind = BootKind::AlpinePremount; }
+                    else if name_matches(name, b"SOURCES") {
+                        // Check for /sources/boot.wim (Windows PE)
+                        let extent = u32::from_le_bytes(scratch[offset + 2..offset + 6].try_into().unwrap());
+                        let size = u32::from_le_bytes(scratch[offset + 10..offset + 14].try_into().unwrap());
+                        // Save current sector before nested find_in_dir overwrites it
+                        let saved_sector = scratch;
+                        if let Some(_) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, extent, size, b"BOOT.WIM", &mut scratch) {
+                            boot_kind = BootKind::WindowsPE;
+                        }
+                        // Restore sector so outer loop can continue
+                        scratch = saved_sector;
+                    }
+                } else {
+                         if name_matches(name, b".ALPINE-RELEASE") { boot_kind = BootKind::AlpinePremount; }
+                    else if name_matches(name, b".ALPINE_RELEASE") { boot_kind = BootKind::AlpinePremount; }
+                    else if name_matches(name, b"BOOT.WIM")        { boot_kind = BootKind::WindowsPE; }
+                }
+            }
+            offset += record_len;
+        }
+    }
+
+    let mut bootloader = BootloaderType::Grub;
+    let grub_paths: [&[&[u8]]; 3] = [
+        &[b"BOOT", b"GRUB",  b"GRUB.CFG"],
+        &[b"BOOT", b"GRUB2", b"GRUB.CFG"],
+        &[b"EFI",  b"BOOT",  b"GRUB.CFG"],
+    ];
+    let mut found_grub = false;
+    for path in &grub_paths {
+        if path_exists(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, path, &mut scratch) {
+            found_grub = true;
+            break;
+        }
+    }
+    if !found_grub {
+        bootloader = BootloaderType::None_;
+    }
+
+    Some(BootDescriptor { boot_kind, bootloader })
+}
+
+fn path_exists(
+    bio_ref: &BlockIoProtocol,
+    bio_ptr: *mut BlockIoProtocol,
+    mid: u32,
+    iso_lba: u64,
+    root_lba: u32,
+    root_size: u32,
+    components: &[&[u8]],
+    scratch: &mut [u8; 2048],
+) -> bool {
+    let (mut cur_lba, mut cur_size) = (root_lba, root_size);
+    for &comp in components {
+        match find_in_dir(bio_ref, bio_ptr, mid, iso_lba, cur_lba, cur_size, comp, scratch) {
+            Some((lba, size)) => { cur_lba = lba; cur_size = size; }
+            None => return false,
+        }
+    }
+    true
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -991,32 +1134,32 @@ fn uefi_chainload_iso(
         }
     };
 
-    // ── Build premount cpio (fixup type depends on strategy) ──────────
-    let premount_bundle = if !sfs_instance.is_null() {
-        let ctx = unsafe { &(*sfs_instance).ctx };
-        let fixup = crate::strategy::get_fixup_type(ctx);
+    // ── Scan ISO directory structure for boot kind detection ──────────
+    let boot_desc = scan_iso_structure(bio_ref, bio_ptr, mid, iso_lba, bs);
+    if let Some(ref desc) = boot_desc {
+        if !sfs_instance.is_null() {
+            let sfs = unsafe { &mut *sfs_instance };
+            sfs.ctx.boot_kind = desc.boot_kind;
+        }
+    }
+    let boot_kind = boot_desc.as_ref().map_or(crate::boot_kind::BootKind::Unknown, |d| d.boot_kind);
+
+    // ── Build premount cpio (fixup type depends on boot_kind) ────────
+    let premount_bundle = {
+        let fixup = boot_kind.fixup_type();
         match fixup {
-            crate::strategy::FixupType::Alpine =>
+            crate::boot_kind::FixupType::Alpine =>
                 crate::premount::prepare_alpine_initrd(bs, iso_lba - part1_lba, iso_name),
-            crate::strategy::FixupType::AlpinePremount => {
-                // AlpinePremount uses the standard premount initrd
-                // (casper-style hook) instead of a custom /init.choosable.
-                crate::premount::prepare_premount_initrd(bs, iso_lba - part1_lba, false, iso_name)
-            }
-            crate::strategy::FixupType::Arch => {
-                // ArchISO: premount initrd mounts ISO at /run/archiso/bootmnt
-                // after the initramfs has already started.  The kernel
-                // cmdline archisodevice=... handles the rest.
-                crate::premount::prepare_premount_initrd(bs, iso_lba - part1_lba, false, iso_name)
-            }
-            crate::strategy::FixupType::WindowsPE => None,
+            crate::boot_kind::FixupType::AlpinePremount =>
+                crate::premount::prepare_premount_initrd(bs, iso_lba - part1_lba, false, iso_name),
+            crate::boot_kind::FixupType::Arch =>
+                crate::premount::prepare_arch_initrd(bs, iso_lba - part1_lba, iso_name),
+            crate::boot_kind::FixupType::WindowsPE => None,
             _ => {
-                let needs_sr = crate::strategy::needs_sr_mod(ctx);
+                let needs_sr = boot_kind.needs_sr_mod();
                 crate::premount::prepare_premount_initrd(bs, iso_lba - part1_lba, needs_sr, iso_name)
             }
         }
-    } else {
-        crate::premount::prepare_premount_initrd(bs, iso_lba - part1_lba, true, iso_name)
     };
     if premount_bundle.is_none() {
         print_raw(st, b"[premount] allocation failed, skipping\r\n\0");
@@ -1117,12 +1260,81 @@ fn uefi_chainload_iso(
                     print_dec(st, eod_offset as u64);
                     print_raw(st, b"\r\n\0");
                 } else {
-                    if !sfs_instance.is_null() {
-                        let sfs = unsafe { &mut *sfs_instance };
-                        sfs.ctx.premount_cpio_buf = bundle.cpio_buf;
-                        sfs.ctx.premount_cpio_size = bundle.cpio_size;
+                    // Root directory is full (no free space for EOD injection
+                    // and no safe file to overwrite).  Relocate the entire
+                    // root directory to a new contiguous extent at the end of
+                    // the virtual CD-ROM, appending the synthetic PREMOUNT.CPIO
+                    // entry.  GRUB's ISO9660 driver reads directories sequentially,
+                    // so the relocated extent must be contiguous.
+                    let root_sectors = ((root_size as u64 + 2047) / 2048) as u32;
+                    // Extra sector for the synthetic entry if needed
+                    let extra_sectors = if root_size % 2048 == 0 || root_size % 2048 + 47 > 2048 { 1u32 } else { 0u32 };
+                    let relocated_sectors = root_sectors + extra_sectors;
+                    let relocated_bytes = relocated_sectors as usize * 2048;
+
+                    let mut relocated_ptr: *mut c_void = core::ptr::null_mut();
+                    if unsafe { (bs.allocate_pool)(MemoryType::EfiLoaderData, relocated_bytes, &mut relocated_ptr) } != EFI_SUCCESS || relocated_ptr.is_null() {
+                        print_raw(st, b"[premount] relocation alloc failed\r\n\0");
+                    } else {
+                        let reloc = unsafe { core::slice::from_raw_parts_mut(relocated_ptr as *mut u8, relocated_bytes) };
+                        // Zero-fill first
+                        for b in reloc.iter_mut() { *b = 0; }
+                        // Copy all original root directory sectors, tracking success
+                        let mut all_sectors_ok = true;
+                        for s in 0..root_sectors {
+                            let mut sec = [0u8; 2048];
+                            if read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, root_lba + s, &mut sec) {
+                                let off = s as usize * 2048;
+                                let copy = ((root_size as usize).saturating_sub(off)).min(2048);
+                                reloc[off..off + copy].copy_from_slice(&sec[..copy]);
+                            } else {
+                                all_sectors_ok = false;
+                                break;
+                            }
+                        }
+                        if !all_sectors_ok {
+                            // Failed to read the full root directory; abort relocation.
+                            unsafe { (bs.free_pool)(relocated_ptr); }
+                            print_raw(st, b"[premount] relocation read failed\r\n\0");
+                        } else {
+                        // Build the synthetic entry at the end of the relocated data
+                        let insert_off = root_size as usize;
+                        let mut blob = [0u8; 128];
+                        let blob_len = build_premount_cpio_entry(
+                            &mut blob,
+                            vb.premount_file_sector,
+                            bundle.cpio_size as u32,
+                        );
+                        reloc[insert_off..insert_off + blob_len as usize].copy_from_slice(&blob[..blob_len as usize]);
+                        let new_root_size = insert_off as u32 + blob_len;
+
+                        let relocated_start = (vb.media.bim_lb + 1) as u32;
+                        vb.media.bim_lb = relocated_start as u64 + relocated_sectors as u64 - 1;
+                        vb.premount_root_relocated = true;
+                        vb.premount_root_buf = relocated_ptr as *mut u8;
+                        vb.premount_root_buf_size = relocated_bytes;
+                        vb.premount_root_sectors = relocated_sectors;
+                        vb.premount_root_start_sector = relocated_start;
+                        vb.premount_new_root_size = new_root_size;
+                        vb.premount_entry_injected = false; // synthetic entry is in reloc, not a separate injected sector
+
+                        if !sfs_instance.is_null() {
+                            let sfs = unsafe { &mut *sfs_instance };
+                            sfs.ctx.premount_cpio_buf = bundle.cpio_buf;
+                            sfs.ctx.premount_cpio_size = bundle.cpio_size;
+                            sfs.ctx.premount_target_name = *b"PREMOUNT.CPIO___";
+                            sfs.ctx.premount_target_name_len = 13;
+                        }
+
+                        print_raw(st, b"[premount] root dir relocated to sector=\0");
+                        print_dec(st, relocated_start as u64);
+                        print_raw(st, b" sectors=\0");
+                        print_dec(st, relocated_sectors as u64);
+                        print_raw(st, b" new_root_size=\0");
+                        print_dec(st, new_root_size as u64);
+                        print_raw(st, b"\r\n\0");
+                        }
                     }
-                    print_raw(st, b"[premount] WARNING: no EOD marker in root dir (SFS-only)\r\n\0");
                 }
             }
         }
@@ -1136,7 +1348,7 @@ fn uefi_chainload_iso(
     let iso_loc = locator.locate();
 
     patch_grub_cfg_blockio(st, bs, vbio_ptr, sfs_instance, bio_ref, bio_ptr, mid, iso_lba, iso_name,
-        &live_uuid, Some(&iso_loc));
+        Some(&iso_loc), boot_kind);
 
     let (efi_lba, efi_size, efi_filename) = match find_efi_boot(st, bio_ref, bio_ptr, mid, iso_lba) {
         Some(v) => v,
@@ -1158,25 +1370,42 @@ fn uefi_chainload_iso(
     print_dec(st, buf_len as u64);
     print_raw(st, b" bytes\r\n\0");
 
-    // Most firmware accepts the synthetic DevicePath; some (InsydeH2O)
-    // reject it and require NULL when SourceBuffer is set.  Try the
-    // DevicePath first, then retry with NULL on EFI_UNSUPPORTED, and
-    // finally retry with a CD-ROM-only DevicePath (no file path node)
-    // which some firmware prefers over NULL.
+    // Most firmware accepts the synthetic DevicePath; some (InsydeH2O,
+    // APTIO V) reject it and require NULL when SourceBuffer is set.
+    // Try the DevicePath first, then retry with NULL, then retry with
+    // a CD-ROM-only DevicePath (no file path node) which some firmware
+    // prefers over NULL.  Also retry on EFI_SECURITY_VIOLATION (some
+    // firmware refuses external EFI binaries unless explicitly allowed).
     let mut child_handle: *mut c_void = core::ptr::null_mut();
-    let mut load_status = unsafe {
+    let mut load_status: usize;
+
+    // Check whether a LoadImage status code is a "soft" error that
+    // warrants retrying with a different DevicePath.
+    fn is_soft_load_error(status: usize) -> bool {
+        status == crate::protocol::EFI_INVALID_PARAMETER
+            || status == crate::protocol::EFI_UNSUPPORTED
+            || status == crate::protocol::EFI_SECURITY_VIOLATION
+    }
+
+    load_status = unsafe {
         (bs.load_image)(false, image_handle,
             device_path as *mut crate::protocol::DevicePathProtocol,
             buf_ptr, buf_len as u64, &mut child_handle)
     };
-    if load_status == crate::protocol::EFI_INVALID_PARAMETER || load_status == crate::protocol::EFI_UNSUPPORTED {
+    print_hex(st, b"[LoadImage #1 (synthetic DP)] status=0x", load_status as u64);
+    print_raw(st, b"\r\n\0");
+
+    if is_soft_load_error(load_status) {
         // Retry with NULL DevicePath (firmware rejects synthetic path).
         load_status = unsafe {
             (bs.load_image)(false, image_handle, core::ptr::null_mut(),
                 buf_ptr, buf_len as u64, &mut child_handle)
         };
+        print_hex(st, b"[LoadImage #2 (NULL DP)] status=0x", load_status as u64);
+        print_raw(st, b"\r\n\0");
     }
-    if load_status == crate::protocol::EFI_INVALID_PARAMETER || load_status == crate::protocol::EFI_UNSUPPORTED {
+
+    if is_soft_load_error(load_status) {
         // Retry with CD-ROM-only DevicePath (no file path node).
         // Some firmware needs a real DevicePath to locate the
         // device, but rejects the synthetic file path.
@@ -1187,13 +1416,27 @@ fn uefi_chainload_iso(
                     cdrom_only_dp as *mut crate::protocol::DevicePathProtocol,
                     buf_ptr, buf_len as u64, &mut child_handle)
             };
+            print_hex(st, b"[LoadImage #3 (CD-ROM DP)] status=0x", load_status as u64);
+            print_raw(st, b"\r\n\0");
             if load_status != EFI_SUCCESS {
                 unsafe { (bs.free_pool)(cdrom_only_dp); }
             }
         }
     }
+
+    if is_soft_load_error(load_status) {
+        // Last resort: try loading without SourceBuffer and DevicePath
+        // both NULL (some firmware requires pure file-based discovery).
+        load_status = unsafe {
+            (bs.load_image)(false, image_handle, core::ptr::null_mut(),
+                core::ptr::null(), 0, &mut child_handle)
+        };
+        print_hex(st, b"[LoadImage #4 (NULL DP, no buffer)] status=0x", load_status as u64);
+        print_raw(st, b"\r\n\0");
+    }
+
     if load_status != EFI_SUCCESS {
-        print_hex(st, b"ERROR: LoadImage failed, status=0x", load_status as u64);
+        print_hex(st, b"ERROR: LoadImage failed after all retries, status=0x", load_status as u64);
         print_raw(st, b"\r\nEFI size=\0");
         print_dec(st, buf_len as u64);
         print_raw(st, b" bytes\r\n\0");
@@ -1202,8 +1445,13 @@ fn uefi_chainload_iso(
     }
     unsafe { (bs.free_pool)(buf_ptr as _); }
 
+    // Patch LoadedImageProtocol to point to the virtual CD-ROM handle.
+    // systemd-boot (Arch ISO) and GRUB need DeviceHandle to be the
+    // virtual CD-ROM so they can locate files (shellx64.efi, grub.cfg,
+    // etc.) via the SimpleFileSystem protocol on that handle.
     let mut lip: *mut LoadedImageProtocol = core::ptr::null_mut();
-    if unsafe { (bs.handle_protocol)(child_handle, &LOADED_IMAGE_PROTOCOL_GUID, &mut lip as *mut _ as _) } == EFI_SUCCESS && !lip.is_null() {
+    let lip_patched = unsafe { (bs.handle_protocol)(child_handle, &LOADED_IMAGE_PROTOCOL_GUID, &mut lip as *mut _ as _) } == EFI_SUCCESS && !lip.is_null();
+    if lip_patched {
         unsafe {
             (*lip).device_handle = device_handle;
             (*lip).file_path = device_path;
@@ -1224,8 +1472,21 @@ fn uefi_chainload_iso(
             }
         }
     }
-    print_raw(st, b"Starting...\r\n\0");
-    let status = unsafe { (bs.start_image)(child_handle, &mut 0u64, &mut core::ptr::null_mut::<u16>()) };
+    print_raw(st, b"Starting (try #1, with DeviceHandle)...\r\n\0");
+    let mut status = unsafe { (bs.start_image)(child_handle, &mut 0u64, &mut core::ptr::null_mut::<u16>()) };
+
+    // If StartImage returned UNSUPPORTED, clear the DeviceHandle and
+    // retry — some firmware/GRUB reject the synthetic DevicePath.
+    if status == crate::protocol::EFI_UNSUPPORTED && lip_patched {
+        print_raw(st, b"StartImage #1 returned UNSUPPORTED, retrying without DeviceHandle...\r\n\0");
+        let mut lip2: *mut LoadedImageProtocol = core::ptr::null_mut();
+        if unsafe { (bs.handle_protocol)(child_handle, &LOADED_IMAGE_PROTOCOL_GUID, &mut lip2 as *mut _ as _) } == EFI_SUCCESS && !lip2.is_null() {
+            unsafe {
+                (*lip2).device_handle = core::ptr::null_mut();
+            }
+        }
+        status = unsafe { (bs.start_image)(child_handle, &mut 0u64, &mut core::ptr::null_mut::<u16>()) };
+    }
     print_hex(st, b"StartImage returned 0x\0", status as u64);
     print_raw(st, b"\r\n\0");
     // Wait for key press so user can read the return value before possible reset

@@ -1,20 +1,25 @@
-# Choosable premount ignore list — ISO9660 root directory entries
-# that must NOT be overwritten for premount cpio injection.
+# Premount ignore list — files protected from being overwritten
+# with the premount CPIO data in the ISO root directory.
 #
-# One pattern per line.  Empty lines and #-comments are ignored.
-# Trailing * means prefix match (e.g. MD5SUM* matches MD5SUM, MD5SUM.TXT, MD5SUMS).
-# Otherwise the entire name is matched exactly.
-# All matching is case-insensitive.
+# Lines starting with '#' are comments.
+# Lines without a '/' suffix use exact (case-insensitive) name matching.
+# Lines with a '/' suffix use prefix matching.
 #
-# Why these are excluded:
-#   MD5SUM*       — GRUB uses if [ -f /MD5SUM.TXT ] for integrity checks
-#   README*       — boot scripts / GRUB may reference README.DISKDEFINES etc.
-#   UBUNTU*       — referenced by Ubuntu GRUB as /UBUNTU sentinel file
-#   DEBIAN*       — referenced by Debian GRUB as /DEBIAN sentinel file
-#   POP*          — referenced by Pop!_OS GRUB as /POP sentinel file
-#   AUTORUN.INF   — Windows autorun, occasionally checked
-#   .ALPINE_RELEASE — Alpine Linux requires this file to detect the live medium
+# Never overwrite files needed by GRUB, EFI boot, or El Torito.
 
+BOOT.CATALOG
+BOOT.CAT
+GRUB.CFG
+LOOPBACK.CFG
+BOOTX64.EFI
+BOOTIA32.EFI
+GRUBX64.EFI
+SHIMX64.EFI
+BOOT.SDI
+BCD
+BOOTMGR
+BOOTMGR.EFI
+MEMTEST.EFI
 MD5SUM*
 README*
 UBUNTU*
@@ -23,4 +28,16 @@ POP*
 AUTORUN.INF
 EFI.IMG
 SHA256SUM.TXT
+# Well-known directory names — never overwrite even if ISO9660 flags are wrong
+CASPER
+LIVE
+LIVEOS
+ARCH
+APKS
+DISTROS
+POP-OS
+SYSTEM
+SOURCES
+# Alpine marker files — scanner relies on these to detect Alpine ISOs
+.ALPINE-RELEASE
 .ALPINE_RELEASE

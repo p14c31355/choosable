@@ -44,6 +44,9 @@ pub struct IsoFsCtx {
     /// ISO9660 name used as premount injection target (e.g. "MD5SUM.TXT")
     pub premount_target_name: [u8; 16],
     pub premount_target_name_len: usize,
+    /// Detected distro family (set after scanning ISO directory structure).
+    pub boot_kind: crate::boot_kind::BootKind,
+    pub bootloader_type: crate::boot_kind::BootloaderType,
 }
 
 #[repr(C)]
@@ -349,25 +352,16 @@ unsafe extern "efiapi" fn file_open(
     let _ = open_mode;
 
     // Eagerly patch .cfg
+    // NOTE: We skip patching here because IsoLocation is not available
+    // at SFS open time. The BlockIO patching flow (patch_grub_cfg_blockio)
+    // handles the real location-dependent patching when the full ISO
+    // context is available. This prevents partial/inconsistent patches
+    // where findiso= or choosable.iso_offset= would be left empty.
     if is_cfg {
         let vf2 = unsafe { &mut *(fp as *mut VirtualFile) };
-        if !vf2.patched {
-            let orig_size = vf2.extent_size as usize;
-            let bs = unsafe { &mut *ctx.bs };
-            let mut tmp_ptr: *mut c_void = core::ptr::null_mut();
-            if unsafe { (bs.allocate_pool)(crate::protocol::MemoryType::EfiLoaderData, orig_size, &mut tmp_ptr) } == EFI_SUCCESS && !tmp_ptr.is_null() {
-                let tmp = unsafe { core::slice::from_raw_parts_mut(tmp_ptr as *mut u8, orig_size) };
-                let mut total = 0;
-                while total < orig_size {
-                    let r = read_extent_data(ctx, child_lba, child_size, total as u64, &mut tmp[total..total + ((orig_size - total).min(2048))]);
-                    if r == 0 { break; } total += r;
-                }
-                if let Some(p) = crate::strategy::patch_grub_cfg(ctx, &tmp[..total], ctx.bs, None) {
-                    vf2.patched_buf = p.buf; vf2.patched_size = p.size as u64; vf2.patched = true;
-                }
-                unsafe { (bs.free_pool)(tmp_ptr); }
-            }
-        }
+        // Mark as needs_grub_patch=true but don't eagerly patch here.
+        // GRUB will read via BlockIO where the full patch can occur.
+        vf2.needs_grub_patch = true;
     }
 
     *new_handle = fp;
@@ -645,6 +639,8 @@ pub fn create_iso_fs(
         premount_cpio_buf, premount_cpio_size,
         premount_target_name: [0u8; 16],
         premount_target_name_len: 0,
+        boot_kind: crate::boot_kind::BootKind::Unknown,
+        bootloader_type: crate::boot_kind::BootloaderType::Grub,
     };
     if let Some((rlb, rsz)) = parse_pvd(&instance.ctx) { instance.ctx.root_lba = rlb; instance.ctx.root_size = rsz; }
     else { unsafe { (bs.free_pool)(ptr); } return core::ptr::null_mut(); }
