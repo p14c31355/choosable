@@ -815,9 +815,13 @@ pub fn scan_iso_structure(
                         // Check for /sources/boot.wim (Windows PE)
                         let extent = u32::from_le_bytes(scratch[offset + 2..offset + 6].try_into().unwrap());
                         let size = u32::from_le_bytes(scratch[offset + 10..offset + 14].try_into().unwrap());
+                        // Save current sector before nested find_in_dir overwrites it
+                        let saved_sector = scratch;
                         if let Some(_) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, extent, size, b"BOOT.WIM", &mut scratch) {
                             boot_kind = BootKind::WindowsPE;
                         }
+                        // Restore sector so outer loop can continue
+                        scratch = saved_sector;
                     }
                 } else {
                          if name_matches(name, b".ALPINE-RELEASE") { boot_kind = BootKind::AlpinePremount; }
