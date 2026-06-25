@@ -506,9 +506,21 @@ fn try_patch_candidate(
         }
     }
 
+    // Allow patching even when no explicit 'linux' line is found, as long as
+    // the file contains menuentry blocks.  Alpine's grub.cfg uses 'boot'
+    // without a preceding 'linux' line and relies on the default kernel loaded
+    // by GRUB at an earlier stage.  We still need to inject the premount initrd.
     let has_linux = (orig.len() >= 6 && orig.windows(6).any(|w| w == b"linux " || w == b"linux\t"))
         || (orig.len() >= 9 && orig.windows(9).any(|w| w == b"linuxefi " || w == b"linuxefi\t"));
-    if !has_linux {
+    let has_menuentry = orig.windows(10).any(|w| {
+        (w.starts_with(b"menuentry ") || w.starts_with(b"menuentry\t"))
+    });
+    let is_alpine = boot_kind == crate::boot_kind::BootKind::AlpinePremount
+        || boot_kind == crate::boot_kind::BootKind::Alpine;
+    // For Alpine, we can still try to patch even without has_linux —
+    // strategy::patch_grub_cfg will inject linux/initrd lines into
+    // the first menuentry block.
+    if !has_linux && !(is_alpine && has_menuentry) {
         unsafe { (bs.free_pool)(orig_ptr as *mut c_void); }
         return false;
     }
@@ -602,14 +614,19 @@ fn patch_grub_cfg_blockio(
     }; 8];
     let mut entry_count = 0usize;
 
-    let known_paths: [(&[u8], &[u8], &[u8], &[u8]); 7] = [
+    // Fedora uses /EFI/fedora/grub.cfg; also search Fedora-specific paths.
+    // The recursive scan will find all .cfg files as a fallback.
+    let known_paths: [(&[u8], &[u8], &[u8], &[u8]); 10] = [
         (b"BOOT", b"GRUB",  b"GRUB.CFG",     b"/boot/grub/grub.cfg"),
         (b"BOOT", b"GRUB",  b"LOOPBACK.CFG", b"/boot/grub/loopback.cfg"),
         (b"BOOT", b"GRUB2", b"GRUB.CFG",     b"/boot/grub2/grub.cfg"),
         (b"BOOT", b"GRUB2", b"LOOPBACK.CFG", b"/boot/grub2/loopback.cfg"),
         (b"EFI",  b"BOOT",  b"GRUB.CFG",     b"/EFI/BOOT/grub.cfg"),
+        (b"EFI",  b"FEDORA", b"GRUB.CFG",    b"/EFI/fedora/grub.cfg"),
+        (b"EFI",  b"FEDORA", b"GRUB.CFG",    b"/EFI/Fedora/grub.cfg"),
         (b"",     b"",      b"GRUB.CFG",     b"/grub.cfg"),
         (b"",     b"",      b"GRUB.CFG",     b"/grub2/grub.cfg"),
+        (b"",     b"",      b"GRUB.CFG",     b"/Fedora/grub.cfg"),
     ];
 
     for (dir1, dir2, filename, path) in &known_paths {
@@ -1397,14 +1414,10 @@ fn uefi_chainload_iso(
     }
     unsafe { (bs.free_pool)(buf_ptr as _); }
 
-    let mut lip: *mut LoadedImageProtocol = core::ptr::null_mut();
-    if unsafe { (bs.handle_protocol)(child_handle, &LOADED_IMAGE_PROTOCOL_GUID, &mut lip as *mut _ as _) } == EFI_SUCCESS && !lip.is_null() {
-        unsafe {
-            (*lip).device_handle = device_handle;
-            (*lip).file_path = device_path;
-            (*lip).parent_handle = image_handle;
-        }
-    }
+    // Try StartImage first WITHOUT patching LoadedImageProtocol.
+    // Some firmware/GRUB (e.g. Arch ISO's BOOTX64.EFI) reject images
+    // whose DeviceHandle points to a virtual CD-ROM.  Patch only if
+    // the first attempt fails with EFI_UNSUPPORTED.
     print_raw(st, b"Press any key to start...\r\n\0");
     {
         let bs_ref = unsafe { &mut *st.boot_services };
@@ -1419,8 +1432,23 @@ fn uefi_chainload_iso(
             }
         }
     }
-    print_raw(st, b"Starting...\r\n\0");
-    let status = unsafe { (bs.start_image)(child_handle, &mut 0u64, &mut core::ptr::null_mut::<u16>()) };
+    print_raw(st, b"Starting (try #1)...\r\n\0");
+    let mut status = unsafe { (bs.start_image)(child_handle, &mut 0u64, &mut core::ptr::null_mut::<u16>()) };
+
+    // If StartImage returned EFI_UNSUPPORTED, patch LoadedImageProtocol
+    // to point to the virtual CD-ROM and retry.
+    if status == crate::protocol::EFI_UNSUPPORTED {
+        print_raw(st, b"StartImage #1 returned UNSUPPORTED, retrying with patched DeviceHandle...\r\n\0");
+        let mut lip: *mut LoadedImageProtocol = core::ptr::null_mut();
+        if unsafe { (bs.handle_protocol)(child_handle, &LOADED_IMAGE_PROTOCOL_GUID, &mut lip as *mut _ as _) } == EFI_SUCCESS && !lip.is_null() {
+            unsafe {
+                (*lip).device_handle = device_handle;
+                (*lip).file_path = device_path;
+                (*lip).parent_handle = image_handle;
+            }
+        }
+        status = unsafe { (bs.start_image)(child_handle, &mut 0u64, &mut core::ptr::null_mut::<u16>()) };
+    }
     print_hex(st, b"StartImage returned 0x\0", status as u64);
     print_raw(st, b"\r\n\0");
     // Wait for key press so user can read the return value before possible reset

@@ -391,12 +391,17 @@ mount -t iso9660 -o ro $LOOP /cdrom 2>/dev/null||{ losetup -d $LOOP 2>/dev/null;
 mount --make-rshared /cdrom 2>/dev/null
 mount -o bind /cdrom /lib/live/mount/medium 2>/dev/null
 [ -f /cdrom/casper/filesystem.squashfs ]&&return 0
+[ -d /cdrom/pop-os/casper_persist ]&&return 0
+[ -f /cdrom/casper/filesystem.* ]&&return 0
 [ -f /cdrom/live/filesystem.squashfs ]&&return 0
 [ -f /cdrom/LiveOS/squashfs.img ]&&return 0
 [ -f /cdrom/.alpine-release ]&&return 0
 [ -f /cdrom/.ALPINE_RELEASE ]&&return 0
 [ -d /cdrom/apks ]&&return 0
 [ -d /cdrom/arch ]&&{ mkdir -p /run/archiso/bootmnt 2>/dev/null;mount -o bind /cdrom /run/archiso/bootmnt 2>/dev/null;return 0;}
+[ -f /cdrom/.disk/info ]&&return 0
+[ -d /cdrom/distros ]&&return 0
+[ -f /cdrom/casper/vmlinuz ]&&return 0
 umount /lib/live/mount/medium 2>/dev/null
 umount /cdrom 2>/dev/null
 losetup -d $LOOP 2>/dev/null
@@ -559,11 +564,15 @@ pub fn prepare_premount_initrd(
         let padded_name_len = ((110 + name_len + 1 + 3) & !3) - 110;
         110 + padded_name_len + data_len + 3
     };
-    let cpio_estimate = entry_size(24, premount_len)
-        + entry_size(33, premount_len)
-        + entry_size(35, premount_len)
-        + entry_size(33, bottom_len)
-        + entry_size(10, 0);
+    // local-premount=33, init-premount=31, live=24, live-premount=33,
+    // casper-premount=35, casper-bottom=33, TRAILER=10
+    let cpio_estimate = entry_size(33, premount_len)  // scripts/local-premount/00choosable
+        + entry_size(31, premount_len)                // scripts/init-premount/00choosable
+        + entry_size(24, premount_len)                // scripts/live/00choosable
+        + entry_size(33, premount_len)                // scripts/live-premount/00choosable
+        + entry_size(35, premount_len)                // scripts/casper-premount/00choosable
+        + entry_size(33, bottom_len)                  // scripts/casper-bottom/00choosable
+        + entry_size(10, 0);                           // TRAILER!!!
     let cpio_alloc_size = (cpio_estimate + 2047) & !2047;
     let mut cpio_ptr: *mut c_void = core::ptr::null_mut();
     if unsafe { (bs.allocate_pool)(MemoryType::EfiLoaderData, cpio_alloc_size, &mut cpio_ptr) } != EFI_SUCCESS || cpio_ptr.is_null() { return None; }
@@ -584,6 +593,12 @@ pub fn prepare_premount_initrd(
         true
     };
 
+    // Inject at multiple hook points — init-premount fires before casper-premount,
+    // and local-premount is the earliest initramfs-tools hook (runs before udev).
+    // These extra hooks ensure the premount script runs before casper tries to
+    // find the live filesystem (fixes Ubuntu "Unable to find medium" error).
+    if !append_entry(cpio, &mut off, b"scripts/local-premount/00choosable", &premount_script[..premount_len], 0o100755) { unsafe { (bs.free_pool)(cpio_ptr); } return None; }
+    if !append_entry(cpio, &mut off, b"scripts/init-premount/00choosable", &premount_script[..premount_len], 0o100755) { unsafe { (bs.free_pool)(cpio_ptr); } return None; }
     if !append_entry(cpio, &mut off, b"scripts/live/00choosable", &premount_script[..premount_len], 0o100755) { unsafe { (bs.free_pool)(cpio_ptr); } return None; }
     if !append_entry(cpio, &mut off, b"scripts/live-premount/00choosable", &premount_script[..premount_len], 0o100755) { unsafe { (bs.free_pool)(cpio_ptr); } return None; }
     if !append_entry(cpio, &mut off, b"scripts/casper-premount/00choosable", &premount_script[..premount_len], 0o100755) { unsafe { (bs.free_pool)(cpio_ptr); } return None; }
