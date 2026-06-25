@@ -28,3 +28,13 @@ POP*
 AUTORUN.INF
 EFI.IMG
 SHA256SUM.TXT
+# Well-known directory names — never overwrite even if ISO9660 flags are wrong
+CASPER
+LIVE
+LIVEOS
+ARCH
+APKS
+DISTROS
+POP-OS
+SYSTEM
+SOURCES

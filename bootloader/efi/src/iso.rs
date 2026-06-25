@@ -267,6 +267,23 @@ fn find_first_file_in_dir(
                     continue;
                 }
 
+                // Hardcoded guard: well-known directory names that MUST NOT
+                // be overwritten.  ISO9660 directory flag (bit 1) is not always
+                // reliable on certain ISOs (e.g. Pop!_OS where CASPER appears
+                // to have the wrong flags).  These names are always skipped
+                // regardless of what the directory flag byte says.
+                let known_dirs: &[&[u8]] = &[
+                    b"CASPER", b"LIVE", b"LIVEOS", b"ARCH", b"APKS",
+                    b"DISTROS", b"POP-OS", b"SYSTEM", b"SOURCES",
+                    b"BOOT", b"EFI", b"GRUB", b"GRUB2", b"FEDORA",
+                    b"ISOLINUX", b"SYSLINUX", b"BOOT",
+                ];
+                let is_known_dir = known_dirs.iter().any(|&d| d.len() == cl && d == &upper[..cl]);
+                if is_known_dir {
+                    offset += record_len;
+                    continue;
+                }
+
                 let dir_sector = dir_lba + s;
                 let dir_offset = offset as u32;
                 return Some((dir_sector, dir_offset, upper, eff_len));
@@ -1414,10 +1431,19 @@ fn uefi_chainload_iso(
     }
     unsafe { (bs.free_pool)(buf_ptr as _); }
 
-    // Try StartImage first WITHOUT patching LoadedImageProtocol.
-    // Some firmware/GRUB (e.g. Arch ISO's BOOTX64.EFI) reject images
-    // whose DeviceHandle points to a virtual CD-ROM.  Patch only if
-    // the first attempt fails with EFI_UNSUPPORTED.
+    // Patch LoadedImageProtocol to point to the virtual CD-ROM handle.
+    // systemd-boot (Arch ISO) and GRUB need DeviceHandle to be the
+    // virtual CD-ROM so they can locate files (shellx64.efi, grub.cfg,
+    // etc.) via the SimpleFileSystem protocol on that handle.
+    let mut lip: *mut LoadedImageProtocol = core::ptr::null_mut();
+    let lip_patched = unsafe { (bs.handle_protocol)(child_handle, &LOADED_IMAGE_PROTOCOL_GUID, &mut lip as *mut _ as _) } == EFI_SUCCESS && !lip.is_null();
+    if lip_patched {
+        unsafe {
+            (*lip).device_handle = device_handle;
+            (*lip).file_path = device_path;
+            (*lip).parent_handle = image_handle;
+        }
+    }
     print_raw(st, b"Press any key to start...\r\n\0");
     {
         let bs_ref = unsafe { &mut *st.boot_services };
@@ -1432,19 +1458,17 @@ fn uefi_chainload_iso(
             }
         }
     }
-    print_raw(st, b"Starting (try #1)...\r\n\0");
+    print_raw(st, b"Starting (try #1, with DeviceHandle)...\r\n\0");
     let mut status = unsafe { (bs.start_image)(child_handle, &mut 0u64, &mut core::ptr::null_mut::<u16>()) };
 
-    // If StartImage returned EFI_UNSUPPORTED, patch LoadedImageProtocol
-    // to point to the virtual CD-ROM and retry.
-    if status == crate::protocol::EFI_UNSUPPORTED {
-        print_raw(st, b"StartImage #1 returned UNSUPPORTED, retrying with patched DeviceHandle...\r\n\0");
-        let mut lip: *mut LoadedImageProtocol = core::ptr::null_mut();
-        if unsafe { (bs.handle_protocol)(child_handle, &LOADED_IMAGE_PROTOCOL_GUID, &mut lip as *mut _ as _) } == EFI_SUCCESS && !lip.is_null() {
+    // If StartImage returned UNSUPPORTED, clear the DeviceHandle and
+    // retry — some firmware/GRUB reject the synthetic DevicePath.
+    if status == crate::protocol::EFI_UNSUPPORTED && lip_patched {
+        print_raw(st, b"StartImage #1 returned UNSUPPORTED, retrying without DeviceHandle...\r\n\0");
+        let mut lip2: *mut LoadedImageProtocol = core::ptr::null_mut();
+        if unsafe { (bs.handle_protocol)(child_handle, &LOADED_IMAGE_PROTOCOL_GUID, &mut lip2 as *mut _ as _) } == EFI_SUCCESS && !lip2.is_null() {
             unsafe {
-                (*lip).device_handle = device_handle;
-                (*lip).file_path = device_path;
-                (*lip).parent_handle = image_handle;
+                (*lip2).device_handle = core::ptr::null_mut();
             }
         }
         status = unsafe { (bs.start_image)(child_handle, &mut 0u64, &mut core::ptr::null_mut::<u16>()) };
