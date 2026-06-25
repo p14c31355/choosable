@@ -33,10 +33,9 @@ macro_rules! fixup {
     };
 }
 
-fixup!(CasperFixup,         prepare_premount_initrd, true);
-fixup!(LiveBootFixup,       prepare_premount_initrd, false);
+fixup!(GenericFixup,        prepare_generic_initrd);
 fixup!(DracutFixup,         prepare_dracut_initrd);
-fixup!(AlpinePremountFixup, prepare_premount_initrd, false);
+fixup!(AlpinePremountFixup, prepare_alpine_initrd);
 fixup!(ArchFixup,           prepare_arch_initrd);
 fixup!(AlpineFixup,         prepare_alpine_initrd);
 
@@ -81,12 +80,96 @@ fn strip_leading_zeros(buf: &[u8; 21]) -> &[u8] {
 
 const CMDLINE_OFFSET_SNIPPET: &[u8] = b"\
 # Parse choosable.iso_offset= from kernel cmdline as fallback
-CMDLINE_OFFSET=\"\"
+__CO=\"\"
 for W in $(cat /proc/cmdline 2>/dev/null);do
-  case \"$W\" in choosable.iso_offset=*) CMDLINE_OFFSET=\"${W#choosable.iso_offset=}\";; esac
+  case \"$W\" in choosable.iso_offset=*) __CO=\"${W#choosable.iso_offset=}\";; esac
 done
-[ -n \"$CMDLINE_OFFSET\" ] && echo \"choosable: cmdline offset=$CMDLINE_OFFSET\" >/dev/console
+[ -n \"$__CO\" ] && echo \"choosable: cmdline offset=$__CO\" >/dev/console
 ";
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Generic /init.choosable wrapper — mounts ISO on /cdrom then execs /init.
+//  Used for Casper (Ubuntu/Mint/Pop), DebianLive, and Unknown fallback.
+//  This avoids the initramfs-tools subshell problem: casper's custom init
+//  does NOT execute /scripts/casper-premount/ hooks, so the only reliable
+//  approach is to replace /init entirely before the kernel runs it.
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn prepare_generic_initrd(
+    bs: &mut BootServices,
+    relative_sector_offset: u64,
+    iso_name: &[u8],
+) -> Option<PremountBundle> {
+    let offset_bytes = relative_sector_offset * 512;
+    let bottom_script = build_bottom_script(iso_name);
+    let bottom_len = bottom_script.iter().position(|&c| c == 0).unwrap_or(2047);
+
+    // Generic init.choosable wrapper — replaces /init entirely.
+    // Mounts the ISO at /cdrom using losetup + mount, then execs the
+    // original /init.orig (saved by the initramfs before this CPIO is
+    // unpacked on top of it).
+    // After mounting, casper's init will find /cdrom/casper/filesystem.squashfs
+    // and proceed normally.  Debian live-boot will find /cdrom/live/.
+    let mut wrapper = [0u8; 8192];
+    let wrapper_src = b"\
+#!/bin/sh
+# Choosable generic init wrapper (Casper/Live/Unknown)
+mount -t proc none /proc 2>/dev/null
+mount -t sysfs none /sys 2>/dev/null
+mount -t devtmpfs none /dev 2>/dev/null
+mkdir -p /tmp 2>/dev/null
+exec >/tmp/choosable.log 2>&1
+echo 'choosable (generic): premount starting' >/dev/console
+modprobe loop 2>/dev/null;modprobe iso9660 2>/dev/null
+modprobe exfat 2>/dev/null;modprobe ntfs3 2>/dev/null
+modprobe virtio_blk 2>/dev/null;modprobe virtio_pci 2>/dev/null
+for i in 0 1 2 3 4 5 6 7;do [ -b /dev/loop$i ]||mknod /dev/loop$i b 7 $i 2>/dev/null;done
+[ -d /cdrom ]||mkdir -p /cdrom /lib/live/mount/medium 2>/dev/null
+OFFSET_FROM_CMDLINE
+sleep 5
+N=0;while [ $N -lt 60 ];do N=$((N+1))
+while read -r a b c d;do case $d in loop*|ram*|dm-*|sr*)continue;;*[0-9]);;*)continue;;esac
+dev=/dev/$d;[ -b $dev ]||continue
+LOOP=;for i in 0 1 2 3 4 5 6 7;do L=/dev/loop$i
+losetup $L >/dev/null 2>&1&&continue
+O=OFFSET;[ -n \"$__CO\" ]&&O=\"$__CO\"
+losetup -o $O $L $dev 2>/dev/null||{ losetup -d $L 2>/dev/null;continue;}
+LOOP=$L;break;done;[ -n \"$LOOP\" ]||continue
+mount -t iso9660 -o ro $LOOP /cdrom 2>/dev/null||{ losetup -d $LOOP 2>/dev/null;continue;}
+mount --make-rshared /cdrom 2>/dev/null
+mount -o bind /cdrom /lib/live/mount/medium 2>/dev/null
+[ -d /cdrom/casper ]&&{ echo 'choosable (generic): CASPER found, exec /init.orig' >/dev/console;[ -x /init.orig ]&&exec /init.orig \"$@\";[ -x /init ]&&exec /init \"$@\";}
+[ -d /cdrom/pop-os ]&&{ echo 'choosable (generic): POP-OS found, exec /init.orig' >/dev/console;[ -x /init.orig ]&&exec /init.orig \"$@\";[ -x /init ]&&exec /init \"$@\";}
+[ -d /cdrom/live ]&&{ echo 'choosable (generic): LIVE found, exec /init.orig' >/dev/console;[ -x /init.orig ]&&exec /init.orig \"$@\";[ -x /init ]&&exec /init \"$@\";}
+[ -d /cdrom/LiveOS ]&&{ echo 'choosable (generic): LiveOS found, exec /init.orig' >/dev/console;[ -x /init.orig ]&&exec /init.orig \"$@\";[ -x /init ]&&exec /init \"$@\";}
+[ -f /cdrom/.alpine-release ]&&{ echo 'choosable (generic): Alpine found, exec /init.orig' >/dev/console;[ -x /init.orig ]&&exec /init.orig \"$@\";[ -x /init ]&&exec /init \"$@\";}
+[ -d /cdrom/arch ]&&{ echo 'choosable (generic): Arch found, exec /init.orig' >/dev/console;[ -x /init.orig ]&&exec /init.orig \"$@\";[ -x /init ]&&exec /init \"$@\";}
+umount /lib/live/mount/medium 2>/dev/null
+umount /cdrom 2>/dev/null
+losetup -d $LOOP 2>/dev/null
+done</proc/partitions
+sleep 1;done
+echo 'choosable (generic): gave up, exec /init.orig' >/dev/console
+[ -x /init.orig ]&&exec /init.orig \"$@\"
+[ -x /init ]&&exec /init \"$@\"
+exec /bin/sh
+";
+    let dec = format_decimal_u64(offset_bytes);
+    let off_slice = strip_leading_zeros(&dec);
+    // OFFSET_FROM_CMDLINE MUST be substituted BEFORE OFFSET.
+    let mut tmp = [0u8; 8192];
+    let tmp_len = subst_template(&mut tmp, wrapper_src, b"OFFSET_FROM_CMDLINE", CMDLINE_OFFSET_SNIPPET, 8191);
+    let wrapper_len = subst_template(&mut wrapper, &tmp[..tmp_len], b"OFFSET", off_slice, 8191);
+
+    // Place /init.choosable at the top of the CPIO. The kernel's initramfs
+    // loader processes CPIO archives in order: if /init exists in this CPIO
+    // and /init.orig is backed up by the real initramfs, the kernel will
+    // run our /init.choosable first (via init= kernel param) or our copy
+    // of /init will shadow the real one.
+    let names: &[&[u8]] = &[b"init.choosable"];
+    let data: &[&[u8]] = &[&wrapper[..wrapper_len]];
+    build_cpio(bs, names, data, offset_bytes)
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Arch-specific premount initrd builder
@@ -125,7 +208,7 @@ while read -r a b c d;do case $d in loop*|ram*|dm-*|sr*)continue;;*[0-9]);;*)con
 dev=/dev/$d;[ -b $dev ]||continue
 LOOP=;for i in 0 1 2 3 4 5 6 7;do L=/dev/loop$i
 losetup $L >/dev/null 2>&1&&continue
-O=OFFSET;[ -n \"$CMDLINE_OFFSET\" ]&&O=\"$CMDLINE_OFFSET\"
+O=OFFSET;[ -n \"$__CO\" ]&&O=\"$__CO\"
 losetup -o $O $L $dev 2>/dev/null||{ losetup -d $L 2>/dev/null;continue;}
 LOOP=$L;break;done;[ -n \"$LOOP\" ]||continue
 mount -t iso9660 -o ro $LOOP /cdrom 2>/dev/null||{ losetup -d $LOOP 2>/dev/null;continue;}
@@ -232,7 +315,7 @@ while read -r a b c d;do case $d in loop*|ram*|dm-*|sr*)continue;;*[0-9]);;*)con
 dev=/dev/$d;[ -b $dev ]||continue
 LOOP=;for i in 0 1 2 3 4 5 6 7;do L=/dev/loop$i
 losetup $L >/dev/null 2>&1&&continue
-O=OFFSET;[ -n \"$CMDLINE_OFFSET\" ]&&O=\"$CMDLINE_OFFSET\"
+O=OFFSET;[ -n \"$__CO\" ]&&O=\"$__CO\"
 losetup -o $O $L $dev 2>/dev/null||{ losetup -d $L 2>/dev/null;continue;}
 LOOP=$L;break;done;[ -n \"$LOOP\" ]||continue
 mount -t iso9660 -o ro $LOOP /cdrom 2>/dev/null||{ losetup -d $LOOP 2>/dev/null;continue;}
@@ -366,7 +449,7 @@ while read -r a b c d;do case $d in loop*|ram*|dm-*|sr*)continue;;*[0-9]);;*)con
 dev=/dev/$d;[ -b $dev ]||continue
 LOOP=;for i in 0 1 2 3 4 5 6 7;do L=/dev/loop$i
 losetup $L >/dev/null 2>&1&&continue
-O=OFFSET;[ -n \"$CMDLINE_OFFSET\" ]&&O=\"$CMDLINE_OFFSET\"
+O=OFFSET;[ -n \"$__CO\" ]&&O=\"$__CO\"
 losetup -o $O $L $dev 2>/dev/null||{ losetup -d $L 2>/dev/null;continue;}
 LOOP=$L;break;done;[ -n \"$LOOP\" ]||continue
 mount -t iso9660 -o ro $LOOP /cdrom 2>/dev/null||{ losetup -d $LOOP 2>/dev/null;continue;}

@@ -20,19 +20,20 @@
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FixupType {
-    /// initramfs-tools casper-premount hooks (Ubuntu, Mint, Pop)
-    Casper,
-    /// initramfs-tools live-premount hooks (Debian Live)
-    LiveBoot,
+    /// Generic /init.choosable wrapper — mounts ISO on /cdrom then execs real /init.
+    /// Used for Casper (Ubuntu, Mint, Pop), LiveBoot (Debian), and Unknown fallback.
+    /// initramfs-tools hook directories are unreliable because casper uses a custom
+    /// init that doesn't execute /scripts/casper-premount/.
+    Generic,
     /// dracut premount hook (Fedora, RHEL, CentOS)
     Dracut,
     /// archiso copytoram hook (Arch Linux)
     Arch,
     /// No initrd fixup needed (Windows PE)
     WindowsPE,
-    /// Custom /init.choosable (Alpine Linux — legacy path)
+    /// Custom /init.choosable (Alpine Linux — lightweight, no initramfs-tools)
     Alpine,
-    /// Alpine using casper-style premount hook (unified path)
+    /// Alpine using generic premount (unified path)
     AlpinePremount,
 }
 
@@ -79,13 +80,13 @@ impl BootKind {
         match self {
             BootKind::Casper => {
                 if is_popos {
-                    b" boot=casper casper_path=pop-os maybe-ubiquity"
+                    b" init=/init.choosable boot=casper casper_path=pop-os maybe-ubiquity"
                 } else {
-                    b" boot=casper maybe-ubiquity"
+                    b" init=/init.choosable boot=casper maybe-ubiquity"
                 }
             }
             BootKind::DebianLive => {
-                b" boot=live live-media=removable"
+                b" init=/init.choosable boot=live live-media=removable"
             }
             BootKind::FedoraLive => {
                 b" init=/init.choosable rd.live.image rootdelay=10"
@@ -100,7 +101,7 @@ impl BootKind {
                 b" init=/init.choosable modules=loop,iso9660"
             }
             BootKind::WindowsPE => b"",
-            BootKind::Unknown => b" boot=casper maybe-ubiquity",
+            BootKind::Unknown => b" init=/init.choosable boot=casper maybe-ubiquity",
         }
     }
 
@@ -168,14 +169,14 @@ impl BootKind {
     /// `EarlyBootFixup` implementation.
     pub fn fixup_type(&self) -> FixupType {
         match self {
-            BootKind::Casper => FixupType::Casper,
-            BootKind::DebianLive => FixupType::LiveBoot,
+            BootKind::Casper => FixupType::Generic,
+            BootKind::DebianLive => FixupType::Generic,
             BootKind::FedoraLive => FixupType::Dracut,
             BootKind::ArchIso => FixupType::Arch,
             BootKind::Alpine => FixupType::Alpine,
             BootKind::AlpinePremount => FixupType::Alpine,
             BootKind::WindowsPE => FixupType::WindowsPE,
-            BootKind::Unknown => FixupType::Casper,
+            BootKind::Unknown => FixupType::Generic,
         }
     }
 }
@@ -246,8 +247,8 @@ mod tests {
 
     #[test]
     fn test_boot_kind_linux_extra_values() {
-        assert_eq!(BootKind::Casper.linux_extra(false), b" boot=casper maybe-ubiquity");
-        assert_eq!(BootKind::Casper.linux_extra(true), b" boot=casper casper_path=pop-os maybe-ubiquity");
+        assert_eq!(BootKind::Casper.linux_extra(false), b" init=/init.choosable boot=casper maybe-ubiquity");
+        assert_eq!(BootKind::Casper.linux_extra(true), b" init=/init.choosable boot=casper casper_path=pop-os maybe-ubiquity");
         assert_eq!(BootKind::WindowsPE.linux_extra(false), b"");
         assert_eq!(BootKind::DebianLive.linux_eol_extra(), b" findiso=");
         assert!(!BootKind::Casper.linux_eol_extra().is_empty());

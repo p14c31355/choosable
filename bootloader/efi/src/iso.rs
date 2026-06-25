@@ -266,12 +266,34 @@ fn find_first_file_in_dir(
                 }
                 // Also skip kernel/initrd payloads used by GRUB —
                 // these filename patterns match known distro conventions.
+                // ISO9660 entries may have trailing dots after version-suffix
+                // stripping (e.g. raw "MACH_KERNEL.;1" → eff_len=12, name="MACH_KERNEL.").
+                // Strip trailing dot(s) for comparison.
+                let eff_name = &upper[..cl];
+                let kernel_compare_len = if cl > 0 && upper[cl-1] == b'.' { cl - 1 } else { cl };
                 let is_kernel_like =
-                    &upper[..cl] == b"MACH_KERNEL"
-                    || &upper[..cl] == b"VMLINUZ"
-                    || &upper[..cl] == b"VMLINUX"
-                    || (cl >= 6 && &upper[..6] == b"VMLINU" && (upper[6] == b'Z' || upper[6] == b'X' || (upper[6] >= b'0' && upper[6] <= b'9')));
+                    kernel_compare_len >= 1 && (
+                        (kernel_compare_len == 11 && &upper[..kernel_compare_len] == b"MACH_KERNEL")
+                        || &upper[..kernel_compare_len] == b"VMLINUZ"
+                        || &upper[..kernel_compare_len] == b"VMLINUX"
+                        || (kernel_compare_len >= 6 && &upper[..6] == b"VMLINU"
+                            && (upper[6] == b'Z' || upper[6] == b'X'
+                                || (upper[6] >= b'0' && upper[6] <= b'9')))
+                    );
                 if is_kernel_like {
+                    offset += record_len;
+                    continue;
+                }
+                // Also skip known initrd payload names.
+                let is_initrd_like =
+                    kernel_compare_len >= 4 && (
+                        &upper[..kernel_compare_len] == b"INITRD"
+                        || &upper[..kernel_compare_len] == b"INITRD.IMG"
+                        || &upper[..kernel_compare_len] == b"INITRAMFS.IMG"
+                        || (kernel_compare_len >= 6 && &upper[..6] == b"INITRD"
+                            && (upper[6] == b'.' || upper[6] == b'-'))
+                    );
+                if is_initrd_like {
                     offset += record_len;
                     continue;
                 }
@@ -477,17 +499,17 @@ fn find_efi_boot(
     }
     let (boot_lba, boot_size) = boot_dir?;
 
-    // Arch Linux uses systemd-boot which often loads \shellx64.efi or
-    // \EFI\systemd\systemd-bootx64.efi from the ESP.  When loaded via
-    // LoadImage with our virtual CD-ROM handle, systemd-boot will use
-    // the SimpleFileSystem protocol on that handle to find its files.
+    // Prefer GRUB/shim over systemd-boot shell.  SHELL*.EFI are last
+    // because loading them produces an interactive EFI shell instead of
+    // booting the OS.  systemd-boot (Arch) is loaded via BOOTX64.EFI.
     let efi_names: &[&[u8]] = &[
-        b"BOOTX64.EFI",
-        b"BOOTIA32.EFI",
         b"GRUBX64.EFI",
         b"SHIMX64.EFI",
+        b"BOOTX64.EFI",
+        b"BOOTIA32.EFI",
         b"SYSTEMD-BOOTX64.EFI",
         b"SYSTEMD-BOOTIA32.EFI",
+        // SHELL*.EFI are fallbacks only — they start an EFI shell, not an OS.
         b"SHELLX64.EFI",
         b"SHELLIA32.EFI",
     ];
@@ -1215,13 +1237,15 @@ fn uefi_chainload_iso(
             crate::boot_kind::FixupType::Alpine =>
                 crate::premount::prepare_alpine_initrd(bs, iso_lba - part1_lba, iso_name),
             crate::boot_kind::FixupType::AlpinePremount =>
-                crate::premount::prepare_premount_initrd(bs, iso_lba - part1_lba, false, iso_name),
+                crate::premount::prepare_alpine_initrd(bs, iso_lba - part1_lba, iso_name),
+            crate::boot_kind::FixupType::Generic =>
+                crate::premount::prepare_generic_initrd(bs, iso_lba - part1_lba, iso_name),
             crate::boot_kind::FixupType::Arch =>
                 crate::premount::prepare_arch_initrd(bs, iso_lba - part1_lba, iso_name),
-        crate::boot_kind::FixupType::Dracut =>
-            crate::premount::prepare_dracut_initrd(bs, iso_lba - part1_lba, iso_name),
-        crate::boot_kind::FixupType::WindowsPE => None,
-        _ => {
+            crate::boot_kind::FixupType::Dracut =>
+                crate::premount::prepare_dracut_initrd(bs, iso_lba - part1_lba, iso_name),
+            crate::boot_kind::FixupType::WindowsPE => None,
+            _ => {
                 let needs_sr = boot_kind.needs_sr_mod();
                 crate::premount::prepare_premount_initrd(bs, iso_lba - part1_lba, needs_sr, iso_name)
             }
