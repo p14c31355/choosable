@@ -35,7 +35,7 @@ macro_rules! fixup {
 
 fixup!(CasperFixup,         prepare_premount_initrd, true);
 fixup!(LiveBootFixup,       prepare_premount_initrd, false);
-fixup!(DracutFixup,         prepare_premount_initrd, false);
+fixup!(DracutFixup,         prepare_dracut_initrd);
 fixup!(AlpinePremountFixup, prepare_premount_initrd, false);
 fixup!(ArchFixup,           prepare_arch_initrd);
 fixup!(AlpineFixup,         prepare_alpine_initrd);
@@ -75,6 +75,20 @@ fn strip_leading_zeros(buf: &[u8; 21]) -> &[u8] {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  Cmdline offset snippet — injected into premount wrappers so they can
+//  read choosable.iso_offset= from /proc/cmdline as a fallback.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const CMDLINE_OFFSET_SNIPPET: &[u8] = b"\
+# Parse choosable.iso_offset= from kernel cmdline as fallback
+CMDLINE_OFFSET=\"\"
+for W in $(cat /proc/cmdline 2>/dev/null);do
+  case \"$W\" in choosable.iso_offset=*) CMDLINE_OFFSET=\"${W#choosable.iso_offset=}\";; esac
+done
+[ -n \"$CMDLINE_OFFSET\" ] && echo \"choosable: cmdline offset=$CMDLINE_OFFSET\" >/dev/console
+";
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  Arch-specific premount initrd builder
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -91,6 +105,7 @@ pub fn prepare_arch_initrd(
     let bottom_len = bottom_script.iter().position(|&c| c == 0).unwrap_or(2047);
 
     // Arch /init wrapper — exec's /init.orig after premount
+    // Uses cmdline offset as fallback when compiled-in OFFSET doesn't work.
     let mut wrapper = [0u8; 8192];
     let wrapper_src = b"\
 #!/bin/sh
@@ -103,13 +118,15 @@ modprobe exfat 2>/dev/null;modprobe ntfs3 2>/dev/null
 modprobe virtio_blk 2>/dev/null;modprobe virtio_pci 2>/dev/null
 for i in 0 1 2 3 4 5 6 7;do [ -b /dev/loop$i ]||mknod /dev/loop$i b 7 $i 2>/dev/null;done
 [ -d /cdrom ]||mkdir -p /cdrom /run/archiso/bootmnt 2>/dev/null
+OFFSET_FROM_CMDLINE
 sleep 5
 N=0;while [ $N -lt 30 ];do N=$((N+1))
 while read -r a b c d;do case $d in loop*|ram*|dm-*|sr*)continue;;*[0-9]);;*)continue;;esac
 dev=/dev/$d;[ -b $dev ]||continue
 LOOP=;for i in 0 1 2 3 4 5 6 7;do L=/dev/loop$i
 losetup $L >/dev/null 2>&1&&continue
-losetup -o OFFSET $L $dev 2>/dev/null||{ losetup -d $L 2>/dev/null;continue;}
+O=OFFSET;[ -n \"$CMDLINE_OFFSET\" ]&&O=\"$CMDLINE_OFFSET\"
+losetup -o $O $L $dev 2>/dev/null||{ losetup -d $L 2>/dev/null;continue;}
 LOOP=$L;break;done;[ -n \"$LOOP\" ]||continue
 mount -t iso9660 -o ro $LOOP /cdrom 2>/dev/null||{ losetup -d $LOOP 2>/dev/null;continue;}
 [ -d /cdrom/arch ]&&{ mkdir -p /run/archiso/bootmnt 2>/dev/null;mount -o bind /cdrom /run/archiso/bootmnt 2>/dev/null;break 2;}
@@ -124,7 +141,11 @@ exec /bin/sh
 ";
     let dec = format_decimal_u64(offset_bytes);
     let off_slice = strip_leading_zeros(&dec);
-    let wrapper_len = subst_template(&mut wrapper, wrapper_src, b"OFFSET", off_slice, 8191);
+    // Substitute OFFSET first
+    let mut tmp = [0u8; 8192];
+    let tmp_len = subst_template(&mut tmp, wrapper_src, b"OFFSET", off_slice, 8191);
+    // Then substitute OFFSET_FROM_CMDLINE with cmdline parsing snippet
+    let wrapper_len = subst_template(&mut wrapper, &tmp[..tmp_len], b"OFFSET_FROM_CMDLINE", CMDLINE_OFFSET_SNIPPET, 8191);
 
     let names: &[&[u8]] = &[b"init", b"hooks/choosable", b"scripts/casper-premount/00choosable", b"scripts/casper-bottom/00choosable"];
     let data: &[&[u8]] = &[&wrapper[..wrapper_len], &premount_script[..premount_len], &premount_script[..premount_len], &bottom_script[..bottom_len]];
@@ -174,6 +195,107 @@ exec /init \"$@\"
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  Dracut (Fedora/RHEL) premount initrd builder — creates /init.choosable
+//  wrapper because dracut does not process initramfs-tools hook directories.
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn prepare_dracut_initrd(
+    bs: &mut BootServices,
+    relative_sector_offset: u64,
+    iso_name: &[u8],
+) -> Option<PremountBundle> {
+    let offset_bytes = relative_sector_offset * 512;
+    let premount_script = build_premount_script(offset_bytes, false);
+    let premount_len = premount_script.iter().position(|&c| c == 0).unwrap_or(8191);
+
+    let bottom_script = build_bottom_script(iso_name);
+    let bottom_len = bottom_script.iter().position(|&c| c == 0).unwrap_or(2047);
+
+    // Dracut init wrapper — mounts ISO then execs /init.orig (original dracut init)
+    // Uses cmdline offset as fallback when compiled-in OFFSET doesn't work.
+    let mut wrapper = [0u8; 8192];
+    let wrapper_src = b"\
+#!/bin/sh
+# Choosable Dracut/Fedora init wrapper
+mkdir -p /tmp 2>/dev/null
+exec >/tmp/choosable.log 2>&1
+echo 'choosable (dracut): premount starting' >/dev/console
+modprobe loop 2>/dev/null;modprobe iso9660 2>/dev/null
+modprobe exfat 2>/dev/null;modprobe ntfs3 2>/dev/null
+modprobe virtio_blk 2>/dev/null;modprobe virtio_pci 2>/dev/null
+for i in 0 1 2 3 4 5 6 7;do [ -b /dev/loop$i ]||mknod /dev/loop$i b 7 $i 2>/dev/null;done
+[ -d /run/initramfs/live ]||mkdir -p /run/initramfs/live /cdrom 2>/dev/null
+OFFSET_FROM_CMDLINE
+N=0;while [ $N -lt 60 ];do N=$((N+1))
+while read -r a b c d;do case $d in loop*|ram*|dm-*|sr*)continue;;*[0-9]);;*)continue;;esac
+dev=/dev/$d;[ -b $dev ]||continue
+LOOP=;for i in 0 1 2 3 4 5 6 7;do L=/dev/loop$i
+losetup $L >/dev/null 2>&1&&continue
+O=OFFSET;[ -n \"$CMDLINE_OFFSET\" ]&&O=\"$CMDLINE_OFFSET\"
+losetup -o $O $L $dev 2>/dev/null||{ losetup -d $L 2>/dev/null;continue;}
+LOOP=$L;break;done;[ -n \"$LOOP\" ]||continue
+mount -t iso9660 -o ro $LOOP /cdrom 2>/dev/null||{ losetup -d $LOOP 2>/dev/null;continue;}
+mount --make-rshared /cdrom 2>/dev/null
+if [ -f /cdrom/LiveOS/squashfs.img ];then
+    mkdir -p /run/initramfs/live 2>/dev/null
+    ln -sf /cdrom/LiveOS /run/initramfs/live/LiveOS 2>/dev/null
+    echo 'choosable (dracut): ISO mounted (LiveOS), exec /init.orig' >/dev/console
+    [ -x /init.orig ]&&exec /init.orig \"$@\"
+    [ -x /init ]&&exec /init \"$@\"
+    break 2
+fi
+[ -f /cdrom/.disk/info ]&&{
+    mkdir -p /run/initramfs/live 2>/dev/null
+    ln -sf /cdrom /run/initramfs/live/LiveOS 2>/dev/null
+    echo 'choosable (dracut): ISO mounted (Fedora), exec /init.orig' >/dev/console
+    [ -x /init.orig ]&&exec /init.orig \"$@\"
+    [ -x /init ]&&exec /init \"$@\"
+    break 2
+}
+umount /cdrom 2>/dev/null;losetup -d $LOOP 2>/dev/null
+done</proc/partitions
+sleep 1;done
+echo 'choosable (dracut): gave up, exec /init.orig' >/dev/console
+[ -x /init.orig ]&&exec /init.orig \"$@\"
+[ -x /init ]&&exec /init \"$@\"
+exec /bin/sh
+";
+    let dec = format_decimal_u64(offset_bytes);
+    let off_slice = strip_leading_zeros(&dec);
+    // Substitute OFFSET first
+    let mut tmp = [0u8; 8192];
+    let tmp_len = subst_template(&mut tmp, wrapper_src, b"OFFSET", off_slice, 8191);
+    // Then substitute OFFSET_FROM_CMDLINE with cmdline parsing snippet
+    let wrapper_len = subst_template(&mut wrapper, &tmp[..tmp_len], b"OFFSET_FROM_CMDLINE", CMDLINE_OFFSET_SNIPPET, 8191);
+
+    // Inject into multiple hook paths:
+    //   - /init.choosable (picked up when init= kernel param is not set but initramfs has it)
+    //   - dracut native hooks
+    //   - initramfs-tools fallback hooks (some Fedora derivatives use these)
+    let names: &[&[u8]] = &[
+        b"init.choosable",
+        b"lib/dracut/hooks/pre-mount/00choosable.sh",
+        b"lib/dracut/hooks/pre-trigger/00choosable.sh",
+        b"scripts/init-premount/00choosable",
+        b"scripts/live/00choosable",
+        b"scripts/live-premount/00choosable",
+        b"scripts/casper-premount/00choosable",
+        b"scripts/casper-bottom/00choosable",
+    ];
+    let data: &[&[u8]] = &[
+        &wrapper[..wrapper_len],
+        &premount_script[..premount_len],
+        &premount_script[..premount_len],
+        &premount_script[..premount_len],
+        &premount_script[..premount_len],
+        &premount_script[..premount_len],
+        &premount_script[..premount_len],
+        &bottom_script[..bottom_len],
+    ];
+    build_cpio(bs, names, data, offset_bytes)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  Pure functions (testable)
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -219,6 +341,12 @@ fn build_premount_script(offset_bytes: u64, needs_sr_mod: bool) -> [u8; 8192] {
     let dec = format_decimal_u64(offset_bytes);
     let off_slice = strip_leading_zeros(&dec);
 
+    // The premount script now:
+    //   1. Parses choosable.iso_offset= from /proc/cmdline as CMDLINE_OFFSET
+    //   2. Falls back to compiled-in OFFSET if no cmdline override
+    // This is critical for Ubuntu/Pop!_OS where the initramfs-tools hook
+    // runs in early userspace and the compiled-in offset may not match
+    // if the partition table was remapped by the kernel.
     let src = b"\
 #!/bin/sh
 mkdir -p /tmp 2>/dev/null
@@ -230,13 +358,15 @@ modprobe virtio_blk 2>/dev/null;modprobe virtio_pci 2>/dev/null
 SRMOD
 for i in 0 1 2 3 4 5 6 7;do [ -b /dev/loop$i ]||mknod /dev/loop$i b 7 $i 2>/dev/null;done
 [ -d /cdrom ]||mkdir -p /cdrom /lib/live/mount/medium 2>/dev/null
+OFFSET_FROM_CMDLINE
 sleep 5
 N=0;while [ $N -lt 60 ];do N=$((N+1))
 while read -r a b c d;do case $d in loop*|ram*|dm-*|sr*)continue;;*[0-9]);;*)continue;;esac
 dev=/dev/$d;[ -b $dev ]||continue
 LOOP=;for i in 0 1 2 3 4 5 6 7;do L=/dev/loop$i
 losetup $L >/dev/null 2>&1&&continue
-losetup -o OFFSET $L $dev 2>/dev/null||{ losetup -d $L 2>/dev/null;continue;}
+O=OFFSET;[ -n \"$CMDLINE_OFFSET\" ]&&O=\"$CMDLINE_OFFSET\"
+losetup -o $O $L $dev 2>/dev/null||{ losetup -d $L 2>/dev/null;continue;}
 LOOP=$L;break;done;[ -n \"$LOOP\" ]||continue
 mount -t iso9660 -o ro $LOOP /cdrom 2>/dev/null||{ losetup -d $LOOP 2>/dev/null;continue;}
 mount --make-rshared /cdrom 2>/dev/null
@@ -275,6 +405,10 @@ return 0
             let max = off_slice.len().min(8191 - pos);
             script[pos..pos + max].copy_from_slice(&off_slice[..max]);
             pos += max; i += 6;
+        } else if i + 21 <= src.len() && &src[i..i+21] == b"OFFSET_FROM_CMDLINE" {
+            let max = CMDLINE_OFFSET_SNIPPET.len().min(8191 - pos);
+            script[pos..pos + max].copy_from_slice(&CMDLINE_OFFSET_SNIPPET[..max]);
+            pos += max; i += 21;
         } else {
             if pos < 8191 { script[pos] = src[i]; pos += 1; }
             i += 1;

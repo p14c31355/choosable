@@ -448,7 +448,20 @@ fn find_efi_boot(
     }
     let (boot_lba, boot_size) = boot_dir?;
 
-    let efi_names: &[&[u8]] = &[b"BOOTX64.EFI", b"BOOTIA32.EFI", b"GRUBX64.EFI", b"SHIMX64.EFI"];
+    // Arch Linux uses systemd-boot which often loads \shellx64.efi or
+    // \EFI\systemd\systemd-bootx64.efi from the ESP.  When loaded via
+    // LoadImage with our virtual CD-ROM handle, systemd-boot will use
+    // the SimpleFileSystem protocol on that handle to find its files.
+    let efi_names: &[&[u8]] = &[
+        b"BOOTX64.EFI",
+        b"BOOTIA32.EFI",
+        b"GRUBX64.EFI",
+        b"SHIMX64.EFI",
+        b"SYSTEMD-BOOTX64.EFI",
+        b"SYSTEMD-BOOTIA32.EFI",
+        b"SHELLX64.EFI",
+        b"SHELLIA32.EFI",
+    ];
     for &name in efi_names {
         if let Some(v) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, boot_lba, boot_size, name, &mut scratch) {
             return Some((v.0, v.1, name));
@@ -1176,8 +1189,10 @@ fn uefi_chainload_iso(
                 crate::premount::prepare_premount_initrd(bs, iso_lba - part1_lba, false, iso_name),
             crate::boot_kind::FixupType::Arch =>
                 crate::premount::prepare_arch_initrd(bs, iso_lba - part1_lba, iso_name),
-            crate::boot_kind::FixupType::WindowsPE => None,
-            _ => {
+        crate::boot_kind::FixupType::Dracut =>
+            crate::premount::prepare_dracut_initrd(bs, iso_lba - part1_lba, iso_name),
+        crate::boot_kind::FixupType::WindowsPE => None,
+        _ => {
                 let needs_sr = boot_kind.needs_sr_mod();
                 crate::premount::prepare_premount_initrd(bs, iso_lba - part1_lba, needs_sr, iso_name)
             }

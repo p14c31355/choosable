@@ -97,7 +97,7 @@ impl BootKind {
                 b" init=/init.choosable modules=loop,iso9660"
             }
             BootKind::AlpinePremount => {
-                b" modules=loop,iso9660 alpine_dev=usbdisk:vfat"
+                b" init=/init.choosable modules=loop,iso9660"
             }
             BootKind::WindowsPE => b"",
             BootKind::Unknown => b" boot=casper maybe-ubiquity",
@@ -136,10 +136,16 @@ impl BootKind {
                 casper_premount: true,
                 casper_bottom: true,
             },
-            BootKind::ArchIso | BootKind::AlpinePremount => HookTargetSet {
+            BootKind::ArchIso => HookTargetSet {
                 live: false,
                 live_premount: false,
                 casper_premount: true,
+                casper_bottom: false,
+            },
+            BootKind::AlpinePremount => HookTargetSet {
+                live: false,
+                live_premount: false,
+                casper_premount: false,
                 casper_bottom: false,
             },
             BootKind::Alpine | BootKind::WindowsPE | BootKind::Unknown => {
@@ -167,7 +173,7 @@ impl BootKind {
             BootKind::FedoraLive => FixupType::Dracut,
             BootKind::ArchIso => FixupType::Arch,
             BootKind::Alpine => FixupType::Alpine,
-            BootKind::AlpinePremount => FixupType::AlpinePremount,
+            BootKind::AlpinePremount => FixupType::Alpine,
             BootKind::WindowsPE => FixupType::WindowsPE,
             BootKind::Unknown => FixupType::Casper,
         }
