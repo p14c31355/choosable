@@ -1231,24 +1231,17 @@ fn uefi_chainload_iso(
     let boot_kind = boot_desc.as_ref().map_or(crate::boot_kind::BootKind::Unknown, |d| d.boot_kind);
 
     // ── Build premount cpio (fixup type depends on boot_kind) ────────
+    // Only Alpine needs premount CPIO — it injects /init.choosable.
+    // Other distros use native ISO discovery: iso-scan/filename= (Casper),
+    // findiso= (DebianLive), root=live:CDLABEL= (Fedora),
+    // archisodevice=LABEL= (Arch).  No premount CPIO needed.
     let premount_bundle = {
         let fixup = boot_kind.fixup_type();
         match fixup {
-            crate::boot_kind::FixupType::Alpine =>
+            crate::boot_kind::FixupType::Alpine
+            | crate::boot_kind::FixupType::AlpinePremount =>
                 crate::premount::prepare_alpine_initrd(bs, iso_lba - part1_lba, iso_name),
-            crate::boot_kind::FixupType::AlpinePremount =>
-                crate::premount::prepare_alpine_initrd(bs, iso_lba - part1_lba, iso_name),
-            crate::boot_kind::FixupType::Generic =>
-                crate::premount::prepare_generic_initrd(bs, iso_lba - part1_lba, iso_name),
-            crate::boot_kind::FixupType::Arch =>
-                crate::premount::prepare_arch_initrd(bs, iso_lba - part1_lba, iso_name),
-            crate::boot_kind::FixupType::Dracut =>
-                crate::premount::prepare_dracut_initrd(bs, iso_lba - part1_lba, iso_name),
-            crate::boot_kind::FixupType::WindowsPE => None,
-            _ => {
-                let needs_sr = boot_kind.needs_sr_mod();
-                crate::premount::prepare_premount_initrd(bs, iso_lba - part1_lba, needs_sr, iso_name)
-            }
+            _ => None,
         }
     };
     if premount_bundle.is_none() {

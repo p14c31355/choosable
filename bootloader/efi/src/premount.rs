@@ -101,15 +101,16 @@ pub fn prepare_generic_initrd(
     iso_name: &[u8],
 ) -> Option<PremountBundle> {
     let offset_bytes = relative_sector_offset * 512;
-    let bottom_script = build_bottom_script(iso_name);
-    let bottom_len = bottom_script.iter().position(|&c| c == 0).unwrap_or(2047);
 
-    // Generic init.choosable wrapper — replaces /init entirely.
-    // Mounts the ISO at /cdrom using losetup + mount, then execs the
-    // original /init.orig (saved by the initramfs before this CPIO is
-    // unpacked on top of it).
-    // After mounting, casper's init will find /cdrom/casper/filesystem.squashfs
-    // and proceed normally.  Debian live-boot will find /cdrom/live/.
+    // Generic init wrapper — replaces /init entirely.
+    // The kernel runs /init by default; by placing our script at /init
+    // in this CPIO (which is concatenated AFTER the original initrd by
+    // GRUB), our /init shadows casper's /init.  We mount the ISO at
+    // /cdrom, then exec the backup /init.real (which we saved from the
+    // original /init before it was overwritten).
+    //
+    // CRITICAL: do NOT redirect stdout/stderr early — the rootfs may
+    // not be writable yet.  Write only to /dev/console.
     let mut wrapper = [0u8; 8192];
     let wrapper_src = b"\
 #!/bin/sh
@@ -118,15 +119,14 @@ mount -t proc none /proc 2>/dev/null
 mount -t sysfs none /sys 2>/dev/null
 mount -t devtmpfs none /dev 2>/dev/null
 mkdir -p /tmp 2>/dev/null
-exec >/tmp/choosable.log 2>&1
-echo 'choosable (generic): premount starting' >/dev/console
 modprobe loop 2>/dev/null;modprobe iso9660 2>/dev/null
 modprobe exfat 2>/dev/null;modprobe ntfs3 2>/dev/null
 modprobe virtio_blk 2>/dev/null;modprobe virtio_pci 2>/dev/null
 for i in 0 1 2 3 4 5 6 7;do [ -b /dev/loop$i ]||mknod /dev/loop$i b 7 $i 2>/dev/null;done
 [ -d /cdrom ]||mkdir -p /cdrom /lib/live/mount/medium 2>/dev/null
 OFFSET_FROM_CMDLINE
-sleep 5
+echo 'choosable (generic): offset=' >/dev/console
+echo OFFSET >/dev/console
 N=0;while [ $N -lt 60 ];do N=$((N+1))
 while read -r a b c d;do case $d in loop*|ram*|dm-*|sr*)continue;;*[0-9]);;*)continue;;esac
 dev=/dev/$d;[ -b $dev ]||continue
@@ -138,20 +138,50 @@ LOOP=$L;break;done;[ -n \"$LOOP\" ]||continue
 mount -t iso9660 -o ro $LOOP /cdrom 2>/dev/null||{ losetup -d $LOOP 2>/dev/null;continue;}
 mount --make-rshared /cdrom 2>/dev/null
 mount -o bind /cdrom /lib/live/mount/medium 2>/dev/null
-[ -d /cdrom/casper ]&&{ echo 'choosable (generic): CASPER found, exec /init.orig' >/dev/console;[ -x /init.orig ]&&exec /init.orig \"$@\";[ -x /init ]&&exec /init \"$@\";}
-[ -d /cdrom/pop-os ]&&{ echo 'choosable (generic): POP-OS found, exec /init.orig' >/dev/console;[ -x /init.orig ]&&exec /init.orig \"$@\";[ -x /init ]&&exec /init \"$@\";}
-[ -d /cdrom/live ]&&{ echo 'choosable (generic): LIVE found, exec /init.orig' >/dev/console;[ -x /init.orig ]&&exec /init.orig \"$@\";[ -x /init ]&&exec /init \"$@\";}
-[ -d /cdrom/LiveOS ]&&{ echo 'choosable (generic): LiveOS found, exec /init.orig' >/dev/console;[ -x /init.orig ]&&exec /init.orig \"$@\";[ -x /init ]&&exec /init \"$@\";}
-[ -f /cdrom/.alpine-release ]&&{ echo 'choosable (generic): Alpine found, exec /init.orig' >/dev/console;[ -x /init.orig ]&&exec /init.orig \"$@\";[ -x /init ]&&exec /init \"$@\";}
-[ -d /cdrom/arch ]&&{ echo 'choosable (generic): Arch found, exec /init.orig' >/dev/console;[ -x /init.orig ]&&exec /init.orig \"$@\";[ -x /init ]&&exec /init \"$@\";}
+if [ -d /cdrom/casper ]||[ -d /cdrom/pop-os ];then
+echo 'choosable (generic): CASPER/POP found' >/dev/console
+[ -x /init.real ]&&exec /init.real \"$@\"
+[ -x /init.orig ]&&exec /init.orig \"$@\"
+exec /bin/sh
+fi
+if [ -d /cdrom/live ];then
+echo 'choosable (generic): LIVE found' >/dev/console
+[ -x /init.real ]&&exec /init.real \"$@\"
+[ -x /init.orig ]&&exec /init.orig \"$@\"
+exec /bin/sh
+fi
+if [ -d /cdrom/LiveOS ];then
+echo 'choosable (generic): LiveOS found' >/dev/console
+[ -x /init.real ]&&exec /init.real \"$@\"
+[ -x /init.orig ]&&exec /init.orig \"$@\"
+exec /bin/sh
+fi
+if [ -f /cdrom/.alpine-release ]||[ -f /cdrom/.ALPINE_RELEASE ];then
+echo 'choosable (generic): Alpine found' >/dev/console
+[ -x /init.real ]&&exec /init.real \"$@\"
+[ -x /init.orig ]&&exec /init.orig \"$@\"
+exec /bin/sh
+fi
+if [ -d /cdrom/arch ];then
+echo 'choosable (generic): Arch found' >/dev/console
+mkdir -p /run/archiso/bootmnt 2>/dev/null
+mount -o bind /cdrom /run/archiso/bootmnt 2>/dev/null
+[ -x /init.real ]&&exec /init.real \"$@\"
+[ -x /init.orig ]&&exec /init.orig \"$@\"
+exec /bin/sh
+fi
+echo 'choosable (generic): no distro marker, mount anyway' >/dev/console
+[ -x /init.real ]&&exec /init.real \"$@\"
+[ -x /init.orig ]&&exec /init.orig \"$@\"
+exec /bin/sh
 umount /lib/live/mount/medium 2>/dev/null
 umount /cdrom 2>/dev/null
 losetup -d $LOOP 2>/dev/null
 done</proc/partitions
 sleep 1;done
-echo 'choosable (generic): gave up, exec /init.orig' >/dev/console
+echo 'choosable (generic): gave up' >/dev/console
+[ -x /init.real ]&&exec /init.real \"$@\"
 [ -x /init.orig ]&&exec /init.orig \"$@\"
-[ -x /init ]&&exec /init \"$@\"
 exec /bin/sh
 ";
     let dec = format_decimal_u64(offset_bytes);
@@ -161,12 +191,10 @@ exec /bin/sh
     let tmp_len = subst_template(&mut tmp, wrapper_src, b"OFFSET_FROM_CMDLINE", CMDLINE_OFFSET_SNIPPET, 8191);
     let wrapper_len = subst_template(&mut wrapper, &tmp[..tmp_len], b"OFFSET", off_slice, 8191);
 
-    // Place /init.choosable at the top of the CPIO. The kernel's initramfs
-    // loader processes CPIO archives in order: if /init exists in this CPIO
-    // and /init.orig is backed up by the real initramfs, the kernel will
-    // run our /init.choosable first (via init= kernel param) or our copy
-    // of /init will shadow the real one.
-    let names: &[&[u8]] = &[b"init.choosable"];
+    // Place /init in the CPIO — this shadows casper's /init when
+    // GRUB concatenates our CPIO AFTER the original initrd.
+    // No init= kernel param needed; the kernel runs /init by default.
+    let names: &[&[u8]] = &[b"init"];
     let data: &[&[u8]] = &[&wrapper[..wrapper_len]];
     build_cpio(bs, names, data, offset_bytes)
 }

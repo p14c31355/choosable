@@ -80,19 +80,20 @@ impl BootKind {
         match self {
             BootKind::Casper => {
                 if is_popos {
-                    b" init=/init.choosable boot=casper casper_path=pop-os maybe-ubiquity"
+                    b" boot=casper casper_path=pop-os maybe-ubiquity"
                 } else {
-                    b" init=/init.choosable boot=casper maybe-ubiquity"
+                    b" boot=casper maybe-ubiquity"
                 }
             }
             BootKind::DebianLive => {
-                b" init=/init.choosable boot=live live-media=removable"
+                b" boot=live live-media=removable"
             }
             BootKind::FedoraLive => {
-                b" init=/init.choosable rd.live.image rootdelay=10"
+                // CDLABEL=CHOOSABLE works because PVD Volume ID is patched.
+                b" rd.live.image root=live:CDLABEL=CHOOSABLE rd.live.dir=/LiveOS rootdelay=10"
             }
             BootKind::ArchIso => {
-                b" archisobasedir=arch copytoram"
+                b" archisodevice=LABEL=CHOOSABLE archisobasedir=arch copytoram"
             }
             BootKind::Alpine => {
                 b" init=/init.choosable modules=loop,iso9660"
@@ -101,18 +102,20 @@ impl BootKind {
                 b" init=/init.choosable modules=loop,iso9660"
             }
             BootKind::WindowsPE => b"",
-            BootKind::Unknown => b" init=/init.choosable boot=casper maybe-ubiquity",
+            BootKind::Unknown => b" boot=casper maybe-ubiquity",
         }
     }
 
     /// Extra kernel args appended at the end of linux lines (before newline).
-    /// For DebianLive this is `findiso=` (appended with the ISO path);
-    /// Casper/FedoraLive/ArchIso/Alpine/AlpinePremount don't need any EOL extra
-    /// because the premount initramfs hook handles ISO discovery independently.
+    /// Casper uses `iso-scan/filename=` (native casper ISO scanner);
+    /// DebianLive uses `findiso=` (native live-boot ISO scanner).
+    /// Other boot kinds don't need EOL injection — they use LABEL-based
+    /// discovery or premount initrd.
     pub fn linux_eol_extra(&self) -> &'static [u8] {
         match self {
+            BootKind::Casper | BootKind::Unknown => b" iso-scan/filename=",
             BootKind::DebianLive => b" findiso=",
-            _ => b" choosable.iso_offset=",
+            _ => b"",
         }
     }
 
@@ -247,8 +250,8 @@ mod tests {
 
     #[test]
     fn test_boot_kind_linux_extra_values() {
-        assert_eq!(BootKind::Casper.linux_extra(false), b" init=/init.choosable boot=casper maybe-ubiquity");
-        assert_eq!(BootKind::Casper.linux_extra(true), b" init=/init.choosable boot=casper casper_path=pop-os maybe-ubiquity");
+        assert_eq!(BootKind::Casper.linux_extra(false), b" boot=casper maybe-ubiquity");
+        assert_eq!(BootKind::Casper.linux_extra(true), b" boot=casper casper_path=pop-os maybe-ubiquity");
         assert_eq!(BootKind::WindowsPE.linux_extra(false), b"");
         assert_eq!(BootKind::DebianLive.linux_eol_extra(), b" findiso=");
         assert!(!BootKind::Casper.linux_eol_extra().is_empty());
