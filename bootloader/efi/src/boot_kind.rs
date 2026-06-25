@@ -74,10 +74,15 @@ pub enum BootKind {
 
 impl BootKind {
     /// Kernel cmdline arguments to inject after the second argument on linux lines.
-    pub fn linux_extra(&self, _toram: bool) -> &'static [u8] {
+    /// `is_popos` is true when the ISO filename contains "pop" or "pop-os".
+    pub fn linux_extra(&self, is_popos: bool) -> &'static [u8] {
         match self {
             BootKind::Casper => {
-                b" boot=casper"
+                if is_popos {
+                    b" boot=casper casper_path=pop-os maybe-ubiquity"
+                } else {
+                    b" boot=casper maybe-ubiquity"
+                }
             }
             BootKind::DebianLive => {
                 b" boot=live live-media=removable"
@@ -92,10 +97,10 @@ impl BootKind {
                 b" init=/init.choosable modules=loop,iso9660"
             }
             BootKind::AlpinePremount => {
-                b" modules=loop,iso9660"
+                b" modules=loop,iso9660 alpine_dev=usbdisk:vfat"
             }
             BootKind::WindowsPE => b"",
-            BootKind::Unknown => b" boot=casper",
+            BootKind::Unknown => b" boot=casper maybe-ubiquity",
         }
     }
 
@@ -235,7 +240,8 @@ mod tests {
 
     #[test]
     fn test_boot_kind_linux_extra_values() {
-        assert_eq!(BootKind::Casper.linux_extra(false), b" boot=casper");
+        assert_eq!(BootKind::Casper.linux_extra(false), b" boot=casper maybe-ubiquity");
+        assert_eq!(BootKind::Casper.linux_extra(true), b" boot=casper casper_path=pop-os maybe-ubiquity");
         assert_eq!(BootKind::WindowsPE.linux_extra(false), b"");
         assert_eq!(BootKind::DebianLive.linux_eol_extra(), b" findiso=");
         assert!(!BootKind::Casper.linux_eol_extra().is_empty());

@@ -278,7 +278,11 @@ fn find_first_file_in_dir(
                     b"BOOT", b"EFI", b"GRUB", b"GRUB2", b"FEDORA",
                     b"ISOLINUX", b"SYSLINUX", b"BOOT",
                 ];
-                let is_known_dir = known_dirs.iter().any(|&d| d.len() == cl && d == &upper[..cl]);
+                let is_known_dir = known_dirs.iter().any(|&d| d.len() == cl && d == &upper[..cl])
+                    // ISO9660 version suffix stripping can leave a trailing dot
+                    // (e.g. "CASPER.;1" → "CASPER."), so also try matching
+                    // after removing a trailing dot.
+                    || (cl >= 2 && upper[cl - 1] == b'.' && known_dirs.iter().any(|&d| d.len() + 1 == cl && d == &upper[..cl - 1]));
                 if is_known_dir {
                     offset += record_len;
                     continue;
@@ -523,13 +527,14 @@ fn try_patch_candidate(
         }
     }
 
-    // Only patch if the file contains 'linux' or 'linuxefi' lines.
-    // Alpine menuentry-only configs are NOT supported because the current
-    // patching logic only rewrites existing kernel lines — it does not
-    // inject new linux/initrd directives into menuentry blocks.
+    // Patch if the file contains 'linux'/'linuxefi' lines or is a menuentry-only
+    // GRUB config (Alpine, etc).  For menuentry-only configs, the strategy patcher
+    // will inject linux/initrd lines into the first menuentry block.
     let has_linux = (orig.len() >= 6 && orig.windows(6).any(|w| w == b"linux " || w == b"linux\t"))
         || (orig.len() >= 9 && orig.windows(9).any(|w| w == b"linuxefi " || w == b"linuxefi\t"));
-    if !has_linux {
+    let has_menuentry = orig.len() >= 9 && orig.windows(9).any(|w| w == b"menuentry" || w == b"MenuEntry");
+    let has_relevant_directive = has_linux || has_menuentry;
+    if !has_relevant_directive {
         unsafe { (bs.free_pool)(orig_ptr as *mut c_void); }
         return false;
     }
@@ -624,18 +629,34 @@ fn patch_grub_cfg_blockio(
     let mut entry_count = 0usize;
 
     // Fedora uses /EFI/fedora/grub.cfg; also search Fedora-specific paths.
-    // The recursive scan will find all .cfg files as a fallback.
-    let known_paths: [(&[u8], &[u8], &[u8], &[u8]); 10] = [
-        (b"BOOT", b"GRUB",  b"GRUB.CFG",     b"/boot/grub/grub.cfg"),
-        (b"BOOT", b"GRUB",  b"LOOPBACK.CFG", b"/boot/grub/loopback.cfg"),
-        (b"BOOT", b"GRUB2", b"GRUB.CFG",     b"/boot/grub2/grub.cfg"),
-        (b"BOOT", b"GRUB2", b"LOOPBACK.CFG", b"/boot/grub2/loopback.cfg"),
-        (b"EFI",  b"BOOT",  b"GRUB.CFG",     b"/EFI/BOOT/grub.cfg"),
-        (b"EFI",  b"FEDORA", b"GRUB.CFG",    b"/EFI/fedora/grub.cfg"),
-        (b"EFI",  b"FEDORA", b"GRUB.CFG",    b"/EFI/Fedora/grub.cfg"),
-        (b"",     b"",      b"GRUB.CFG",     b"/grub.cfg"),
-        (b"",     b"",      b"GRUB.CFG",     b"/grub2/grub.cfg"),
-        (b"",     b"",      b"GRUB.CFG",     b"/Fedora/grub.cfg"),
+    // Alpine uses /boot/grub/grub.cfg at ISO root; GRUB2 shell fallback
+    // is entered when no grub.cfg is found — ensure all possible locations
+    // are covered.  The recursive scan will find any remaining .cfg files.
+    let known_paths: [(&[u8], &[u8], &[u8], &[u8]); 20] = [
+        (b"BOOT",  b"GRUB",   b"GRUB.CFG",     b"/boot/grub/grub.cfg"),
+        (b"BOOT",  b"GRUB",   b"LOOPBACK.CFG", b"/boot/grub/loopback.cfg"),
+        (b"BOOT",  b"GRUB2",  b"GRUB.CFG",     b"/boot/grub2/grub.cfg"),
+        (b"BOOT",  b"GRUB2",  b"LOOPBACK.CFG", b"/boot/grub2/loopback.cfg"),
+        (b"EFI",   b"BOOT",   b"GRUB.CFG",     b"/EFI/BOOT/grub.cfg"),
+        (b"EFI",   b"FEDORA", b"GRUB.CFG",     b"/EFI/fedora/grub.cfg"),
+        (b"EFI",   b"FEDORA", b"GRUB.CFG",     b"/EFI/Fedora/grub.cfg"),
+        (b"EFI",   b"fedora", b"GRUB.CFG",     b"/EFI/fedora/grub.cfg"),
+        (b"EFI",   b"LINUX",  b"GRUB.CFG",     b"/EFI/linux/grub.cfg"),
+        (b"EFI",   b"LINUX",  b"LOOPBACK.CFG", b"/EFI/linux/loopback.cfg"),
+        (b"",      b"",       b"GRUB.CFG",     b"/grub.cfg"),
+        (b"",      b"",       b"GRUB.CFG",     b"/grub2/grub.cfg"),
+        (b"",      b"",       b"GRUB.CFG",     b"/Fedora/grub.cfg"),
+        (b"",      b"",       b"LOOPBACK.CFG", b"/loopback.cfg"),
+        // Alpine-specific: grub.cfg at /boot/grub/ from root (directory is "BOOT")
+        (b"",      b"",       b"GRUB.CFG",     b"/boot/grub/grub.cfg"),
+        // Alpine 3.20+ may use /grub/grub.cfg directly
+        (b"",      b"",       b"GRUB.CFG",     b"/grub/grub.cfg"),
+        // Fedora 40+ may place grub.cfg under /loader/entries/
+        (b"EFI",   b"BOOT",   b"GRUB.CFG",     b"/EFI/BOOT/grubx64/grub.cfg"),
+        // openSUSE / SLES paths
+        (b"EFI",   b"BOOT",   b"GRUB.CFG",     b"/EFI/BOOT/x86_64-efi/grub.cfg"),
+        (b"",      b"",       b"SYSLINUX.CFG", b"/syslinux/syslinux.cfg"),
+        (b"",      b"",       b"ISOLINUX.CFG", b"/isolinux/isolinux.cfg"),
     ];
 
     for (dir1, dir2, filename, path) in &known_paths {
@@ -807,6 +828,7 @@ pub fn scan_iso_structure(
             if boot_kind == BootKind::Unknown {
                 if is_dir {
                          if name_matches(name, b"CASPER")  { boot_kind = BootKind::Casper; }
+                    else if name_matches(name, b"POP-OS")  { boot_kind = BootKind::Casper; }
                     else if name_matches(name, b"LIVE")    { boot_kind = BootKind::DebianLive; }
                     else if name_matches(name, b"LIVEOS")  { boot_kind = BootKind::FedoraLive; }
                     else if name_matches(name, b"ARCH")    { boot_kind = BootKind::ArchIso; }

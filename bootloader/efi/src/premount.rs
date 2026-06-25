@@ -241,18 +241,21 @@ LOOP=$L;break;done;[ -n \"$LOOP\" ]||continue
 mount -t iso9660 -o ro $LOOP /cdrom 2>/dev/null||{ losetup -d $LOOP 2>/dev/null;continue;}
 mount --make-rshared /cdrom 2>/dev/null
 mount -o bind /cdrom /lib/live/mount/medium 2>/dev/null
-[ -f /cdrom/casper/filesystem.squashfs ]&&return 0
-[ -d /cdrom/pop-os/casper_persist ]&&return 0
-[ -f /cdrom/casper/filesystem.* ]&&return 0
-[ -f /cdrom/live/filesystem.squashfs ]&&return 0
-[ -f /cdrom/LiveOS/squashfs.img ]&&return 0
-[ -f /cdrom/.alpine-release ]&&return 0
-[ -f /cdrom/.ALPINE_RELEASE ]&&return 0
-[ -d /cdrom/apks ]&&return 0
-[ -d /cdrom/arch ]&&{ mkdir -p /run/archiso/bootmnt 2>/dev/null;mount -o bind /cdrom /run/archiso/bootmnt 2>/dev/null;return 0;}
-[ -f /cdrom/.disk/info ]&&return 0
-[ -d /cdrom/distros ]&&return 0
-[ -f /cdrom/casper/vmlinuz ]&&return 0
+    [ -f /cdrom/casper/filesystem.squashfs ]&&return 0
+    [ -f /cdrom/casper/filesystem.* ]&&return 0
+    [ -f /cdrom/casper/vmlinuz ]&&return 0
+    [ -d /cdrom/casper ]&&return 0
+    [ -d /cdrom/pop-os ]&&return 0
+    [ -f /cdrom/live/filesystem.squashfs ]&&return 0
+    [ -f /cdrom/LiveOS/squashfs.img ]&&return 0
+    [ -f /cdrom/.alpine-release ]&&return 0
+    [ -f /cdrom/.ALPINE_RELEASE ]&&return 0
+    [ -d /cdrom/apks ]&&return 0
+    [ -d /cdrom/arch ]&&{ mkdir -p /run/archiso/bootmnt 2>/dev/null;mount -o bind /cdrom /run/archiso/bootmnt 2>/dev/null;return 0;}
+    [ -f /cdrom/.disk/info ]&&return 0
+    [ -d /cdrom/distros ]&&return 0
+    [ -d /cdrom/dists ]&&return 0
+    [ -d /cdrom/pool ]&&return 0
 umount /lib/live/mount/medium 2>/dev/null
 umount /cdrom 2>/dev/null
 losetup -d $LOOP 2>/dev/null
