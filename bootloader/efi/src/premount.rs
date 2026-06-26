@@ -54,14 +54,15 @@ impl EarlyBootFixup for WindowsPEFixup {
 fn subst_template(dst: &mut [u8], src: &[u8], marker: &[u8], replacement: &[u8], buf_cap: usize) -> usize {
     let mut pos = 0;
     let mut i = 0;
+    let cap = buf_cap.min(dst.len());
     while i < src.len() {
         if i + marker.len() <= src.len() && &src[i..i + marker.len()] == marker {
-            let max = replacement.len().min(buf_cap.saturating_sub(pos));
+            let max = replacement.len().min(cap.saturating_sub(pos));
             dst[pos..pos + max].copy_from_slice(&replacement[..max]);
             pos += max;
             i += marker.len();
         } else {
-            if pos < buf_cap { dst[pos] = src[i]; pos += 1; }
+            if pos < cap { dst[pos] = src[i]; pos += 1; }
             i += 1;
         }
     }
