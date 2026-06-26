@@ -697,7 +697,7 @@ fn patch_grub_cfg_blockio(
     // Alpine uses /boot/grub/grub.cfg at ISO root; GRUB2 shell fallback
     // is entered when no grub.cfg is found — ensure all possible locations
     // are covered.  The recursive scan will find any remaining .cfg files.
-    let known_paths: [(&[u8], &[u8], &[u8], &[u8]); 20] = [
+    let known_paths: [(&[u8], &[u8], &[u8], &[u8]); 19] = [
         (b"BOOT",  b"GRUB",   b"GRUB.CFG",     b"/boot/grub/grub.cfg"),
         (b"BOOT",  b"GRUB",   b"LOOPBACK.CFG", b"/boot/grub/loopback.cfg"),
         (b"BOOT",  b"GRUB2",  b"GRUB.CFG",     b"/boot/grub2/grub.cfg"),
@@ -712,8 +712,6 @@ fn patch_grub_cfg_blockio(
         (b"GRUB2", b"",       b"GRUB.CFG",     b"/grub2/grub.cfg"),
         (b"FEDORA",b"",       b"GRUB.CFG",     b"/Fedora/grub.cfg"),
         (b"",      b"",       b"LOOPBACK.CFG", b"/loopback.cfg"),
-        // Alpine-specific: grub.cfg at /boot/grub/ from root (directory is "BOOT")
-        (b"BOOT",  b"GRUB",   b"GRUB.CFG",     b"/boot/grub/grub.cfg"),
         // Alpine 3.20+ may use /grub/grub.cfg directly
         (b"GRUB",  b"",       b"GRUB.CFG",     b"/grub/grub.cfg"),
         // Fedora 40+ may place grub.cfg under /loader/entries/
