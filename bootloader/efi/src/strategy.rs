@@ -196,8 +196,42 @@ fn patch_grub_cfg_impl(
         }
     } else { linux_eol_extra };
 
+    // Always build choosable.iso_offset=<decimal> as a separate injection.
+    // This is the primary mechanism for premount-init to locate the ISO at
+    // boot time.  It is injected alongside distro-specific args (findiso=,
+    // iso-scan/filename=) for Casper/DebianLive, and as the sole EOL arg
+    // for all other boot kinds (Fedora, Arch, Alpine, etc.).
+    let mut iso_offset_buf = [0u8; 64];
+    let iso_offset_dynamic: &[u8] = if let Some(loc) = inp.iso_location {
+        let offset = loc.offset_bytes();
+        let prefix = b" choosable.iso_offset=";
+        let plen = prefix.len();
+        // Build the full string left-to-right: prefix first, then decimal digits.
+        let mut write_pos = 0usize;
+        iso_offset_buf[write_pos..write_pos + plen].copy_from_slice(prefix);
+        write_pos += plen;
+        let mut v = offset;
+        let mut digits = [0u8; 21];
+        let mut dpos = 20;
+        if v == 0 { digits[20] = b'0'; }
+        else {
+            loop {
+                digits[dpos] = b'0' + (v % 10) as u8;
+                v /= 10;
+                if v == 0 { break; }
+                dpos -= 1;
+            }
+        }
+        let dlen = 21 - dpos;
+        iso_offset_buf[write_pos..write_pos + dlen].copy_from_slice(&digits[dpos..dpos + dlen]);
+        write_pos += dlen;
+        &iso_offset_buf[..write_pos]
+    } else {
+        b""
+    };
+
     let (linux_count, initrd_count) = count_matching_lines(orig);
-    let extra = linux_count * (linux_extra.len() + eol_extra_dynamic.len())
+    let extra = linux_count * (linux_extra.len() + eol_extra_dynamic.len() + iso_offset_dynamic.len())
         + initrd_count * initrd_extra.len();
     let (out_ptr, out_cap) = allocate_output(bs, orig.len(), extra)?;
     let out = unsafe { core::slice::from_raw_parts_mut(out_ptr, out_cap) };
@@ -229,7 +263,7 @@ fn patch_grub_cfg_impl(
             {
                 // Remove any existing ISO locator arguments to prevent duplicates
                 // and ensure our dynamic value takes precedence.
-                if !eol_extra_dynamic.is_empty() {
+                if !eol_extra_dynamic.is_empty() || !iso_offset_dynamic.is_empty() {
                     remove_iso_locator_args(out, line_start, &mut dst);
                 }
 
@@ -248,6 +282,15 @@ fn patch_grub_cfg_impl(
                 if !eol_extra_dynamic.is_empty() {
                     let inj2 = inject_at + linux_extra.len();
                     shift_and_inject(out, inj2, &mut dst, eol_extra_dynamic);
+                }
+
+                // Inject choosable.iso_offset=<decimal> as the final
+                // kernel cmdline argument on this line.  premount-init
+                // reads this from /proc/cmdline to locate the ISO by
+                // raw byte offset and loopback-mount it.
+                if !iso_offset_dynamic.is_empty() {
+                    let inj3 = inject_at + linux_extra.len() + eol_extra_dynamic.len();
+                    shift_and_inject(out, inj3, &mut dst, iso_offset_dynamic);
                 }
             }
             else if (t.starts_with(b"initrd ") || t.starts_with(b"initrd\t")
