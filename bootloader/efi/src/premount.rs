@@ -621,6 +621,7 @@ fn build_cpio(
     data: &[&[u8]],
     offset_bytes: u64,
 ) -> Option<PremountBundle> {
+    if names.len() != data.len() { return None; }
     // Each entry has a header (110 + padded_name), data, and up to 3 bytes
     // of padding for 4-byte alignment.  Add 8 bytes margin per entry.
     let estimate = names.iter().zip(data.iter())
