@@ -56,7 +56,7 @@ impl IsoLocation {
 
     fn from_payload_entry(entry: &PayloadEntry, partition_guid: Guid, partition_number: u32, part1_lba: u64) -> Self {
         let mut file_path = [0u8; 256];
-        let name_len = entry.name_len.min(255);
+        let name_len = entry.name_len.min(256);
         file_path[..name_len].copy_from_slice(&entry.name[..name_len]);
         IsoLocation { partition_guid, partition_number, file_path, file_path_len: name_len,
             file_size: entry.file_size, part1_lba, iso_lba: entry.file_start_lba }
@@ -117,7 +117,7 @@ mod tests {
     use super::*;
 
     fn make_entry(name: &[u8], lba: u64, size: u64) -> PayloadEntry {
-        let name_len = name.len().min(255);
+        let name_len = name.len().min(256);
         let mut n = [0u8; 256];
         n[..name_len].copy_from_slice(&name[..name_len]);
         PayloadEntry { name: n, name_len, file_start_lba: lba, file_size: size, payload_type: PayloadType::Iso }

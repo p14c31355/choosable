@@ -2,7 +2,7 @@
 //  Console output helpers
 // ═══════════════════════════════════════════════════════════════════════════
 
-use crate::protocol::{Key, ResetType, SimpleTextInput, SimpleTextOutput, SystemTable, EFI_SUCCESS};
+use crate::protocol::{Key, ResetType, SimpleTextInput, SimpleTextOutput, SystemTable, EFI_SUCCESS, EFI_NOT_READY};
 
 pub fn prints(co: &mut SimpleTextOutput, s: &[u8]) {
     let mut buf = [0u16; 256];
@@ -72,7 +72,9 @@ pub fn wait_for_keypress(st: &mut SystemTable, message: Option<&[u8]>, stall_us:
         if let Some(msg) = message { print_raw(st, msg); }
         loop {
             let mut k = Key { sc: 0, uc: 0 };
-            if unsafe { (ci.read_key_stroke)(ci as *mut _, &mut k) } == EFI_SUCCESS { break; }
+            let status = unsafe { (ci.read_key_stroke)(ci as *mut _, &mut k) };
+            if status == EFI_SUCCESS { break; }
+            if status != EFI_NOT_READY { break; }
             unsafe { (bs.stall)(stall_us) };
         }
     }

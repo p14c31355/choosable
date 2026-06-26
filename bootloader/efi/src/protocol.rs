@@ -465,6 +465,7 @@ pub const EFI_NO_MEDIA: usize             = 0x80000000_00000014usize;
 pub const EFI_WRITE_PROTECTED: usize      = 0x80000000_00000011usize;
 pub const EFI_OUT_OF_RESOURCES: usize     = 0x80000000_00000009usize;
 pub const EFI_SECURITY_VIOLATION: usize   = 0x80000000_0000001Ausize;
+pub const EFI_NOT_READY: usize            = 0x80000000_00000006usize;
 
 pub const BLOCK_IO_PROTOCOL_GUID: Guid = Guid {
     d1: 0x964e5b21,

@@ -254,7 +254,7 @@ exec /bin/sh
     let tmp_len = subst_template(&mut tmp, wrapper_src, b"OFFSET_FROM_CMDLINE", CMDLINE_OFFSET_SNIPPET, 8191);
     let wrapper_len = subst_template(&mut wrapper, &tmp[..tmp_len], b"OFFSET", off_slice, 8191);
 
-    let names: &[&[u8]] = &[b"init", b"hooks/choosable", b"scripts/casper-premount/00choosable", b"scripts/casper-bottom/00choosable"];
+    let names: &[&[u8]] = &[b"init.choosable", b"hooks/choosable", b"scripts/casper-premount/00choosable", b"scripts/casper-bottom/00choosable"];
     let data: &[&[u8]] = &[&wrapper[..wrapper_len], &premount_script[..premount_len], &premount_script[..premount_len], &bottom_script[..bottom_len]];
     build_cpio(bs, names, data, offset_bytes)
 }

@@ -202,7 +202,7 @@ fn patch_grub_cfg_impl(
             }
             else if (t.starts_with(b"initrd ") || t.starts_with(b"initrd\t")
                 || t.starts_with(b"initrdefi ") || t.starts_with(b"initrdefi\t"))
-                && !premount_target_name_p.is_empty()
+                && !effective_target.is_empty()
                 && dedup_slice.len() <= line.len()
                 && !line.windows(dedup_slice.len()).any(|w| w == dedup_slice)
             {

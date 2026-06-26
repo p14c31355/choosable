@@ -313,12 +313,16 @@ unsafe extern "efiapi" fn vblock_read(
             if vbio.premount_entry_rename {
                 let off = vbio.premount_entry_offset as usize;
                 let name = b"PREMOUNT.CPIO;1";
-                // ISO9660 name length at byte 32
+                // ISO9660 name length at byte 32, record length at byte 0
                 let name_len_byte = name.len() as u8;
-                if off + 33 + name.len() <= 2048 {
-                    dst[block_offset + off + 32] = name_len_byte;
-                    dst[block_offset + off + 33..block_offset + off + 33 + name.len()]
-                        .copy_from_slice(name);
+                if off < 2048 && block_offset + off < dst.len() {
+                    let record_len = dst[block_offset + off] as usize;
+                    // Check both sector boundary and record length can fit the new name
+                    if off + 33 + name.len() <= 2048 && 33 + name.len() <= record_len {
+                        dst[block_offset + off + 32] = name_len_byte;
+                        dst[block_offset + off + 33..block_offset + off + 33 + name.len()]
+                            .copy_from_slice(name);
+                    }
                 }
             }
         }

@@ -708,13 +708,13 @@ fn patch_grub_cfg_blockio(
         (b"EFI",   b"LINUX",  b"GRUB.CFG",     b"/EFI/linux/grub.cfg"),
         (b"EFI",   b"LINUX",  b"LOOPBACK.CFG", b"/EFI/linux/loopback.cfg"),
         (b"",      b"",       b"GRUB.CFG",     b"/grub.cfg"),
-        (b"",      b"",       b"GRUB.CFG",     b"/grub2/grub.cfg"),
-        (b"",      b"",       b"GRUB.CFG",     b"/Fedora/grub.cfg"),
+        (b"GRUB2", b"",       b"GRUB.CFG",     b"/grub2/grub.cfg"),
+        (b"FEDORA",b"",       b"GRUB.CFG",     b"/Fedora/grub.cfg"),
         (b"",      b"",       b"LOOPBACK.CFG", b"/loopback.cfg"),
         // Alpine-specific: grub.cfg at /boot/grub/ from root (directory is "BOOT")
-        (b"",      b"",       b"GRUB.CFG",     b"/boot/grub/grub.cfg"),
+        (b"BOOT",  b"GRUB",   b"GRUB.CFG",     b"/boot/grub/grub.cfg"),
         // Alpine 3.20+ may use /grub/grub.cfg directly
-        (b"",      b"",       b"GRUB.CFG",     b"/grub/grub.cfg"),
+        (b"GRUB",  b"",       b"GRUB.CFG",     b"/grub/grub.cfg"),
         // Fedora 40+ may place grub.cfg under /loader/entries/
         (b"EFI",   b"BOOT",   b"GRUB.CFG",     b"/EFI/BOOT/grubx64/grub.cfg"),
         // openSUSE / SLES paths
