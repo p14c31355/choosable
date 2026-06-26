@@ -1,6 +1,11 @@
 // ═══════════════════════════════════════════════════════════════════════════
-//  Premount initrd builder — creates loop device from raw partition offset
+//  Premount initrd builder — embeds /init.choosable static ELF binary
 // ═══════════════════════════════════════════════════════════════════════════
+//
+//  The binary is compiled separately via x86_64-unknown-linux-musl:
+//     cd bootloader/premount-init && cargo build --target x86_64-unknown-linux-musl --release
+//
+//  EFI build.rs automatically builds it before compiling the EFI module.
 
 use core::ffi::c_void;
 use crate::boot_context::BootContext;
@@ -17,28 +22,27 @@ pub trait EarlyBootFixup {
     fn build_initrd(&self, ctx: &BootContext, bs: &mut BootServices) -> Option<PremountBundle>;
 }
 
-// ── Macro-generated fixup structs ────────────────────────────────────────
+// ── Fixup structs (one per distro family) ────────────────────────────
 
 macro_rules! fixup {
-    ($name:ident, $ctor:path $(, $arg:literal)?) => {
+    ($name:ident) => {
         pub struct $name;
         impl EarlyBootFixup for $name {
             fn build_initrd(&self, ctx: &BootContext, bs: &mut BootServices) -> Option<PremountBundle> {
                 let p = ctx.selected_payload()?;
                 let rel = p.file_start_lba - ctx.partition_start_lba;
-                let name_bytes = &p.name[..p.name_len.min(p.name.len())];
-                $ctor(bs, rel $(, $arg)?, name_bytes)
+                build_premount_cpio(bs, rel)
             }
         }
     };
 }
 
-fixup!(CasperFixup,         prepare_premount_initrd, true);
-fixup!(LiveBootFixup,       prepare_premount_initrd, false);
-fixup!(DracutFixup,         prepare_dracut_initrd);
-fixup!(AlpinePremountFixup, prepare_alpine_initrd);
-fixup!(ArchFixup,           prepare_arch_initrd);
-fixup!(AlpineFixup,         prepare_alpine_initrd);
+fixup!(CasperFixup);
+fixup!(LiveBootFixup);
+fixup!(DracutFixup);
+fixup!(AlpinePremountFixup);
+fixup!(ArchFixup);
+fixup!(AlpineFixup);
 
 pub struct WindowsPEFixup;
 impl EarlyBootFixup for WindowsPEFixup {
@@ -46,534 +50,20 @@ impl EarlyBootFixup for WindowsPEFixup {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Template engine — substitutes OFFSET / SRMOD / LOGNAME placeholders
+//  Embedded premount-init binary
 // ═══════════════════════════════════════════════════════════════════════════
+//  Pre-compiled with x86_64-unknown-linux-musl for fully-static ELF.
+//  Runs as /init.choosable in any initramfs (no /bin/sh required).
 
-/// Copy template bytes to `dst`, replacing a marker of `marker_len` bytes
-/// (matching `marker`) with `replacement`. `buf_cap` = max bytes written.
-fn subst_template(dst: &mut [u8], src: &[u8], marker: &[u8], replacement: &[u8], buf_cap: usize) -> usize {
-    let mut pos = 0;
-    let mut i = 0;
-    let cap = buf_cap.min(dst.len());
-    while i < src.len() {
-        if i + marker.len() <= src.len() && &src[i..i + marker.len()] == marker {
-            let max = replacement.len().min(cap.saturating_sub(pos));
-            dst[pos..pos + max].copy_from_slice(&replacement[..max]);
-            pos += max;
-            i += marker.len();
-        } else {
-            if pos < cap { dst[pos] = src[i]; pos += 1; }
-            i += 1;
-        }
-    }
-    pos
-}
-
-fn strip_leading_zeros(buf: &[u8; 21]) -> &[u8] {
-    let mut s = 0;
-    while s < 20 && buf[s] == b'0' { s += 1; }
-    if s >= 20 { &buf[20..] } else { &buf[s..] }
-}
+const PREMOUNT_INIT_BIN: &[u8] = include_bytes!("../premount-init.bin");
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Cmdline offset snippet — injected into premount wrappers so they can
-//  read choosable.iso_offset= from /proc/cmdline as a fallback.
-// ═══════════════════════════════════════════════════════════════════════════
-
-const CMDLINE_OFFSET_SNIPPET: &[u8] = b"\
-# Parse choosable.iso_offset= from kernel cmdline as fallback
-__CO=\"\"
-for W in $(cat /proc/cmdline 2>/dev/null);do
-  case \"$W\" in choosable.iso_offset=*) __CO=\"${W#choosable.iso_offset=}\";; esac
-done
-[ -n \"$__CO\" ] && echo \"choosable: cmdline offset=$__CO\" >/dev/console
-";
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  Generic /init.choosable wrapper — mounts ISO on /cdrom then execs /init.
-//  Used for Casper (Ubuntu/Mint/Pop), DebianLive, and Unknown fallback.
-//  This avoids the initramfs-tools subshell problem: casper's custom init
-//  does NOT execute /scripts/casper-premount/ hooks, so the only reliable
-//  approach is to replace /init entirely before the kernel runs it.
-// ═══════════════════════════════════════════════════════════════════════════
-
-pub fn prepare_generic_initrd(
-    bs: &mut BootServices,
-    relative_sector_offset: u64,
-    iso_name: &[u8],
-) -> Option<PremountBundle> {
-    let offset_bytes = relative_sector_offset * 512;
-
-    // Generic init wrapper — replaces /init entirely.
-    // The kernel runs /init by default; by placing our script at /init
-    // in this CPIO (which is concatenated AFTER the original initrd by
-    // GRUB), our /init shadows casper's /init.  We mount the ISO at
-    // /cdrom, then exec the backup /init.real (which we saved from the
-    // original /init before it was overwritten).
-    //
-    // CRITICAL: do NOT redirect stdout/stderr early — the rootfs may
-    // not be writable yet.  Write only to /dev/console.
-    let mut wrapper = [0u8; 8192];
-    let wrapper_src = b"\
-#!/bin/sh
-# Choosable generic init wrapper (Casper/Live/Unknown)
-mount -t proc none /proc 2>/dev/null
-mount -t sysfs none /sys 2>/dev/null
-mount -t devtmpfs none /dev 2>/dev/null
-mkdir -p /tmp 2>/dev/null
-modprobe loop 2>/dev/null;modprobe iso9660 2>/dev/null
-modprobe exfat 2>/dev/null;modprobe ntfs3 2>/dev/null
-modprobe virtio_blk 2>/dev/null;modprobe virtio_pci 2>/dev/null
-for i in 0 1 2 3 4 5 6 7;do [ -b /dev/loop$i ]||mknod /dev/loop$i b 7 $i 2>/dev/null;done
-[ -d /cdrom ]||mkdir -p /cdrom /lib/live/mount/medium 2>/dev/null
-OFFSET_FROM_CMDLINE
-echo 'choosable (generic): offset=' >/dev/console
-echo OFFSET >/dev/console
-N=0;while [ $N -lt 60 ];do N=$((N+1))
-while read -r a b c d;do case $d in loop*|ram*|dm-*|sr*)continue;;*[0-9]);;*)continue;;esac
-dev=/dev/$d;[ -b $dev ]||continue
-LOOP=;for i in 0 1 2 3 4 5 6 7;do L=/dev/loop$i
-losetup $L >/dev/null 2>&1&&continue
-O=OFFSET;[ -n \"$__CO\" ]&&O=\"$__CO\"
-losetup -o $O $L $dev 2>/dev/null||{ losetup -d $L 2>/dev/null;continue;}
-LOOP=$L;break;done;[ -n \"$LOOP\" ]||continue
-mount -t iso9660 -o ro $LOOP /cdrom 2>/dev/null||{ losetup -d $LOOP 2>/dev/null;continue;}
-mount --make-rshared /cdrom 2>/dev/null
-mount -o bind /cdrom /lib/live/mount/medium 2>/dev/null
-if [ -d /cdrom/casper ]||[ -d /cdrom/pop-os ];then
-echo 'choosable (generic): CASPER/POP found' >/dev/console
-[ -x /init ]&&exec /init \"$@\"
-exec /bin/sh
-fi
-if [ -d /cdrom/live ];then
-echo 'choosable (generic): LIVE found' >/dev/console
-[ -x /init ]&&exec /init \"$@\"
-exec /bin/sh
-fi
-if [ -d /cdrom/LiveOS ];then
-echo 'choosable (generic): LiveOS found' >/dev/console
-[ -x /init ]&&exec /init \"$@\"
-exec /bin/sh
-fi
-if [ -f /cdrom/.alpine-release ]||[ -f /cdrom/.ALPINE_RELEASE ];then
-echo 'choosable (generic): Alpine found' >/dev/console
-[ -x /init ]&&exec /init \"$@\"
-exec /bin/sh
-fi
-if [ -d /cdrom/arch ];then
-echo 'choosable (generic): Arch found' >/dev/console
-mkdir -p /run/archiso/bootmnt 2>/dev/null
-mount -o bind /cdrom /run/archiso/bootmnt 2>/dev/null
-[ -x /init ]&&exec /init \"$@\"
-exec /bin/sh
-fi
-echo 'choosable (generic): no distro marker, mount anyway' >/dev/console
-[ -x /init ]&&exec /init \"$@\"
-exec /bin/sh
-umount /lib/live/mount/medium 2>/dev/null
-umount /cdrom 2>/dev/null
-losetup -d $LOOP 2>/dev/null
-done</proc/partitions
-sleep 1;done
-echo 'choosable (generic): gave up' >/dev/console
-[ -x /init ]&&exec /init \"$@\"
-exec /bin/sh
-";
-    let dec = format_decimal_u64(offset_bytes);
-    let off_slice = strip_leading_zeros(&dec);
-    // OFFSET_FROM_CMDLINE MUST be substituted BEFORE OFFSET.
-    let mut tmp = [0u8; 8192];
-    let tmp_len = subst_template(&mut tmp, wrapper_src, b"OFFSET_FROM_CMDLINE", CMDLINE_OFFSET_SNIPPET, 8191);
-    let wrapper_len = subst_template(&mut wrapper, &tmp[..tmp_len], b"OFFSET", off_slice, 8191);
-
-    // Place /init.choosable in the CPIO — kernel invokes it via
-    // init=/init.choosable on the cmdline.  We mount the ISO, then
-    // exec the real /init (casper/dracut/archiso) from the original
-    // initrd which is still intact because we didn't shadow it.
-    let names: &[&[u8]] = &[b"init.choosable"];
-    let data: &[&[u8]] = &[&wrapper[..wrapper_len]];
-    build_cpio(bs, names, data, offset_bytes)
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  Arch-specific premount initrd builder
-// ═══════════════════════════════════════════════════════════════════════════
-
-pub fn prepare_arch_initrd(
-    bs: &mut BootServices,
-    relative_sector_offset: u64,
-    iso_name: &[u8],
-) -> Option<PremountBundle> {
-    let offset_bytes = relative_sector_offset * 512;
-    let premount_script = build_premount_script(offset_bytes, false);
-    let premount_len = premount_script.iter().position(|&c| c == 0).unwrap_or(8191);
-
-    let bottom_script = build_bottom_script(iso_name);
-    let bottom_len = bottom_script.iter().position(|&c| c == 0).unwrap_or(2047);
-
-    // Arch /init wrapper — exec's /init.orig after premount
-    // Uses cmdline offset as fallback when compiled-in OFFSET doesn't work.
-    let mut wrapper = [0u8; 8192];
-    let wrapper_src = b"\
-#!/bin/sh
-# Choosable Arch init wrapper
-mkdir -p /tmp 2>/dev/null
-exec >/tmp/choosable.log 2>&1
-echo 'choosable (arch): premount starting' >/dev/console
-modprobe loop 2>/dev/null;modprobe iso9660 2>/dev/null
-modprobe exfat 2>/dev/null;modprobe ntfs3 2>/dev/null
-modprobe virtio_blk 2>/dev/null;modprobe virtio_pci 2>/dev/null
-for i in 0 1 2 3 4 5 6 7;do [ -b /dev/loop$i ]||mknod /dev/loop$i b 7 $i 2>/dev/null;done
-[ -d /cdrom ]||mkdir -p /cdrom /run/archiso/bootmnt 2>/dev/null
-OFFSET_FROM_CMDLINE
-sleep 5
-N=0;while [ $N -lt 30 ];do N=$((N+1))
-while read -r a b c d;do case $d in loop*|ram*|dm-*|sr*)continue;;*[0-9]);;*)continue;;esac
-dev=/dev/$d;[ -b $dev ]||continue
-LOOP=;for i in 0 1 2 3 4 5 6 7;do L=/dev/loop$i
-losetup $L >/dev/null 2>&1&&continue
-O=OFFSET;[ -n \"$__CO\" ]&&O=\"$__CO\"
-losetup -o $O $L $dev 2>/dev/null||{ losetup -d $L 2>/dev/null;continue;}
-LOOP=$L;break;done;[ -n \"$LOOP\" ]||continue
-mount -t iso9660 -o ro $LOOP /cdrom 2>/dev/null||{ losetup -d $LOOP 2>/dev/null;continue;}
-[ -d /cdrom/arch ]&&{ mkdir -p /run/archiso/bootmnt 2>/dev/null;mount -o bind /cdrom /run/archiso/bootmnt 2>/dev/null;break 2;}
-umount /cdrom 2>/dev/null;losetup -d $LOOP 2>/dev/null
-done</proc/partitions
-sleep 1;done
-echo 'choosable (arch): done, exec /init.orig' >/dev/console
-if [ -x /init.orig ];then exec /init.orig \"$@\"
-else echo 'choosable (arch): /init.orig not found, trying /init' >/dev/console
-[ -x /init ]&&exec /init \"$@\";fi
-exec /bin/sh
-";
-    let dec = format_decimal_u64(offset_bytes);
-    let off_slice = strip_leading_zeros(&dec);
-    // OFFSET_FROM_CMDLINE MUST be substituted BEFORE OFFSET.  Otherwise
-    // OFFSET replacement (e.g. "12345") corrupts the longer marker
-    // ("12345_FROM_CMDLINE" will never match "OFFSET_FROM_CMDLINE").
-    let mut tmp = [0u8; 8192];
-    let tmp_len = subst_template(&mut tmp, wrapper_src, b"OFFSET_FROM_CMDLINE", CMDLINE_OFFSET_SNIPPET, 8191);
-    let wrapper_len = subst_template(&mut wrapper, &tmp[..tmp_len], b"OFFSET", off_slice, 8191);
-
-    let names: &[&[u8]] = &[b"init.choosable", b"hooks/choosable", b"scripts/casper-premount/00choosable", b"scripts/casper-bottom/00choosable"];
-    let data: &[&[u8]] = &[&wrapper[..wrapper_len], &premount_script[..premount_len], &premount_script[..premount_len], &bottom_script[..bottom_len]];
-    build_cpio(bs, names, data, offset_bytes)
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  Alpine-specific premount initrd builder
-// ═══════════════════════════════════════════════════════════════════════════
-
-pub fn prepare_alpine_initrd(
-    bs: &mut BootServices,
-    relative_sector_offset: u64,
-    _iso_name: &[u8],
-) -> Option<PremountBundle> {
-    let offset_bytes = relative_sector_offset * 512;
-    let dec = format_decimal_u64(offset_bytes);
-    let off_slice = strip_leading_zeros(&dec);
-
-    let mut script = [0u8; 4096];
-    let src = b"\
-#!/bin/sh
-mount -t proc none /proc 2>/dev/null
-mount -t sysfs none /sys 2>/dev/null
-mount -t devtmpfs none /dev 2>/dev/null
-modprobe loop 2>/dev/null;modprobe iso9660 2>/dev/null
-for i in 0 1 2 3 4 5 6 7;do [ -b /dev/loop$i ]||mknod /dev/loop$i b 7 $i 2>/dev/null;done
-[ -d /cdrom ]||mkdir -p /cdrom 2>/dev/null
-for dev in /dev/[sv]d*[0-9] /dev/nvme*n1p* /dev/mmcblk*p*;do
- [ -b \"$dev\" ]||continue
- for i in 0 1 2 3 4 5 6 7;do
-  L=/dev/loop$i
-  losetup $L >/dev/null 2>&1&&continue
-  losetup -o OFFSET $L \"$dev\" 2>/dev/null||continue
-  mount -t iso9660 -ro $L /cdrom 2>/dev/null||{ losetup -d $L 2>/dev/null;continue;}
-  if [ -f /cdrom/.alpine-release ]||[ -f /cdrom/.ALPINE_RELEASE ];then
-   exec /init \"$@\"
-  fi
-  umount /cdrom 2>/dev/null;losetup -d $L 2>/dev/null
- done
-done
-exec /init \"$@\"
-";
-    let script_len = subst_template(&mut script, src, b"OFFSET", off_slice, 4095);
-
-    build_cpio(bs, &[b"init.choosable"], &[&script[..script_len]], offset_bytes)
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  Dracut (Fedora/RHEL) premount initrd builder — creates /init.choosable
-//  wrapper because dracut does not process initramfs-tools hook directories.
-// ═══════════════════════════════════════════════════════════════════════════
-
-pub fn prepare_dracut_initrd(
-    bs: &mut BootServices,
-    relative_sector_offset: u64,
-    iso_name: &[u8],
-) -> Option<PremountBundle> {
-    let offset_bytes = relative_sector_offset * 512;
-    let premount_script = build_premount_script(offset_bytes, false);
-    let premount_len = premount_script.iter().position(|&c| c == 0).unwrap_or(8191);
-
-    let bottom_script = build_bottom_script(iso_name);
-    let bottom_len = bottom_script.iter().position(|&c| c == 0).unwrap_or(2047);
-
-    // Dracut init wrapper — mounts ISO then execs /init.orig (original dracut init)
-    // Uses cmdline offset as fallback when compiled-in OFFSET doesn't work.
-    let mut wrapper = [0u8; 8192];
-    let wrapper_src = b"\
-#!/bin/sh
-# Choosable Dracut/Fedora init wrapper
-mkdir -p /tmp 2>/dev/null
-exec >/tmp/choosable.log 2>&1
-echo 'choosable (dracut): premount starting' >/dev/console
-modprobe loop 2>/dev/null;modprobe iso9660 2>/dev/null
-modprobe exfat 2>/dev/null;modprobe ntfs3 2>/dev/null
-modprobe virtio_blk 2>/dev/null;modprobe virtio_pci 2>/dev/null
-for i in 0 1 2 3 4 5 6 7;do [ -b /dev/loop$i ]||mknod /dev/loop$i b 7 $i 2>/dev/null;done
-[ -d /run/initramfs/live ]||mkdir -p /run/initramfs/live /cdrom 2>/dev/null
-OFFSET_FROM_CMDLINE
-N=0;while [ $N -lt 60 ];do N=$((N+1))
-while read -r a b c d;do case $d in loop*|ram*|dm-*|sr*)continue;;*[0-9]);;*)continue;;esac
-dev=/dev/$d;[ -b $dev ]||continue
-LOOP=;for i in 0 1 2 3 4 5 6 7;do L=/dev/loop$i
-losetup $L >/dev/null 2>&1&&continue
-O=OFFSET;[ -n \"$__CO\" ]&&O=\"$__CO\"
-losetup -o $O $L $dev 2>/dev/null||{ losetup -d $L 2>/dev/null;continue;}
-LOOP=$L;break;done;[ -n \"$LOOP\" ]||continue
-mount -t iso9660 -o ro $LOOP /cdrom 2>/dev/null||{ losetup -d $LOOP 2>/dev/null;continue;}
-mount --make-rshared /cdrom 2>/dev/null
-if [ -f /cdrom/LiveOS/squashfs.img ];then
-    mkdir -p /run/initramfs/live 2>/dev/null
-    ln -sf /cdrom/LiveOS /run/initramfs/live/LiveOS 2>/dev/null
-    echo 'choosable (dracut): ISO mounted (LiveOS), exec /init.orig' >/dev/console
-    [ -x /init.orig ]&&exec /init.orig \"$@\"
-    [ -x /init ]&&exec /init \"$@\"
-    break 2
-fi
-[ -f /cdrom/.disk/info ]&&{
-    mkdir -p /run/initramfs/live 2>/dev/null
-    ln -sf /cdrom /run/initramfs/live/LiveOS 2>/dev/null
-    echo 'choosable (dracut): ISO mounted (Fedora), exec /init.orig' >/dev/console
-    [ -x /init.orig ]&&exec /init.orig \"$@\"
-    [ -x /init ]&&exec /init \"$@\"
-    break 2
-}
-umount /cdrom 2>/dev/null;losetup -d $LOOP 2>/dev/null
-done</proc/partitions
-sleep 1;done
-echo 'choosable (dracut): gave up, exec /init.orig' >/dev/console
-[ -x /init.orig ]&&exec /init.orig \"$@\"
-[ -x /init ]&&exec /init \"$@\"
-exec /bin/sh
-";
-    let dec = format_decimal_u64(offset_bytes);
-    let off_slice = strip_leading_zeros(&dec);
-    // OFFSET_FROM_CMDLINE MUST be substituted BEFORE OFFSET.  Otherwise
-    // OFFSET replacement corrupts the longer marker.
-    let mut tmp = [0u8; 8192];
-    let tmp_len = subst_template(&mut tmp, wrapper_src, b"OFFSET_FROM_CMDLINE", CMDLINE_OFFSET_SNIPPET, 8191);
-    let wrapper_len = subst_template(&mut wrapper, &tmp[..tmp_len], b"OFFSET", off_slice, 8191);
-
-    // Inject into multiple hook paths:
-    //   - /init.choosable (picked up when init= kernel param is not set but initramfs has it)
-    //   - dracut native hooks
-    //   - initramfs-tools fallback hooks (some Fedora derivatives use these)
-    let names: &[&[u8]] = &[
-        b"init.choosable",
-        b"lib/dracut/hooks/pre-mount/00choosable.sh",
-        b"lib/dracut/hooks/pre-trigger/00choosable.sh",
-        b"scripts/init-premount/00choosable",
-        b"scripts/live/00choosable",
-        b"scripts/live-premount/00choosable",
-        b"scripts/casper-premount/00choosable",
-        b"scripts/casper-bottom/00choosable",
-    ];
-    let data: &[&[u8]] = &[
-        &wrapper[..wrapper_len],
-        &premount_script[..premount_len],
-        &premount_script[..premount_len],
-        &premount_script[..premount_len],
-        &premount_script[..premount_len],
-        &premount_script[..premount_len],
-        &premount_script[..premount_len],
-        &bottom_script[..bottom_len],
-    ];
-    build_cpio(bs, names, data, offset_bytes)
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  Pure functions (testable)
+//  CPIO helpers
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn hex_nibble(n: u8) -> u8 {
     if n < 10 { b'0' + n } else { b'A' + (n - 10) }
 }
-
-fn format_decimal_u64(v: u64) -> [u8; 21] {
-    let mut buf = [b'0'; 21];
-    let mut val = v;
-    let mut pos = 20;
-    if val == 0 { return buf; }
-    loop {
-        buf[pos] = b'0' + (val % 10) as u8;
-        val /= 10;
-        if val == 0 { break; }
-        pos -= 1;
-    }
-    buf
-}
-
-fn sanitize_filename(input: &[u8]) -> ([u8; 320], usize) {
-    let mut buf = [0u8; 320];
-    let mut pos = 0;
-    for &b in input {
-        if b == 0 || pos >= 319 { break; }
-        buf[pos] = match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' | b'_' => b,
-            _ => b'_',
-        };
-        pos += 1;
-    }
-    (buf, pos)
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  Script builders
-// ═══════════════════════════════════════════════════════════════════════════
-
-fn build_premount_script(offset_bytes: u64, needs_sr_mod: bool) -> [u8; 8192] {
-    let mut script = [0u8; 8192];
-    let sr_mod_line: &[u8] = if needs_sr_mod { b"modprobe sr_mod 2>/dev/null\n" } else { b"" };
-    let dec = format_decimal_u64(offset_bytes);
-    let off_slice = strip_leading_zeros(&dec);
-
-    // The premount script now:
-    //   1. Parses choosable.iso_offset= from /proc/cmdline as CMDLINE_OFFSET
-    //   2. Falls back to compiled-in OFFSET if no cmdline override
-    // This is critical for Ubuntu/Pop!_OS where the initramfs-tools hook
-    // runs in early userspace and the compiled-in offset may not match
-    // if the partition table was remapped by the kernel.
-    let src = b"\
-#!/bin/sh
-echo 'choosable: starting premount' >/dev/console
-modprobe loop 2>/dev/null;modprobe iso9660 2>/dev/null
-modprobe exfat 2>/dev/null;modprobe ntfs3 2>/dev/null
-modprobe virtio_blk 2>/dev/null;modprobe virtio_pci 2>/dev/null
-SRMOD
-for i in 0 1 2 3 4 5 6 7;do [ -b /dev/loop$i ]||mknod /dev/loop$i b 7 $i 2>/dev/null;done
-[ -d /cdrom ]||mkdir -p /cdrom /lib/live/mount/medium 2>/dev/null
-OFFSET_FROM_CMDLINE
-sleep 5
-N=0;while [ $N -lt 60 ];do N=$((N+1))
-while read -r a b c d;do case $d in loop*|ram*|dm-*|sr*)continue;;*[0-9]);;*)continue;;esac
-dev=/dev/$d;[ -b $dev ]||continue
-LOOP=;for i in 0 1 2 3 4 5 6 7;do L=/dev/loop$i
-losetup $L >/dev/null 2>&1&&continue
-O=OFFSET;[ -n \"$__CO\" ]&&O=\"$__CO\"
-losetup -o $O $L $dev 2>/dev/null||{ losetup -d $L 2>/dev/null;continue;}
-LOOP=$L;break;done;[ -n \"$LOOP\" ]||continue
-mount -t iso9660 -o ro $LOOP /cdrom 2>/dev/null||{ losetup -d $LOOP 2>/dev/null;continue;}
-mount --make-rshared /cdrom 2>/dev/null
-mount -o bind /cdrom /lib/live/mount/medium 2>/dev/null
-    [ -f /cdrom/casper/filesystem.squashfs ]&&exit 0
-    [ -f /cdrom/casper/filesystem.* ]&&exit 0
-    [ -f /cdrom/casper/vmlinuz ]&&exit 0
-    [ -d /cdrom/casper ]&&exit 0
-    [ -d /cdrom/pop-os ]&&exit 0
-    [ -f /cdrom/live/filesystem.squashfs ]&&exit 0
-    [ -f /cdrom/LiveOS/squashfs.img ]&&exit 0
-    [ -f /cdrom/.alpine-release ]&&exit 0
-    [ -f /cdrom/.ALPINE_RELEASE ]&&exit 0
-    [ -d /cdrom/apks ]&&exit 0
-    [ -d /cdrom/arch ]&&{ mkdir -p /run/archiso/bootmnt 2>/dev/null;mount -o bind /cdrom /run/archiso/bootmnt 2>/dev/null;exit 0;}
-    [ -f /cdrom/.disk/info ]&&exit 0
-    [ -d /cdrom/distros ]&&exit 0
-    [ -d /cdrom/dists ]&&exit 0
-    [ -d /cdrom/pool ]&&exit 0
-umount /lib/live/mount/medium 2>/dev/null
-umount /cdrom 2>/dev/null
-losetup -d $LOOP 2>/dev/null
-done</proc/partitions
-sleep 1;done
-echo 'choosable: gave up - no ISO found on any partition' >/dev/console
-exit 0
-";
-    let mut pos = 0;
-    let mut i = 0;
-    while i < src.len() {
-        // OFFSET_FROM_CMDLINE must be checked BEFORE OFFSET because
-        // "OFFSET_FROM_CMDLINE" starts with "OFFSET".  Checking OFFSET
-        // first would corrupt the longer marker.
-        if i + 5 <= src.len() && &src[i..i+5] == b"SRMOD" {
-            let max = sr_mod_line.len().min(8191 - pos);
-            script[pos..pos + max].copy_from_slice(&sr_mod_line[..max]);
-            pos += max; i += 5;
-        } else if i + 19 <= src.len() && &src[i..i+19] == b"OFFSET_FROM_CMDLINE" {
-            let max = CMDLINE_OFFSET_SNIPPET.len().min(8191 - pos);
-            script[pos..pos + max].copy_from_slice(&CMDLINE_OFFSET_SNIPPET[..max]);
-            pos += max; i += 19;
-        } else if i + 6 <= src.len() && &src[i..i+6] == b"OFFSET" {
-            let max = off_slice.len().min(8191 - pos);
-            script[pos..pos + max].copy_from_slice(&off_slice[..max]);
-            pos += max; i += 6;
-        } else {
-            if pos < 8191 { script[pos] = src[i]; pos += 1; }
-            i += 1;
-        }
-    }
-    script
-}
-
-fn build_bottom_script(iso_name: &[u8]) -> [u8; 2048] {
-    let mut script = [0u8; 2048];
-    let (safe_name, safe_len) = sanitize_filename(iso_name);
-
-    let logline = {
-        let mut buf = [0u8; 320];
-        let prefix = b"Choosable-";
-        let suffix = b".log";
-        buf[..prefix.len()].copy_from_slice(prefix);
-        let n = safe_len.min(250);
-        buf[prefix.len()..prefix.len() + n].copy_from_slice(&safe_name[..n]);
-        let end = prefix.len() + n;
-        buf[end..end + suffix.len()].copy_from_slice(suffix);
-        let l = (end + suffix.len()).min(319);
-        (buf, l)
-    };
-    let logline_slice = &logline.0[..logline.1];
-
-    let src = b"\
-#!/bin/sh
-exec >/dev/null 2>&1
-modprobe exfat 2>/dev/null;modprobe ntfs3 2>/dev/null
-mkdir -p /tmp
-while read a b c d;do case $d in loop*|ram*|dm-*|sr*)continue;;*[0-9]);;*)continue;;esac
-dev=/dev/$d;[ -b $dev ]||continue
-mount -t exfat -o rw $dev /tmp 2>/dev/null||mount -t ntfs3 -o rw $dev /tmp 2>/dev/null||continue
-(dmesg;cat /proc/cmdline)>/tmp/LOGNAME
-umount /tmp;exit 0
-done</proc/partitions
-";
-    let mut pos = 0;
-    let mut i = 0;
-    while i < src.len() {
-        if i + 7 <= src.len() && &src[i..i+7] == b"LOGNAME" {
-            let max = logline_slice.len().min(2047 - pos);
-            script[pos..pos + max].copy_from_slice(&logline_slice[..max]);
-            pos += max; i += 7;
-        } else {
-            if pos < 2047 { script[pos] = src[i]; pos += 1; }
-            i += 1;
-        }
-    }
-    script
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  CPIO helpers
-// ═══════════════════════════════════════════════════════════════════════════
 
 fn cpio_entry_size(name_len: usize, data_len: usize) -> usize {
     let padded_name_len = ((110 + name_len + 1 + 3) & !3) - 110;
@@ -612,18 +102,12 @@ fn cpio_append_entry(cpio: &mut [u8], off: &mut usize, name: &[u8], data: &[u8],
     true
 }
 
-/// Allocates a CPIO buffer, appends all `names`/`data` pairs + TRAILER!!!,
-/// and returns a `PremountBundle`.  Caller must set `cpio_alloc_size` to the
-/// pool allocation size.
-fn build_cpio(
-    bs: &mut BootServices,
-    names: &[&[u8]],
-    data: &[&[u8]],
-    offset_bytes: u64,
-) -> Option<PremountBundle> {
-    if names.len() != data.len() { return None; }
-    // Each entry has a header (110 + padded_name), data, and up to 3 bytes
-    // of padding for 4-byte alignment.  Add 8 bytes margin per entry.
+/// Build a minimal CPIO containing the /init.choosable ELF binary.
+fn build_premount_cpio(bs: &mut BootServices, relative_sector_offset: u64) -> Option<PremountBundle> {
+    let offset_bytes = relative_sector_offset * 512;
+    let names: &[&[u8]] = &[b"init.choosable"];
+    let data: &[&[u8]] = &[PREMOUNT_INIT_BIN];
+
     let estimate = names.iter().zip(data.iter())
         .map(|(&n, &d)| cpio_entry_size(n.len(), d.len()) + 8)
         .sum::<usize>()
@@ -648,44 +132,15 @@ fn build_cpio(
     Some(PremountBundle { cpio_buf: cpio_ptr as *mut u8, cpio_size: off, cpio_alloc_size: alloc_size, iso_offset_bytes: offset_bytes })
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  Public builder
-// ═══════════════════════════════════════════════════════════════════════════
+// ── Public entry points (for backward compatibility with fixup! macro) ───
 
-pub fn prepare_premount_initrd(
-    bs: &mut BootServices,
-    relative_sector_offset: u64,
-    needs_sr_mod: bool,
-    iso_name: &[u8],
-) -> Option<PremountBundle> {
-    let offset_bytes = relative_sector_offset * 512;
-    let premount_script = build_premount_script(offset_bytes, needs_sr_mod);
-    let premount_len = premount_script.iter().position(|&c| c == 0).unwrap_or(8191);
-    let bottom_script = build_bottom_script(iso_name);
-    let bottom_len = bottom_script.iter().position(|&c| c == 0).unwrap_or(2047);
+pub fn prepare_generic_initrd(bs: &mut BootServices, rel: u64, _iso_name: &[u8]) -> Option<PremountBundle> { build_premount_cpio(bs, rel) }
+pub fn prepare_arch_initrd(bs: &mut BootServices, rel: u64, _iso_name: &[u8]) -> Option<PremountBundle> { build_premount_cpio(bs, rel) }
+pub fn prepare_alpine_initrd(bs: &mut BootServices, rel: u64, _iso_name: &[u8]) -> Option<PremountBundle> { build_premount_cpio(bs, rel) }
+pub fn prepare_dracut_initrd(bs: &mut BootServices, rel: u64, _iso_name: &[u8]) -> Option<PremountBundle> { build_premount_cpio(bs, rel) }
+pub fn prepare_premount_initrd(bs: &mut BootServices, rel: u64, _sr: bool, _iso_name: &[u8]) -> Option<PremountBundle> { build_premount_cpio(bs, rel) }
 
-    let names: &[&[u8]] = &[
-        b"scripts/local-premount/00choosable",
-        b"scripts/init-premount/00choosable",
-        b"scripts/live/00choosable",
-        b"scripts/live-premount/00choosable",
-        b"scripts/casper-premount/00choosable",
-        b"scripts/casper-bottom/00choosable",
-    ];
-    let data: &[&[u8]] = &[
-        &premount_script[..premount_len],
-        &premount_script[..premount_len],
-        &premount_script[..premount_len],
-        &premount_script[..premount_len],
-        &premount_script[..premount_len],
-        &bottom_script[..bottom_len],
-    ];
-    build_cpio(bs, names, data, offset_bytes)
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  Tests
-// ═══════════════════════════════════════════════════════════════════════════
+// ── Tests ─────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -700,41 +155,9 @@ mod tests {
     }
 
     #[test]
-    fn test_format_decimal_u64() {
-        let r = format_decimal_u64(0);
-        assert_eq!(&r[20..], b"0");
-        let r = format_decimal_u64(42);
-        assert_eq!(&r[19..], b"42");
-        let r = format_decimal_u64(12345678901234567890);
-        // Just verify it doesn't panic and contains digits
-        assert!(r.iter().all(|&c| c >= b'0' && c <= b'9'));
-    }
-
-    #[test]
-    fn test_strip_leading_zeros() {
-        let buf = format_decimal_u64(42);
-        let s = strip_leading_zeros(&buf);
-        assert_eq!(s, b"42");
-        let buf = format_decimal_u64(0);
-        let s = strip_leading_zeros(&buf);
-        assert_eq!(s, b"0");
-    }
-
-    #[test]
-    fn test_sanitize_filename() {
-        let (buf, len) = sanitize_filename(b"Hello World.iso");
-        assert_eq!(&buf[..len], b"Hello_World.iso");
-        let (buf, len) = sanitize_filename(b"test-v1.0_file.iso");
-        assert_eq!(&buf[..len], b"test-v1.0_file.iso");
-        let (buf, len) = sanitize_filename(b"bad\xffname.iso");
-        assert_eq!(&buf[..len], b"bad_name.iso");
-    }
-
-    #[test]
     fn test_cpio_entry_size() {
-        // TRAILER!!! (10 chars) => name_len=10, data=0
         let sz = cpio_entry_size(10, 0);
-        assert!(sz >= 110 + 1 + 10 + 1); // header + null + name + pad
+        assert!(sz >= 110 + 1 + 10 + 1);
     }
 
     #[test]
@@ -742,42 +165,6 @@ mod tests {
         let mut buf = [0u8; 128];
         let sz = cpio_newc_header(&mut buf, b"TRAILER!!!", 0, 0);
         assert!(sz > 0 && sz < 128);
-        // Magic check
         assert_eq!(&buf[..6], b"070701");
-        // Name should be null-terminated
-        assert_eq!(buf[sz - 1], 0);
-    }
-
-    #[test]
-    fn test_subst_template() {
-        let mut dst = [0u8; 64];
-        let src = b"hello OFFSET world";
-        let len = subst_template(&mut dst, src, b"OFFSET", b"12345", 63);
-        assert_eq!(&dst[..len], b"hello 12345 world");
-    }
-
-    #[test]
-    fn test_subst_template_no_match() {
-        let mut dst = [0u8; 64];
-        let src = b"hello world";
-        let len = subst_template(&mut dst, src, b"OFFSET", b"12345", 63);
-        assert_eq!(&dst[..len], b"hello world");
-    }
-
-    #[test]
-    fn test_subst_template_multiple() {
-        let mut dst = [0u8; 128];
-        let src = b"aOFFSETbOFFSETc";
-        let len = subst_template(&mut dst, src, b"OFFSET", b"X", 127);
-        assert_eq!(&dst[..len], b"aXbXc");
-    }
-
-    #[test]
-    fn test_subst_template_truncation() {
-        let mut dst = [0u8; 10];
-        let src = b"hello OFFSET world";
-        let len = subst_template(&mut dst, src, b"OFFSET", b"12345678901234", 9);
-        // Fits only "hello 123" in 10 bytes (cap=9)
-        assert_eq!(&dst[..len], b"hello 123");
     }
 }

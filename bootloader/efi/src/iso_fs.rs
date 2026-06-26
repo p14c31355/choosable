@@ -16,7 +16,7 @@ use core::ffi::c_void;
 
 use crate::protocol::{
     BlockIoProtocol, BootServices, FileProtocol, SimpleFileSystemProtocol,
-    EfiFileInfo, EfiTime, Guid, SystemTable,
+    EfiFileInfo, EfiTime, Guid, SystemTable, VirtualBlockIo,
     EFI_SUCCESS, EFI_NOT_FOUND, EFI_INVALID_PARAMETER,
     EFI_UNSUPPORTED, EFI_BAD_BUFFER_SIZE, EFI_DEVICE_ERROR,
     EFI_WRITE_PROTECTED, FILE_INFO_GUID, EFI_OUT_OF_RESOURCES,
@@ -47,6 +47,11 @@ pub struct IsoFsCtx {
     /// Detected distro family (set after scanning ISO directory structure).
     pub boot_kind: crate::boot_kind::BootKind,
     pub bootloader_type: crate::boot_kind::BootloaderType,
+    /// Virtual Block I/O handle — when set, SFS reads go through the
+    /// virtual Block I/O (which applies patched grub.cfg, PVD edits, and
+    /// premount CPIO injection) instead of reading directly from the
+    /// physical disk.
+    pub vbio_ptr: *mut VirtualBlockIo,
 }
 
 #[repr(C)]
@@ -81,6 +86,27 @@ pub struct VirtualFile {
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn read_iso_sector(ctx: &IsoFsCtx, iso_sector: u32, buf: &mut [u8; 2048]) -> bool {
+    // When the virtual Block I/O is available, route reads through it so
+    // that all patches (PVD Volume ID, grub.cfg content, directory entry
+    // renames, premount CPIO injection) are visible to SFS consumers.
+    // This is critical for systemd-boot (Arch) which reads ISO metadata
+    // via SFS instead of raw Block I/O.
+    if !ctx.vbio_ptr.is_null() {
+        // The virtual Block I/O media has bim_bs=2048, so the LBA is in
+        // 2048-byte ISO sector units (not 512-byte disk sectors).
+        let media_id = unsafe { (*ctx.vbio_ptr).media.mid };
+        let status = unsafe {
+            ((*ctx.vbio_ptr).protocol.read_blocks)(
+                ctx.vbio_ptr as *mut BlockIoProtocol,
+                media_id, // use actual media ID from VirtualBlockIo
+                iso_sector as u64, // ISO sector LBA (2048-byte units)
+                2048, // buffer_size (one ISO sector)
+                buf.as_mut_ptr() as *mut c_void,
+            )
+        };
+        return status == EFI_SUCCESS;
+    }
+
     let disk_lba = ctx.iso_lba + iso_sector as u64 * 4;
     let bio_ref = unsafe { &*ctx.real_bio_ptr };
     let status = unsafe {
@@ -162,7 +188,7 @@ fn lookup_in_dir(ctx: &IsoFsCtx, dir_lba: u32, dir_size: u32, name: &[u16]) -> O
     None
 }
 
-fn parse_pvd(ctx: &IsoFsCtx) -> Option<(u32, u32)> {
+pub fn parse_pvd(ctx: &IsoFsCtx) -> Option<(u32, u32)> {
     let mut pvd = [0u8; 2048];
     if !read_iso_sector(ctx, 16, &mut pvd) { return None; }
     if pvd[0] != 1 || &pvd[1..6] != b"CD001" { return None; }
@@ -641,6 +667,7 @@ pub fn create_iso_fs(
         premount_target_name_len: 0,
         boot_kind: crate::boot_kind::BootKind::Unknown,
         bootloader_type: crate::boot_kind::BootloaderType::Grub,
+        vbio_ptr: core::ptr::null_mut(),
     };
     if let Some((rlb, rsz)) = parse_pvd(&instance.ctx) { instance.ctx.root_lba = rlb; instance.ctx.root_size = rsz; }
     else { unsafe { (bs.free_pool)(ptr); } return core::ptr::null_mut(); }

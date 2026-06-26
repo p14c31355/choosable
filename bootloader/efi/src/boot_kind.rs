@@ -88,11 +88,15 @@ impl BootKind {
                 b" boot=live live-media=removable init=/init.choosable"
             }
             BootKind::FedoraLive => {
-                // CDLABEL=CHOOSABLE works because PVD Volume ID is patched.
-                b" rd.live.image root=live:CDLABEL=CHOOSABLE rd.live.dir=/LiveOS rootdelay=10"
+                // CDLABEL=CHOOSABLE works only for GRUB pre-boot (virtual
+                // Block I/O PVD patch).  At runtime, dracut sees the real
+                // physical disk and cannot match LABEL=CHOOSABLE.  Therefore
+                // init=/init.choosable is needed so premount mounts the ISO
+                // from the partition offset before dracut scans for root.
+                b" rd.live.image root=live:CDLABEL=CHOOSABLE rd.live.dir=/LiveOS rootdelay=10 init=/init.choosable"
             }
             BootKind::ArchIso => {
-                b" archisodevice=LABEL=CHOOSABLE archisobasedir=arch copytoram"
+                b" archisodevice=LABEL=CHOOSABLE archisobasedir=arch copytoram init=/init.choosable"
             }
             BootKind::Alpine => {
                 b" init=/init.choosable modules=loop,iso9660"
@@ -107,9 +111,11 @@ impl BootKind {
 
     /// Extra kernel args appended at the end of linux lines (before newline).
     /// DebianLive uses `findiso=` (native live-boot ISO scanner).
+    /// Casper uses `iso-scan/filename=` so casper-premount can locate the ISO.
     /// Other boot kinds use premount initrd for ISO discovery — no EOL needed.
     pub fn linux_eol_extra(&self) -> &'static [u8] {
         match self {
+            BootKind::Casper => b" iso-scan/filename=",
             BootKind::DebianLive => b" findiso=",
             _ => b"",
         }
@@ -250,7 +256,7 @@ mod tests {
         assert_eq!(BootKind::Casper.linux_extra(true), b" boot=casper casper_path=pop-os maybe-ubiquity init=/init.choosable");
         assert_eq!(BootKind::WindowsPE.linux_extra(false), b"");
         assert_eq!(BootKind::DebianLive.linux_eol_extra(), b" findiso=");
-        assert_eq!(BootKind::Casper.linux_eol_extra(), b"");
+        assert_eq!(BootKind::Casper.linux_eol_extra(), b" iso-scan/filename=");
     }
 
     #[test]

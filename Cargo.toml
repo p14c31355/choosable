@@ -6,6 +6,7 @@ members = [
 exclude = [
     "bootloader/kernel",
     "bootloader/efi",
+    "bootloader/premount-init",
 ]
 resolver = "2"
 
