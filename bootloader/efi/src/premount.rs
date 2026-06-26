@@ -25,24 +25,21 @@ pub trait EarlyBootFixup {
 // ── Fixup structs (one per distro family) ────────────────────────────
 
 macro_rules! fixup {
-    ($name:ident) => {
-        pub struct $name;
-        impl EarlyBootFixup for $name {
-            fn build_initrd(&self, ctx: &BootContext, bs: &mut BootServices) -> Option<PremountBundle> {
-                let p = ctx.selected_payload()?;
-                let rel = p.file_start_lba - ctx.partition_start_lba;
-                build_premount_cpio(bs, rel)
+    ($($name:ident),+ $(,)?) => {
+        $(
+            pub struct $name;
+            impl EarlyBootFixup for $name {
+                fn build_initrd(&self, ctx: &BootContext, bs: &mut BootServices) -> Option<PremountBundle> {
+                    let p = ctx.selected_payload()?;
+                    let rel = p.file_start_lba - ctx.partition_start_lba;
+                    build_premount_cpio(bs, rel)
+                }
             }
-        }
+        )+
     };
 }
 
-fixup!(CasperFixup);
-fixup!(LiveBootFixup);
-fixup!(DracutFixup);
-fixup!(AlpinePremountFixup);
-fixup!(ArchFixup);
-fixup!(AlpineFixup);
+fixup!(CasperFixup, LiveBootFixup, DracutFixup, AlpinePremountFixup, ArchFixup, AlpineFixup);
 
 pub struct WindowsPEFixup;
 impl EarlyBootFixup for WindowsPEFixup {
@@ -132,13 +129,19 @@ fn build_premount_cpio(bs: &mut BootServices, relative_sector_offset: u64) -> Op
     Some(PremountBundle { cpio_buf: cpio_ptr as *mut u8, cpio_size: off, cpio_alloc_size: alloc_size, iso_offset_bytes: offset_bytes })
 }
 
-// ── Public entry points (for backward compatibility with fixup! macro) ───
+// ── Public entry points (for backward compatibility) ─────────────────
 
-pub fn prepare_generic_initrd(bs: &mut BootServices, rel: u64, _iso_name: &[u8]) -> Option<PremountBundle> { build_premount_cpio(bs, rel) }
-pub fn prepare_arch_initrd(bs: &mut BootServices, rel: u64, _iso_name: &[u8]) -> Option<PremountBundle> { build_premount_cpio(bs, rel) }
-pub fn prepare_alpine_initrd(bs: &mut BootServices, rel: u64, _iso_name: &[u8]) -> Option<PremountBundle> { build_premount_cpio(bs, rel) }
-pub fn prepare_dracut_initrd(bs: &mut BootServices, rel: u64, _iso_name: &[u8]) -> Option<PremountBundle> { build_premount_cpio(bs, rel) }
-pub fn prepare_premount_initrd(bs: &mut BootServices, rel: u64, _sr: bool, _iso_name: &[u8]) -> Option<PremountBundle> { build_premount_cpio(bs, rel) }
+macro_rules! prep_initrd_fn {
+    ($($fn:ident),+ $(,)?) => {
+        $( pub fn $fn(bs: &mut BootServices, rel: u64, _iso_name: &[u8]) -> Option<PremountBundle> { build_premount_cpio(bs, rel) } )+
+    };
+}
+
+prep_initrd_fn!(prepare_generic_initrd, prepare_arch_initrd, prepare_alpine_initrd, prepare_dracut_initrd);
+
+pub fn prepare_premount_initrd(bs: &mut BootServices, rel: u64, _sr: bool, _iso_name: &[u8]) -> Option<PremountBundle> {
+    build_premount_cpio(bs, rel)
+}
 
 // ── Tests ─────────────────────────────────────────────────────────────
 

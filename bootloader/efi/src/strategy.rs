@@ -159,41 +159,28 @@ fn patch_grub_cfg_impl(
     // DebianLive findiso= needs the file path.
     // If iso_location is None, skip EOL injection entirely to avoid bare "findiso=" or "choosable.iso_offset=".
     let mut eol_buf = [0u8; 320];
-    let eol_extra_dynamic: &[u8] = if !linux_eol_extra.is_empty() && linux_eol_extra.ends_with(b"=") {
-        if let Some(loc) = inp.iso_location {
+    let eol_extra_dynamic = if !linux_eol_extra.is_empty() && linux_eol_extra.ends_with(b"=") {
+        inp.iso_location.map_or(b"".as_ref(), |loc| {
             let plen = linux_eol_extra.len();
             if linux_eol_extra == b" findiso=" {
-                // DebianLive: needs full path (e.g. /ubuntu.iso)
-                let path = loc.path();
-                let pl = path.len().min(320 - plen);
+                let path = loc.path(); let pl = path.len().min(320 - plen);
                 eol_buf[..plen].copy_from_slice(linux_eol_extra);
                 eol_buf[plen..plen + pl].copy_from_slice(&path[..pl]);
                 &eol_buf[..plen + pl]
             } else if linux_eol_extra == b" iso-scan/filename=" {
-                // Casper/Ubuntu: needs just filename (e.g. ubuntu.iso)
-                let fname = loc.file_name();
-                let pl = fname.len().min(320 - plen);
+                let fname = loc.file_name(); let pl = fname.len().min(320 - plen);
                 eol_buf[..plen].copy_from_slice(linux_eol_extra);
                 eol_buf[plen..plen + pl].copy_from_slice(&fname[..pl]);
                 &eol_buf[..plen + pl]
             } else {
-                // choosable.iso_offset=  — needs decimal byte offset
-                let offset = loc.offset_bytes();
-                let mut off_str = [0u8; 21];
-                let mut v = offset;
-                let mut pos = 20;
-                if v == 0 { off_str[20] = b'0'; }
-                else { loop { off_str[pos] = b'0' + (v % 10) as u8; v /= 10; if v == 0 { break; } pos -= 1; } }
-                let off_len = 21 - pos;
+                let (digits, dpos) = build_decimal_buf(loc.offset_bytes());
+                let off_len = 21 - dpos;
                 eol_buf[..plen].copy_from_slice(linux_eol_extra);
                 let pl = off_len.min(320 - plen);
-                eol_buf[plen..plen + pl].copy_from_slice(&off_str[pos..pos + pl]);
+                eol_buf[plen..plen + pl].copy_from_slice(&digits[dpos..dpos + pl]);
                 &eol_buf[..plen + pl]
             }
-        } else {
-            // iso_location is None — skip EOL injection to avoid bare "findiso=" or "choosable.iso_offset="
-            b""
-        }
+        })
     } else { linux_eol_extra };
 
     // Always build choosable.iso_offset=<decimal> as a separate injection.
@@ -202,33 +189,16 @@ fn patch_grub_cfg_impl(
     // iso-scan/filename=) for Casper/DebianLive, and as the sole EOL arg
     // for all other boot kinds (Fedora, Arch, Alpine, etc.).
     let mut iso_offset_buf = [0u8; 64];
-    let iso_offset_dynamic: &[u8] = if let Some(loc) = inp.iso_location {
-        let offset = loc.offset_bytes();
+    let iso_offset_dynamic = inp.iso_location.map_or(b"".as_ref(), |loc| {
         let prefix = b" choosable.iso_offset=";
         let plen = prefix.len();
-        // Build the full string left-to-right: prefix first, then decimal digits.
-        let mut write_pos = 0usize;
-        iso_offset_buf[write_pos..write_pos + plen].copy_from_slice(prefix);
-        write_pos += plen;
-        let mut v = offset;
-        let mut digits = [0u8; 21];
-        let mut dpos = 20;
-        if v == 0 { digits[20] = b'0'; }
-        else {
-            loop {
-                digits[dpos] = b'0' + (v % 10) as u8;
-                v /= 10;
-                if v == 0 { break; }
-                dpos -= 1;
-            }
-        }
+        iso_offset_buf[..plen].copy_from_slice(prefix);
+        let (digits, dpos) = build_decimal_buf(loc.offset_bytes());
         let dlen = 21 - dpos;
-        iso_offset_buf[write_pos..write_pos + dlen].copy_from_slice(&digits[dpos..dpos + dlen]);
-        write_pos += dlen;
-        &iso_offset_buf[..write_pos]
-    } else {
-        b""
-    };
+        let wp = plen + dlen;
+        iso_offset_buf[plen..wp].copy_from_slice(&digits[dpos..dpos + dlen]);
+        &iso_offset_buf[..wp]
+    });
 
     let (linux_count, initrd_count) = count_matching_lines(orig);
     let extra = linux_count * (linux_extra.len() + eol_extra_dynamic.len() + iso_offset_dynamic.len())
@@ -312,8 +282,25 @@ fn patch_grub_cfg_impl(
     Some(PatchOutput { buf: out_ptr, size: dst })
 }
 
+// ── Decimal string builder (shared) ────────────────────────────────────
+
+fn build_decimal_buf(mut v: u64) -> ([u8; 21], usize) {
+    let mut digits = [0u8; 21];
+    let mut dpos = 20;
+    if v == 0 { digits[20] = b'0'; }
+    else {
+        loop {
+            digits[dpos] = b'0' + (v % 10) as u8;
+            v /= 10;
+            if v == 0 { break; }
+            dpos -= 1;
+        }
+    }
+    (digits, dpos)
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
-//  Public entry point — replaces old BootStrategy dispatch
+//  Internal helpers
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Patch a GRUB configuration file to inject the kernel cmdline arguments and
