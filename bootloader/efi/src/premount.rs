@@ -509,10 +509,10 @@ exit 0
             let max = sr_mod_line.len().min(8191 - pos);
             script[pos..pos + max].copy_from_slice(&sr_mod_line[..max]);
             pos += max; i += 5;
-        } else if i + 21 <= src.len() && &src[i..i+21] == b"OFFSET_FROM_CMDLINE" {
+        } else if i + 19 <= src.len() && &src[i..i+19] == b"OFFSET_FROM_CMDLINE" {
             let max = CMDLINE_OFFSET_SNIPPET.len().min(8191 - pos);
             script[pos..pos + max].copy_from_slice(&CMDLINE_OFFSET_SNIPPET[..max]);
-            pos += max; i += 21;
+            pos += max; i += 19;
         } else if i + 6 <= src.len() && &src[i..i+6] == b"OFFSET" {
             let max = off_slice.len().min(8191 - pos);
             script[pos..pos + max].copy_from_slice(&off_slice[..max]);
