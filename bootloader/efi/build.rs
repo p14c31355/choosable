@@ -24,8 +24,28 @@ fn main() {
         panic!("premount-init source directory not found at: {}", premount_src.display());
     }
 
+    // Determine target directory: prefer CARGO_TARGET_DIR, otherwise use OUT_DIR-relative
+    let target_dir = env::var("CARGO_TARGET_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env::var("OUT_DIR").unwrap())
+                .parent()
+                .and_then(|p| p.parent())
+                .and_then(|p| p.parent())
+                .expect("cannot derive target dir from OUT_DIR")
+                .to_path_buf()
+        });
+
     let status = Command::new("cargo")
-        .args(["build", "--target", "x86_64-unknown-linux-musl", "--release"])
+        .args([
+            "build",
+            "--target",
+            "x86_64-unknown-linux-musl",
+            "--release",
+            "--target-dir",
+        ])
+        .arg(&target_dir)
         .current_dir(&premount_src)
         .status()
         .unwrap_or_else(|e| {
@@ -36,8 +56,8 @@ fn main() {
         panic!("premount-init build failed with status: {}", status);
     }
 
-    let built = premount_src
-        .join("target/x86_64-unknown-linux-musl/release/premount-init");
+    let built = target_dir
+        .join("x86_64-unknown-linux-musl/release/premount-init");
     if !built.exists() {
         panic!("premount-init binary not found after successful build at: {}", built.display());
     }
