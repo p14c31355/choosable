@@ -16,7 +16,7 @@ use core::ffi::c_void;
 
 use crate::protocol::{
     BlockIoProtocol, BootServices, FileProtocol, SimpleFileSystemProtocol,
-    EfiFileInfo, EfiTime, Guid, SystemTable,
+    EfiFileInfo, EfiTime, Guid, SystemTable, VirtualBlockIo,
     EFI_SUCCESS, EFI_NOT_FOUND, EFI_INVALID_PARAMETER,
     EFI_UNSUPPORTED, EFI_BAD_BUFFER_SIZE, EFI_DEVICE_ERROR,
     EFI_WRITE_PROTECTED, FILE_INFO_GUID, EFI_OUT_OF_RESOURCES,
@@ -47,6 +47,11 @@ pub struct IsoFsCtx {
     /// Detected distro family (set after scanning ISO directory structure).
     pub boot_kind: crate::boot_kind::BootKind,
     pub bootloader_type: crate::boot_kind::BootloaderType,
+    /// Virtual Block I/O handle — when set, SFS reads go through the
+    /// virtual Block I/O (which applies patched grub.cfg, PVD edits, and
+    /// premount CPIO injection) instead of reading directly from the
+    /// physical disk.
+    pub vbio_ptr: *mut VirtualBlockIo,
 }
 
 #[repr(C)]
@@ -641,6 +646,7 @@ pub fn create_iso_fs(
         premount_target_name_len: 0,
         boot_kind: crate::boot_kind::BootKind::Unknown,
         bootloader_type: crate::boot_kind::BootloaderType::Grub,
+        vbio_ptr: core::ptr::null_mut(),
     };
     if let Some((rlb, rsz)) = parse_pvd(&instance.ctx) { instance.ctx.root_lba = rlb; instance.ctx.root_size = rsz; }
     else { unsafe { (bs.free_pool)(ptr); } return core::ptr::null_mut(); }

@@ -107,9 +107,11 @@ impl BootKind {
 
     /// Extra kernel args appended at the end of linux lines (before newline).
     /// DebianLive uses `findiso=` (native live-boot ISO scanner).
+    /// Casper uses `iso-scan/filename=` so casper-premount can locate the ISO.
     /// Other boot kinds use premount initrd for ISO discovery — no EOL needed.
     pub fn linux_eol_extra(&self) -> &'static [u8] {
         match self {
+            BootKind::Casper => b" iso-scan/filename=",
             BootKind::DebianLive => b" findiso=",
             _ => b"",
         }
@@ -250,7 +252,7 @@ mod tests {
         assert_eq!(BootKind::Casper.linux_extra(true), b" boot=casper casper_path=pop-os maybe-ubiquity init=/init.choosable");
         assert_eq!(BootKind::WindowsPE.linux_extra(false), b"");
         assert_eq!(BootKind::DebianLive.linux_eol_extra(), b" findiso=");
-        assert_eq!(BootKind::Casper.linux_eol_extra(), b"");
+        assert_eq!(BootKind::Casper.linux_eol_extra(), b" iso-scan/filename=");
     }
 
     #[test]

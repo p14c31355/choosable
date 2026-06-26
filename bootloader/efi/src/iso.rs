@@ -598,7 +598,13 @@ fn try_patch_candidate(
     let has_linux = (orig.len() >= 6 && orig.windows(6).any(|w| w == b"linux " || w == b"linux\t"))
         || (orig.len() >= 9 && orig.windows(9).any(|w| w == b"linuxefi " || w == b"linuxefi\t"));
     let has_menuentry = orig.len() >= 9 && orig.windows(9).any(|w| w == b"menuentry" || w == b"MenuEntry");
-    let has_relevant_directive = has_linux || has_menuentry;
+    // Fedora 40+ uses BLS (Boot Loader Spec) — grub.cfg contains only
+    // `blscfg` with no explicit linux/initrd lines.  Detect this so the
+    // patcher can inject a `set kernelopts=...` line before blscfg.
+    let has_blscfg = (orig.len() >= 6 && orig.windows(6).any(|w| w == b"blscfg" || w == b"BLSCFG"))
+        || (orig.len() >= 9 && orig.windows(9).any(|w| w == b"blscfg\n" || w == b"BLSCFG\n"))
+        || (orig.len() >= 7 && orig.windows(7).any(|w| w == b"\nblscfg" || w == b"\nBLSCFG"));
+    let has_relevant_directive = has_linux || has_menuentry || has_blscfg;
     if !has_relevant_directive {
         unsafe { (bs.free_pool)(orig_ptr as *mut c_void); }
         return false;
@@ -766,7 +772,7 @@ fn patch_grub_cfg_blockio(
             return;
         }
     }
-    print_raw(st, b"[grub.cfg] No patchable .CFG found (none have 'linux' line).\r\n\0");
+    print_raw(st, b"[grub.cfg] No patchable .CFG found (none have 'linux', 'menuentry', or 'blscfg').\r\n\0");
 }
 
 fn recursive_find_cfg_with_loc(
@@ -1218,6 +1224,16 @@ fn uefi_chainload_iso(
             halt_or_reboot(st);
         }
     };
+
+    // Route SFS reads through the virtual Block I/O so that patched
+    // grub.cfg, PVD edits, and premount CPIO injection are visible
+    // to applications using the Simple File System protocol (e.g.
+    // systemd-boot on Arch).  Without this, SFS reads go directly
+    // to the physical disk and miss all Block I/O-layer patches.
+    if !sfs_instance.is_null() && !vbio_ptr.is_null() {
+        let sfs = unsafe { &mut *sfs_instance };
+        sfs.ctx.vbio_ptr = vbio_ptr;
+    }
 
     // ── Scan ISO directory structure for boot kind detection ──────────
     let boot_desc = scan_iso_structure(bio_ref, bio_ptr, mid, iso_lba, bs);
