@@ -324,6 +324,10 @@ pub struct VirtualBlockIo {
     pub premount_entry_new_extent: u32,
     pub premount_entry_new_size: u32,
     pub premount_entry_patched: bool,
+    /// When premount_entry_patched is true, also rewrite the ISO9660
+    /// name field to "PREMOUNT.CPIO" so that GRUB's initrd directive
+    /// "/PREMOUNT.CPIO" resolves correctly.
+    pub premount_entry_rename: bool,
     /// ── Injected synthetic entry (when no existing entry to patch) ──
     /// If true, a complete ISO9660 directory record is written at
     /// premount_entry_sector/offset (instead of patching extent fields).
@@ -461,6 +465,7 @@ pub const EFI_NO_MEDIA: usize             = 0x80000000_00000014usize;
 pub const EFI_WRITE_PROTECTED: usize      = 0x80000000_00000011usize;
 pub const EFI_OUT_OF_RESOURCES: usize     = 0x80000000_00000009usize;
 pub const EFI_SECURITY_VIOLATION: usize   = 0x80000000_0000001Ausize;
+pub const EFI_NOT_READY: usize            = 0x80000000_00000006usize;
 
 pub const BLOCK_IO_PROTOCOL_GUID: Guid = Guid {
     d1: 0x964e5b21,

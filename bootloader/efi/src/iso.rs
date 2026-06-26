@@ -13,7 +13,7 @@ use core::ffi::c_void;
 
 use crate::disk::read_sector;
 use crate::fs::{FsCtx, PayloadEntry, PayloadType, PAYLOAD_SLOT_COUNT};
-use crate::output::{format_u64_buf, halt_or_reboot, print_dec, print_hex, print_raw};
+use crate::output::{format_u64_buf, halt_or_reboot, print_dec, print_hex, print_raw, wait_for_keypress};
 use crate::protocol::{
     BlockIoProtocol, BootServices, LoadedImageProtocol, MemoryType, SystemTable,
     DevicePathProtocol, VirtualBlockIo, EFI_SUCCESS, LOADED_IMAGE_PROTOCOL_GUID,
@@ -238,11 +238,63 @@ fn find_first_file_in_dir(
                     continue;
                 }
 
-                // Skip EFI boot files — needed by the chainloaded shim/GRUB.
+                // Skip records that are too small to be renamed to "PREMOUNT.CPIO;1" (requires 48 bytes)
+                if record_len < 48 {
+                    offset += record_len;
+                    continue;
+                }
+
+                // Skip EFI boot files — these MUST NOT be overwritten
                 let is_efi_boot =
-                    &upper[..cl] == b"BOOTX64.EFI"
-                    || &upper[..cl] == b"BOOTIA32.EFI";
+                    (eff_len >= 4 && {
+                        let ofs = name_offset + eff_len - 4;
+                        scratch[ofs] == b'.' && (scratch[ofs+1] | 0x20) == b'e'
+                            && (scratch[ofs+2] | 0x20) == b'f' && (scratch[ofs+3] | 0x20) == b'i'
+                    })
+                    || &upper[..cl] == b"BOOTX64.EFI"
+                    || &upper[..cl] == b"BOOTIA32.EFI"
+                    || &upper[..cl] == b"GRUBX64.EFI"
+                    || &upper[..cl] == b"SHIMX64.EFI"
+                    || &upper[..cl] == b"SYSTEMD-BOOTX64.EFI"
+                    || &upper[..cl] == b"SYSTEMD-BOOTIA32.EFI"
+                    || &upper[..cl] == b"SHELLX64.EFI"
+                    || &upper[..cl] == b"SHELLIA32.EFI"
+                    || &upper[..cl] == b"MMX64.EFI"
+                    || &upper[..cl] == b"BOOTMGFW.EFI";
                 if is_efi_boot {
+                    offset += record_len;
+                    continue;
+                }
+                // Also skip kernel/initrd payloads used by GRUB —
+                // these filename patterns match known distro conventions.
+                // ISO9660 entries may have trailing dots after version-suffix
+                // stripping (e.g. raw "MACH_KERNEL.;1" → eff_len=12, name="MACH_KERNEL.").
+                // Strip trailing dot(s) for comparison.
+                let eff_name = &upper[..cl];
+                let kernel_compare_len = if cl > 0 && upper[cl-1] == b'.' { cl - 1 } else { cl };
+                let is_kernel_like =
+                    kernel_compare_len >= 1 && (
+                        (kernel_compare_len == 11 && &upper[..kernel_compare_len] == b"MACH_KERNEL")
+                        || &upper[..kernel_compare_len] == b"VMLINUZ"
+                        || &upper[..kernel_compare_len] == b"VMLINUX"
+                        || (kernel_compare_len >= 6 && &upper[..6] == b"VMLINU"
+                            && (upper[6] == b'Z' || upper[6] == b'X'
+                                || (upper[6] >= b'0' && upper[6] <= b'9')))
+                    );
+                if is_kernel_like {
+                    offset += record_len;
+                    continue;
+                }
+                // Also skip known initrd payload names.
+                let is_initrd_like =
+                    kernel_compare_len >= 4 && (
+                        &upper[..kernel_compare_len] == b"INITRD"
+                        || &upper[..kernel_compare_len] == b"INITRD.IMG"
+                        || &upper[..kernel_compare_len] == b"INITRAMFS.IMG"
+                        || (kernel_compare_len >= 6 && &upper[..6] == b"INITRD"
+                            && (upper[6] == b'.' || upper[6] == b'-'))
+                    );
+                if is_initrd_like {
                     offset += record_len;
                     continue;
                 }
@@ -278,7 +330,11 @@ fn find_first_file_in_dir(
                     b"BOOT", b"EFI", b"GRUB", b"GRUB2", b"FEDORA",
                     b"ISOLINUX", b"SYSLINUX", b"BOOT",
                 ];
-                let is_known_dir = known_dirs.iter().any(|&d| d.len() == cl && d == &upper[..cl]);
+                let is_known_dir = known_dirs.iter().any(|&d| d.len() == cl && d == &upper[..cl])
+                    // ISO9660 version suffix stripping can leave a trailing dot
+                    // (e.g. "CASPER.;1" → "CASPER."), so also try matching
+                    // after removing a trailing dot.
+                    || (cl >= 2 && upper[cl - 1] == b'.' && known_dirs.iter().any(|&d| d.len() + 1 == cl && d == &upper[..cl - 1]));
                 if is_known_dir {
                     offset += record_len;
                     continue;
@@ -444,7 +500,20 @@ fn find_efi_boot(
     }
     let (boot_lba, boot_size) = boot_dir?;
 
-    let efi_names: &[&[u8]] = &[b"BOOTX64.EFI", b"BOOTIA32.EFI", b"GRUBX64.EFI", b"SHIMX64.EFI"];
+    // Prefer GRUB/shim over systemd-boot shell.  SHELL*.EFI are last
+    // because loading them produces an interactive EFI shell instead of
+    // booting the OS.  systemd-boot (Arch) is loaded via BOOTX64.EFI.
+    let efi_names: &[&[u8]] = &[
+        b"GRUBX64.EFI",
+        b"SHIMX64.EFI",
+        b"BOOTX64.EFI",
+        b"BOOTIA32.EFI",
+        b"SYSTEMD-BOOTX64.EFI",
+        b"SYSTEMD-BOOTIA32.EFI",
+        // SHELL*.EFI are fallbacks only — they start an EFI shell, not an OS.
+        b"SHELLX64.EFI",
+        b"SHELLIA32.EFI",
+    ];
     for &name in efi_names {
         if let Some(v) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, boot_lba, boot_size, name, &mut scratch) {
             return Some((v.0, v.1, name));
@@ -523,13 +592,14 @@ fn try_patch_candidate(
         }
     }
 
-    // Only patch if the file contains 'linux' or 'linuxefi' lines.
-    // Alpine menuentry-only configs are NOT supported because the current
-    // patching logic only rewrites existing kernel lines — it does not
-    // inject new linux/initrd directives into menuentry blocks.
+    // Patch if the file contains 'linux'/'linuxefi' lines or is a menuentry-only
+    // GRUB config (Alpine, etc).  For menuentry-only configs, the strategy patcher
+    // will inject linux/initrd lines into the first menuentry block.
     let has_linux = (orig.len() >= 6 && orig.windows(6).any(|w| w == b"linux " || w == b"linux\t"))
         || (orig.len() >= 9 && orig.windows(9).any(|w| w == b"linuxefi " || w == b"linuxefi\t"));
-    if !has_linux {
+    let has_menuentry = orig.len() >= 9 && orig.windows(9).any(|w| w == b"menuentry" || w == b"MenuEntry");
+    let has_relevant_directive = has_linux || has_menuentry;
+    if !has_relevant_directive {
         unsafe { (bs.free_pool)(orig_ptr as *mut c_void); }
         return false;
     }
@@ -624,18 +694,32 @@ fn patch_grub_cfg_blockio(
     let mut entry_count = 0usize;
 
     // Fedora uses /EFI/fedora/grub.cfg; also search Fedora-specific paths.
-    // The recursive scan will find all .cfg files as a fallback.
-    let known_paths: [(&[u8], &[u8], &[u8], &[u8]); 10] = [
-        (b"BOOT", b"GRUB",  b"GRUB.CFG",     b"/boot/grub/grub.cfg"),
-        (b"BOOT", b"GRUB",  b"LOOPBACK.CFG", b"/boot/grub/loopback.cfg"),
-        (b"BOOT", b"GRUB2", b"GRUB.CFG",     b"/boot/grub2/grub.cfg"),
-        (b"BOOT", b"GRUB2", b"LOOPBACK.CFG", b"/boot/grub2/loopback.cfg"),
-        (b"EFI",  b"BOOT",  b"GRUB.CFG",     b"/EFI/BOOT/grub.cfg"),
-        (b"EFI",  b"FEDORA", b"GRUB.CFG",    b"/EFI/fedora/grub.cfg"),
-        (b"EFI",  b"FEDORA", b"GRUB.CFG",    b"/EFI/Fedora/grub.cfg"),
-        (b"",     b"",      b"GRUB.CFG",     b"/grub.cfg"),
-        (b"",     b"",      b"GRUB.CFG",     b"/grub2/grub.cfg"),
-        (b"",     b"",      b"GRUB.CFG",     b"/Fedora/grub.cfg"),
+    // Alpine uses /boot/grub/grub.cfg at ISO root; GRUB2 shell fallback
+    // is entered when no grub.cfg is found — ensure all possible locations
+    // are covered.  The recursive scan will find any remaining .cfg files.
+    let known_paths: [(&[u8], &[u8], &[u8], &[u8]); 19] = [
+        (b"BOOT",  b"GRUB",   b"GRUB.CFG",     b"/boot/grub/grub.cfg"),
+        (b"BOOT",  b"GRUB",   b"LOOPBACK.CFG", b"/boot/grub/loopback.cfg"),
+        (b"BOOT",  b"GRUB2",  b"GRUB.CFG",     b"/boot/grub2/grub.cfg"),
+        (b"BOOT",  b"GRUB2",  b"LOOPBACK.CFG", b"/boot/grub2/loopback.cfg"),
+        (b"EFI",   b"BOOT",   b"GRUB.CFG",     b"/EFI/BOOT/grub.cfg"),
+        (b"EFI",   b"FEDORA", b"GRUB.CFG",     b"/EFI/fedora/grub.cfg"),
+        (b"EFI",   b"FEDORA", b"GRUB.CFG",     b"/EFI/Fedora/grub.cfg"),
+        (b"EFI",   b"fedora", b"GRUB.CFG",     b"/EFI/fedora/grub.cfg"),
+        (b"EFI",   b"LINUX",  b"GRUB.CFG",     b"/EFI/linux/grub.cfg"),
+        (b"EFI",   b"LINUX",  b"LOOPBACK.CFG", b"/EFI/linux/loopback.cfg"),
+        (b"",      b"",       b"GRUB.CFG",     b"/grub.cfg"),
+        (b"GRUB2", b"",       b"GRUB.CFG",     b"/grub2/grub.cfg"),
+        (b"FEDORA",b"",       b"GRUB.CFG",     b"/Fedora/grub.cfg"),
+        (b"",      b"",       b"LOOPBACK.CFG", b"/loopback.cfg"),
+        // Alpine 3.20+ may use /grub/grub.cfg directly
+        (b"GRUB",  b"",       b"GRUB.CFG",     b"/grub/grub.cfg"),
+        // Fedora 40+ may place grub.cfg under /loader/entries/
+        (b"EFI",   b"BOOT",   b"GRUB.CFG",     b"/EFI/BOOT/grubx64/grub.cfg"),
+        // openSUSE / SLES paths
+        (b"EFI",   b"BOOT",   b"GRUB.CFG",     b"/EFI/BOOT/x86_64-efi/grub.cfg"),
+        (b"",      b"",       b"SYSLINUX.CFG", b"/syslinux/syslinux.cfg"),
+        (b"",      b"",       b"ISOLINUX.CFG", b"/isolinux/isolinux.cfg"),
     ];
 
     for (dir1, dir2, filename, path) in &known_paths {
@@ -807,6 +891,7 @@ pub fn scan_iso_structure(
             if boot_kind == BootKind::Unknown {
                 if is_dir {
                          if name_matches(name, b"CASPER")  { boot_kind = BootKind::Casper; }
+                    else if name_matches(name, b"POP-OS")  { boot_kind = BootKind::Casper; }
                     else if name_matches(name, b"LIVE")    { boot_kind = BootKind::DebianLive; }
                     else if name_matches(name, b"LIVEOS")  { boot_kind = BootKind::FedoraLive; }
                     else if name_matches(name, b"ARCH")    { boot_kind = BootKind::ArchIso; }
@@ -1151,10 +1236,15 @@ fn uefi_chainload_iso(
             crate::boot_kind::FixupType::Alpine =>
                 crate::premount::prepare_alpine_initrd(bs, iso_lba - part1_lba, iso_name),
             crate::boot_kind::FixupType::AlpinePremount =>
-                crate::premount::prepare_premount_initrd(bs, iso_lba - part1_lba, false, iso_name),
+                crate::premount::prepare_alpine_initrd(bs, iso_lba - part1_lba, iso_name),
+            crate::boot_kind::FixupType::Dracut =>
+                crate::premount::prepare_dracut_initrd(bs, iso_lba - part1_lba, iso_name),
             crate::boot_kind::FixupType::Arch =>
                 crate::premount::prepare_arch_initrd(bs, iso_lba - part1_lba, iso_name),
             crate::boot_kind::FixupType::WindowsPE => None,
+            crate::boot_kind::FixupType::Casper |
+            crate::boot_kind::FixupType::LiveBoot =>
+                crate::premount::prepare_generic_initrd(bs, iso_lba - part1_lba, iso_name),
             _ => {
                 let needs_sr = boot_kind.needs_sr_mod();
                 crate::premount::prepare_premount_initrd(bs, iso_lba - part1_lba, needs_sr, iso_name)
@@ -1201,6 +1291,11 @@ fn uefi_chainload_iso(
                 vb.premount_entry_new_extent = vb.premount_file_sector;
                 vb.premount_entry_new_size = bundle.cpio_size as u32;
                 vb.premount_entry_patched = true;
+                // Also patch the directory entry's NAME to "PREMOUNT.CPIO"
+                // so GRUB can find it at the path referenced in grub.cfg.
+                // The original entry keeps its name otherwise, which doesn't
+                // match "/PREMOUNT.CPIO" and causes initrd load failure.
+                vb.premount_entry_rename = true;
 
                 if !sfs_instance.is_null() {
                     let sfs = unsafe { &mut *sfs_instance };
@@ -1458,20 +1553,7 @@ fn uefi_chainload_iso(
             (*lip).parent_handle = image_handle;
         }
     }
-    print_raw(st, b"Press any key to start...\r\n\0");
-    {
-        let bs_ref = unsafe { &mut *st.boot_services };
-        if !st.con_in.is_null() {
-            let ci = unsafe { &mut *(st.con_in as *mut crate::protocol::SimpleTextInput) };
-            loop {
-                let mut k = crate::protocol::Key { sc: 0, uc: 0 };
-                if unsafe { (ci.read_key_stroke)(ci as *mut _, &mut k) } == EFI_SUCCESS {
-                    break;
-                }
-                unsafe { (bs_ref.stall)(100_000) };
-            }
-        }
-    }
+    wait_for_keypress(st, Some(b"Press any key to start...\r\n\0"), 100_000);
     print_raw(st, b"Starting (try #1, with DeviceHandle)...\r\n\0");
     let mut status = unsafe { (bs.start_image)(child_handle, &mut 0u64, &mut core::ptr::null_mut::<u16>()) };
 
@@ -1481,42 +1563,15 @@ fn uefi_chainload_iso(
         print_raw(st, b"StartImage #1 returned UNSUPPORTED, retrying without DeviceHandle...\r\n\0");
         let mut lip2: *mut LoadedImageProtocol = core::ptr::null_mut();
         if unsafe { (bs.handle_protocol)(child_handle, &LOADED_IMAGE_PROTOCOL_GUID, &mut lip2 as *mut _ as _) } == EFI_SUCCESS && !lip2.is_null() {
-            unsafe {
-                (*lip2).device_handle = core::ptr::null_mut();
-            }
+            unsafe { (*lip2).device_handle = core::ptr::null_mut(); }
         }
         status = unsafe { (bs.start_image)(child_handle, &mut 0u64, &mut core::ptr::null_mut::<u16>()) };
     }
     print_hex(st, b"StartImage returned 0x\0", status as u64);
     print_raw(st, b"\r\n\0");
     // Wait for key press so user can read the return value before possible reset
-    print_raw(st, b"Press any key...\r\n\0");
-    {
-        let bs_ref = unsafe { &mut *st.boot_services };
-        if !st.con_in.is_null() {
-            let ci = unsafe { &mut *(st.con_in as *mut crate::protocol::SimpleTextInput) };
-            loop {
-                let mut k = crate::protocol::Key { sc: 0, uc: 0 };
-                if unsafe { (ci.read_key_stroke)(ci as *mut _, &mut k) } == EFI_SUCCESS {
-                    break;
-                }
-                unsafe { (bs_ref.stall)(100_000) };
-            }
-        }
-    }
+    wait_for_keypress(st, Some(b"Press any key...\r\n\0"), 100_000);
     if status != EFI_SUCCESS {
-        print_raw(st, b"Press any key to reboot...\r\n\0");
-        let bs_ref = unsafe { &mut *st.boot_services };
-        if !st.con_in.is_null() {
-            let ci = unsafe { &mut *(st.con_in as *mut crate::protocol::SimpleTextInput) };
-            loop {
-                let mut k = crate::protocol::Key { sc: 0, uc: 0 };
-                if unsafe { (ci.read_key_stroke)(ci as *mut _, &mut k) } == EFI_SUCCESS {
-                    break;
-                }
-                unsafe { (bs_ref.stall)(100_000) };
-            }
-        }
         halt_or_reboot(st);
     }
     // Child called ExitBootServices.  Never reboot.

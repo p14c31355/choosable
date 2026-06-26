@@ -122,10 +122,18 @@ fn patch_grub_cfg_impl(
         if let Some(loc) = inp.iso_location {
             let plen = linux_eol_extra.len();
             if linux_eol_extra == b" findiso=" {
+                // DebianLive: needs full path (e.g. /ubuntu.iso)
                 let path = loc.path();
                 let pl = path.len().min(320 - plen);
                 eol_buf[..plen].copy_from_slice(linux_eol_extra);
                 eol_buf[plen..plen + pl].copy_from_slice(&path[..pl]);
+                &eol_buf[..plen + pl]
+            } else if linux_eol_extra == b" iso-scan/filename=" {
+                // Casper/Ubuntu: needs just filename (e.g. ubuntu.iso)
+                let fname = loc.file_name();
+                let pl = fname.len().min(320 - plen);
+                eol_buf[..plen].copy_from_slice(linux_eol_extra);
+                eol_buf[plen..plen + pl].copy_from_slice(&fname[..pl]);
                 &eol_buf[..plen + pl]
             } else {
                 // choosable.iso_offset=  — needs decimal byte offset
@@ -194,6 +202,7 @@ fn patch_grub_cfg_impl(
             }
             else if (t.starts_with(b"initrd ") || t.starts_with(b"initrd\t")
                 || t.starts_with(b"initrdefi ") || t.starts_with(b"initrdefi\t"))
+                && !effective_target.is_empty()
                 && dedup_slice.len() <= line.len()
                 && !line.windows(dedup_slice.len()).any(|w| w == dedup_slice)
             {

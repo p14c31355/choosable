@@ -308,6 +308,23 @@ unsafe extern "efiapi" fn vblock_read(
             if !is_dir_patched && !read_real_iso_sector(vbio, block_lba, dst, block_offset) { return EFI_DEVICE_ERROR; }
             patch_dir_entry(&mut dst[block_offset..block_offset + 2048],
                 vbio.premount_entry_offset as usize, vbio.premount_entry_new_extent, vbio.premount_entry_new_size);
+            // Also rename the ISO9660 directory entry to "PREMOUNT.CPIO;1"
+            // so GRUB can resolve the /PREMOUNT.CPIO path from grub.cfg.
+            if vbio.premount_entry_rename {
+                let off = vbio.premount_entry_offset as usize;
+                let name = b"PREMOUNT.CPIO;1";
+                // ISO9660 name length at byte 32, record length at byte 0
+                let name_len_byte = name.len() as u8;
+                if off < 2048 && block_offset + off < dst.len() {
+                    let record_len = dst[block_offset + off] as usize;
+                    // Check both sector boundary and record length can fit the new name
+                    if off + 33 + name.len() <= 2048 && 33 + name.len() <= record_len {
+                        dst[block_offset + off + 32] = name_len_byte;
+                        dst[block_offset + off + 33..block_offset + off + 33 + name.len()]
+                            .copy_from_slice(name);
+                    }
+                }
+            }
         }
 
         if is_premount_injected {
@@ -497,6 +514,7 @@ pub fn create_virtual_cdrom(
     vbio.premount_entry_new_extent = 0;
     vbio.premount_entry_new_size = 0;
     vbio.premount_entry_patched = false;
+    vbio.premount_entry_rename = false;
     vbio.premount_file_sector = 0;
     vbio.premount_file_sectors = 0;
     vbio.premount_file_buf = core::ptr::null_mut();
