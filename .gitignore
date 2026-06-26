@@ -3,3 +3,5 @@
 bootloader/target
 bootloader/kernel/target
 bootloader/efi/target
+bootloader/premount-init/target
+bootloader/efi/premount-init.bin

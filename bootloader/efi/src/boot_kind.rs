@@ -88,11 +88,15 @@ impl BootKind {
                 b" boot=live live-media=removable init=/init.choosable"
             }
             BootKind::FedoraLive => {
-                // CDLABEL=CHOOSABLE works because PVD Volume ID is patched.
-                b" rd.live.image root=live:CDLABEL=CHOOSABLE rd.live.dir=/LiveOS rootdelay=10"
+                // CDLABEL=CHOOSABLE works only for GRUB pre-boot (virtual
+                // Block I/O PVD patch).  At runtime, dracut sees the real
+                // physical disk and cannot match LABEL=CHOOSABLE.  Therefore
+                // init=/init.choosable is needed so premount mounts the ISO
+                // from the partition offset before dracut scans for root.
+                b" rd.live.image root=live:CDLABEL=CHOOSABLE rd.live.dir=/LiveOS rootdelay=10 init=/init.choosable"
             }
             BootKind::ArchIso => {
-                b" archisodevice=LABEL=CHOOSABLE archisobasedir=arch copytoram"
+                b" archisodevice=LABEL=CHOOSABLE archisobasedir=arch copytoram init=/init.choosable"
             }
             BootKind::Alpine => {
                 b" init=/init.choosable modules=loop,iso9660"

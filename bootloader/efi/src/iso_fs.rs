@@ -86,6 +86,26 @@ pub struct VirtualFile {
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn read_iso_sector(ctx: &IsoFsCtx, iso_sector: u32, buf: &mut [u8; 2048]) -> bool {
+    // When the virtual Block I/O is available, route reads through it so
+    // that all patches (PVD Volume ID, grub.cfg content, directory entry
+    // renames, premount CPIO injection) are visible to SFS consumers.
+    // This is critical for systemd-boot (Arch) which reads ISO metadata
+    // via SFS instead of raw Block I/O.
+    if !ctx.vbio_ptr.is_null() {
+        // The virtual Block I/O media has bim_bs=2048, so the LBA is in
+        // 2048-byte ISO sector units (not 512-byte disk sectors).
+        let status = unsafe {
+            ((*ctx.vbio_ptr).protocol.read_blocks)(
+                ctx.vbio_ptr as *mut BlockIoProtocol,
+                0, // media_id — unused by the virtual driver
+                iso_sector as u64, // ISO sector LBA (2048-byte units)
+                2048, // buffer_size (one ISO sector)
+                buf.as_mut_ptr() as *mut c_void,
+            )
+        };
+        return status == EFI_SUCCESS;
+    }
+
     let disk_lba = ctx.iso_lba + iso_sector as u64 * 4;
     let bio_ref = unsafe { &*ctx.real_bio_ptr };
     let status = unsafe {

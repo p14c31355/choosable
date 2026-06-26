@@ -186,18 +186,21 @@ fn patch_grub_cfg_impl(
                 && !line.windows(linux_extra.len()).any(|w| w == linux_extra)
                 && !linux_extra.is_empty()
             {
-                let needs_eol = !eol_extra_dynamic.is_empty();
+                // Inject linux_extra after the kernel path (second
+                // argument).  This position is always before any "---"
+                // separator, so kernel parameters are guaranteed to be
+                // received by the kernel.
                 let inject_at = find_second_arg_end(line_start, out, dst);
                 shift_and_inject(out, inject_at, &mut dst, linux_extra);
-                if needs_eol {
-                    if dst > 0 && out[dst - 1] == b'\n' {
-                        let mut inject_at = dst - 1;
-                        if dst > 1 && out[dst - 2] == b'\r' { inject_at -= 1; }
-                        shift_and_inject(out, inject_at, &mut dst, eol_extra_dynamic);
-                    } else {
-                        out[dst..dst + eol_extra_dynamic.len()].copy_from_slice(eol_extra_dynamic);
-                        dst += eol_extra_dynamic.len();
-                    }
+
+                // Inject iso-scan/filename= (or findiso=) as a second
+                // argument block IMMEDIATELY AFTER linux_extra, with a
+                // leading space.  This places it before any "---" and
+                // ensures it's separated by whitespace from both the
+                // preceding arg and the following arg/separator.
+                if !eol_extra_dynamic.is_empty() {
+                    let inj2 = inject_at + linux_extra.len();
+                    shift_and_inject(out, inj2, &mut dst, eol_extra_dynamic);
                 }
             }
             else if (t.starts_with(b"initrd ") || t.starts_with(b"initrd\t")
