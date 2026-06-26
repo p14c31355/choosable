@@ -87,6 +87,47 @@ fn matches_any_lower(name: &[u8], patterns: &[&[u8]]) -> bool {
     }))
 }
 
+/// Remove all occurrences of ISO locator arguments (findiso=, iso-scan/filename=, choosable.iso_offset=)
+/// from the output buffer between line_start and dst, and adjust dst accordingly.
+fn remove_iso_locator_args(out: &mut [u8], line_start: usize, dst: &mut usize) {
+    let patterns: &[&[u8]] = &[b"findiso=", b"iso-scan/filename=", b"choosable.iso_offset="];
+
+    let mut pos = line_start;
+    let mut write_pos = line_start;
+
+    while pos < *dst {
+        let mut found_pattern = false;
+
+        // Check if we're at the start of an ISO locator argument
+        for pattern in patterns {
+            if pos + pattern.len() <= *dst && &out[pos..pos + pattern.len()] == *pattern {
+                // Found a pattern - skip it and its value
+                pos += pattern.len();
+                // Skip the argument value (until next space, tab, or newline)
+                while pos < *dst && out[pos] != b' ' && out[pos] != b'\t' && out[pos] != b'\n' && out[pos] != b'\r' {
+                    pos += 1;
+                }
+                // Skip trailing whitespace (but keep newlines)
+                while pos < *dst && (out[pos] == b' ' || out[pos] == b'\t') {
+                    pos += 1;
+                }
+                found_pattern = true;
+                break;
+            }
+        }
+
+        if !found_pattern {
+            if write_pos != pos {
+                out[write_pos] = out[pos];
+            }
+            write_pos += 1;
+            pos += 1;
+        }
+    }
+
+    *dst = write_pos;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Core patching engine
 // ═══════════════════════════════════════════════════════════════════════════
@@ -186,6 +227,12 @@ fn patch_grub_cfg_impl(
                 && !line.windows(linux_extra.len()).any(|w| w == linux_extra)
                 && !linux_extra.is_empty()
             {
+                // Remove any existing ISO locator arguments to prevent duplicates
+                // and ensure our dynamic value takes precedence.
+                if !eol_extra_dynamic.is_empty() {
+                    remove_iso_locator_args(out, line_start, &mut dst);
+                }
+
                 // Inject linux_extra after the kernel path (second
                 // argument).  This position is always before any "---"
                 // separator, so kernel parameters are guaranteed to be

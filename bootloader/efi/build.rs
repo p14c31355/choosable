@@ -20,35 +20,32 @@ fn main() {
     let premount_src = repo_root.join("bootloader/premount-init");
     let premount_bin = manifest_dir.join("premount-init.bin");
 
-    if premount_src.exists() {
-        let status = Command::new("cargo")
-            .args(["build", "--target", "x86_64-unknown-linux-musl", "--release"])
-            .current_dir(&premount_src)
-            .status();
-        match status {
-            Ok(s) if s.success() => {
-                let built = premount_src
-                    .join("target/x86_64-unknown-linux-musl/release/premount-init");
-                if built.exists() {
-                    fs::copy(&built, &premount_bin).unwrap_or_else(|e| {
-                        panic!("Failed to copy premount-init binary: {}", e);
-                    });
-                    println!("cargo:warning=premount-init built successfully");
-                } else {
-                    println!("cargo:warning=premount-init binary not found after build");
-                    // Create a minimal stub binary so include_bytes! doesn't fail
-                    let stub = [0x7f, b'E', b'L', b'F']; // minimal ELF magic — will fail gracefully
-                    fs::write(&premount_bin, stub).ok();
-                }
-            }
-            Ok(s) => {
-                println!("cargo:warning=premount-init build failed with status: {}", s);
-            }
-            Err(e) => {
-                println!("cargo:warning=premount-init cargo command failed: {}", e);
-            }
-        }
+    if !premount_src.exists() {
+        panic!("premount-init source directory not found at: {}", premount_src.display());
     }
+
+    let status = Command::new("cargo")
+        .args(["build", "--target", "x86_64-unknown-linux-musl", "--release"])
+        .current_dir(&premount_src)
+        .status()
+        .unwrap_or_else(|e| {
+            panic!("Failed to execute cargo command for premount-init: {}", e);
+        });
+
+    if !status.success() {
+        panic!("premount-init build failed with status: {}", status);
+    }
+
+    let built = premount_src
+        .join("target/x86_64-unknown-linux-musl/release/premount-init");
+    if !built.exists() {
+        panic!("premount-init binary not found after successful build at: {}", built.display());
+    }
+
+    fs::copy(&built, &premount_bin).unwrap_or_else(|e| {
+        panic!("Failed to copy premount-init binary: {}", e);
+    });
+    println!("cargo:warning=premount-init built successfully");
 
     // Rebuild if premount-init source changes
     println!(

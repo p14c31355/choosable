@@ -1233,6 +1233,13 @@ fn uefi_chainload_iso(
     if !sfs_instance.is_null() && !vbio_ptr.is_null() {
         let sfs = unsafe { &mut *sfs_instance };
         sfs.ctx.vbio_ptr = vbio_ptr;
+        // Re-parse PVD through virtual Block I/O to pick up any
+        // PVD edits (e.g. Volume ID patches) and update root directory
+        // metadata so SFS traversal uses the correct root state.
+        if let Some((rlb, rsz)) = crate::iso_fs::parse_pvd(&sfs.ctx) {
+            sfs.ctx.root_lba = rlb;
+            sfs.ctx.root_size = rsz;
+        }
     }
 
     // ── Scan ISO directory structure for boot kind detection ──────────

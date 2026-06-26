@@ -12,9 +12,34 @@ use std::io::Read;
 
 const MS_RDONLY: libc::c_ulong = 1;
 const MS_BIND: libc::c_ulong = 0x1000;
-const LOOP_SET_FD: i32 = 0x4C00u32 as i32;
-const LOOP_CLR_FD: i32 = 0x4C01u32 as i32;
+
+#[cfg(target_env = "musl")]
+type IoctlRequest = libc::c_int;
+#[cfg(not(target_env = "musl"))]
+type IoctlRequest = libc::c_ulong;
+
+const LOOP_SET_FD: IoctlRequest = 0x4C00;
+const LOOP_CLR_FD: IoctlRequest = 0x4C01;
+const LOOP_SET_STATUS64: IoctlRequest = 0x4C04;
 const MAX_OFFSET: u64 = 512 * 4_294_967_296;
+const LO_FLAGS_READ_ONLY: u32 = 1;
+
+#[repr(C)]
+struct LoopInfo64 {
+    lo_device: u64,
+    lo_inode: u64,
+    lo_rdevice: u64,
+    lo_offset: u64,
+    lo_sizelimit: u64,
+    lo_number: u32,
+    lo_encrypt_type: u32,
+    lo_encrypt_key_size: u32,
+    lo_flags: u32,
+    lo_file_name: [u8; 64],
+    lo_crypt_name: [u8; 64],
+    lo_encrypt_key: [u8; 32],
+    lo_init: [u64; 2],
+}
 
 // ── Console logging ────────────────────────────────────────────────────
 fn console_log(s: &str) {
@@ -84,7 +109,9 @@ fn check_distro() -> bool {
     if std::path::Path::new("/cdrom/LiveOS").is_dir() {
         console_log("LiveOS (Fedora) detected");
         unsafe {
+            do_mkdir("/run/initramfs");
             do_mkdir("/run/initramfs/live");
+            do_mkdir("/run/initramfs/live/LiveOS");
             do_mount("/cdrom/LiveOS", "/run/initramfs/live/LiveOS", "", MS_BIND);
         }
         return true;
@@ -92,6 +119,7 @@ fn check_distro() -> bool {
     if std::path::Path::new("/cdrom/arch").is_dir() {
         console_log("archiso detected");
         unsafe {
+            do_mkdir("/run/archiso");
             do_mkdir("/run/archiso/bootmnt");
             do_mount("/cdrom", "/run/archiso/bootmnt", "", MS_BIND);
         }
@@ -177,17 +205,26 @@ fn main() {
         let Some(li) = loop_i else { continue };
         let lp = format!("/dev/loop{li}");
 
-        // Mount with offset
-        let mount_ok = if offset > 0 {
-            let opts = format!("ro,offset={offset}");
-            let o = std::ffi::CString::new(opts).unwrap();
-            let l = std::ffi::CString::new(lp.as_str()).unwrap();
-            let t = std::ffi::CString::new("/cdrom").unwrap();
-            let f = std::ffi::CString::new("iso9660").unwrap();
-            unsafe { libc::mount(l.as_ptr(), t.as_ptr(), f.as_ptr(), MS_RDONLY, o.as_ptr() as *const libc::c_void) == 0 }
-        } else {
-            unsafe { do_mount(&lp, "/cdrom", "iso9660", MS_RDONLY) == 0 }
-        };
+        // Configure loop device with offset and read-only flag
+        if offset > 0 {
+            if let Ok(lf) = fs::OpenOptions::new().read(true).write(true).open(&lp) {
+                let lfd = lf.as_raw_fd();
+                let mut info: LoopInfo64 = unsafe { core::mem::zeroed() };
+                info.lo_offset = offset;
+                info.lo_flags = LO_FLAGS_READ_ONLY;
+                if unsafe { libc::ioctl(lfd, LOOP_SET_STATUS64, &info as *const LoopInfo64) } != 0 {
+                    // Failed to set offset on loop device - clean up and continue
+                    unsafe { libc::ioctl(lfd, LOOP_CLR_FD, 0) };
+                    continue;
+                }
+            } else {
+                // Failed to open loop device - continue to next
+                continue;
+            }
+        }
+
+        // Mount the loop device (offset is already configured on the device)
+        let mount_ok = unsafe { do_mount(&lp, "/cdrom", "iso9660", MS_RDONLY) == 0 };
 
         if !mount_ok {
             // Detach loop

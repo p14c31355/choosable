@@ -94,10 +94,11 @@ fn read_iso_sector(ctx: &IsoFsCtx, iso_sector: u32, buf: &mut [u8; 2048]) -> boo
     if !ctx.vbio_ptr.is_null() {
         // The virtual Block I/O media has bim_bs=2048, so the LBA is in
         // 2048-byte ISO sector units (not 512-byte disk sectors).
+        let media_id = unsafe { (*ctx.vbio_ptr).media.mid };
         let status = unsafe {
             ((*ctx.vbio_ptr).protocol.read_blocks)(
                 ctx.vbio_ptr as *mut BlockIoProtocol,
-                0, // media_id — unused by the virtual driver
+                media_id, // use actual media ID from VirtualBlockIo
                 iso_sector as u64, // ISO sector LBA (2048-byte units)
                 2048, // buffer_size (one ISO sector)
                 buf.as_mut_ptr() as *mut c_void,
@@ -187,7 +188,7 @@ fn lookup_in_dir(ctx: &IsoFsCtx, dir_lba: u32, dir_size: u32, name: &[u16]) -> O
     None
 }
 
-fn parse_pvd(ctx: &IsoFsCtx) -> Option<(u32, u32)> {
+pub fn parse_pvd(ctx: &IsoFsCtx) -> Option<(u32, u32)> {
     let mut pvd = [0u8; 2048];
     if !read_iso_sector(ctx, 16, &mut pvd) { return None; }
     if pvd[0] != 1 || &pvd[1..6] != b"CD001" { return None; }
