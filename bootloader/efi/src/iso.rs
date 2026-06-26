@@ -238,12 +238,13 @@ fn find_first_file_in_dir(
                     continue;
                 }
 
+                // Skip records that are too small to be renamed to "PREMOUNT.CPIO;1" (requires 48 bytes)
+                if record_len < 48 {
+                    offset += record_len;
+                    continue;
+                }
+
                 // Skip EFI boot files — these MUST NOT be overwritten
-                // because the chainloaded EFI binary (shim/GRUB/systemd-boot)
-                // needs to find them on the virtual CD-ROM.  Overwriting a
-                // directory entry with PREMOUNT.CPIO data corrupts the EFI
-                // binary extent reference, causing "UNSUPPORTED" or invalid
-                // image errors on StartImage.
                 let is_efi_boot =
                     (eff_len >= 4 && {
                         let ofs = name_offset + eff_len - 4;
