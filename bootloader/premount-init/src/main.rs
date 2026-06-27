@@ -99,7 +99,12 @@ fn parse_cmdline() -> CmdlineParams {
                     if v > 0 && v <= MAX_OFFSET { params.iso_offset = Some(v); }
                 }
                 b"choosable.part_guid" => {
-                    if let Ok(s) = std::str::from_utf8(val) { params.part_guid = Some(s.to_lowercase()); }
+                    if let Ok(s) = std::str::from_utf8(val) {
+                        let s = s.to_lowercase();
+                        if s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+                            params.part_guid = Some(s);
+                        }
+                    }
                 }
                 b"choosable.part_num" => {
                     let mut v: u32 = 0;

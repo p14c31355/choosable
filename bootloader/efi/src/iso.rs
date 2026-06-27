@@ -762,9 +762,9 @@ fn patch_grub_cfg_blockio(
     if entry_count == 0 {
         let mut raw_entries: [(u32, u32, u32, u32); 32] = [(0,0,0,0); 32];
         let mut raw_count = 0usize;
-        recursive_find_cfg_with_loc(
+        recursive_find_files_with_ext(
             bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size,
-            &mut scratch, &mut raw_entries, &mut raw_count, 0,
+            &mut scratch, &mut raw_entries, &mut raw_count, 0, b"cfg",
         );
         for i in 0..raw_count {
             let (ext_lba, ext_size, dir_sector, dir_offset) = raw_entries[i];
@@ -780,9 +780,9 @@ fn patch_grub_cfg_blockio(
             if let Some(entries_dir) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, loader_dir.0, loader_dir.1, b"ENTRIES", &mut scratch) {
                 let mut conf_entries: [(u32, u32, u32, u32); 32] = [(0,0,0,0); 32];
                 let mut conf_count = 0usize;
-                recursive_find_conf_with_loc(
+                recursive_find_files_with_ext(
                     bio_ref, bio_ptr, mid, iso_lba, entries_dir.0, entries_dir.1,
-                    &mut scratch, &mut conf_entries, &mut conf_count, 0,
+                    &mut scratch, &mut conf_entries, &mut conf_count, 0, b"conf",
                 );
                 for i in 0..conf_count {
                     let (ext_lba, ext_size, dir_sector, dir_offset) = conf_entries[i];
@@ -809,7 +809,7 @@ fn patch_grub_cfg_blockio(
     print_raw(st, b"[grub.cfg] No patchable .CFG found (none have 'linux', 'menuentry', or 'blscfg').\r\n\0");
 }
 
-fn recursive_find_conf_with_loc(
+fn recursive_find_files_with_ext(
     bio_ref: &BlockIoProtocol,
     bio_ptr: *mut BlockIoProtocol,
     mid: u32,
@@ -820,6 +820,7 @@ fn recursive_find_conf_with_loc(
     entries: &mut [(u32, u32, u32, u32); 32],
     entry_count: &mut usize,
     depth: usize,
+    ext: &[u8],
 ) {
     if depth > 16 || *entry_count >= 32 { return; }
     let total_sectors = ((dir_size as u64 + 2047) / 2048) as u32;
@@ -845,14 +846,11 @@ fn recursive_find_conf_with_loc(
                 } else {
                     name_len
                 };
-                let has_conf = eff_len >= 5 && {
-                    let ofs = name_offset + eff_len - 5;
-                    scratch[ofs] == b'.' && (scratch[ofs+1] | 0x20) == b'c'
-                        && (scratch[ofs+2] | 0x20) == b'o'
-                        && (scratch[ofs+3] | 0x20) == b'n'
-                        && (scratch[ofs+4] | 0x20) == b'f'
+                let has_ext = eff_len >= ext.len() + 1 && {
+                    let ofs = name_offset + eff_len - (ext.len() + 1);
+                    scratch[ofs] == b'.' && scratch[ofs+1..ofs+1+ext.len()].iter().zip(ext.iter()).all(|(&a, &b)| (a | 0x20) == (b | 0x20))
                 };
-                if has_conf && !is_dir && *entry_count < 32 {
+                if has_ext && !is_dir && *entry_count < 32 {
                     let mut dup = false;
                     for j in 0..*entry_count { if entries[j].0 == extent { dup = true; break; } }
                     if !dup {
@@ -861,66 +859,7 @@ fn recursive_find_conf_with_loc(
                     }
                 }
                 if is_dir && extent != dir_lba && *entry_count < 32 {
-                    recursive_find_conf_with_loc(bio_ref, bio_ptr, mid, iso_lba, extent, size, scratch, entries, entry_count, depth + 1);
-                    if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, dir_lba + s, scratch) { return; }
-                }
-            }
-            offset += record_len;
-        }
-    }
-}
-
-fn recursive_find_cfg_with_loc(
-    bio_ref: &BlockIoProtocol,
-    bio_ptr: *mut BlockIoProtocol,
-    mid: u32,
-    iso_lba: u64,
-    dir_lba: u32,
-    dir_size: u32,
-    scratch: &mut [u8; 2048],
-    entries: &mut [(u32, u32, u32, u32); 32],
-    entry_count: &mut usize,
-    depth: usize,
-) {
-    if depth > 16 || *entry_count >= 32 { return; }
-    let total_sectors = ((dir_size as u64 + 2047) / 2048) as u32;
-    for s in 0..total_sectors {
-        if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, dir_lba + s, scratch) { return; }
-        let mut offset: usize = 0;
-        while offset + 34 <= 2048 && offset < (dir_size as usize).saturating_sub(s as usize * 2048) {
-            let record_len = scratch[offset] as usize;
-            if record_len == 0 { break; }
-            if offset + record_len > 2048 { break; }
-            let name_len = scratch[offset + 32] as usize;
-            let name_offset = offset + 33;
-            if name_offset + name_len > 2048 { break; }
-            let flags = scratch[offset + 25];
-            let is_dir = flags & 0x02 != 0;
-            let extent = u32::from_le_bytes(scratch[offset + 2..offset + 6].try_into().unwrap());
-            let size = u32::from_le_bytes(scratch[offset + 10..offset + 14].try_into().unwrap());
-
-            let skip = name_len == 1 && (scratch[name_offset] == 0 || scratch[name_offset] == 1);
-            if !skip {
-                let eff_len = if name_len >= 2 && scratch[name_offset + name_len - 2] == b';' {
-                    name_len - 2
-                } else {
-                    name_len
-                };
-                let has_cfg = eff_len >= 4 && {
-                    let ofs = name_offset + eff_len - 4;
-                    scratch[ofs] == b'.' && (scratch[ofs+1] | 0x20) == b'c'
-                        && (scratch[ofs+2] | 0x20) == b'f' && (scratch[ofs+3] | 0x20) == b'g'
-                };
-                if has_cfg && !is_dir && *entry_count < 32 {
-                    let mut dup = false;
-                    for j in 0..*entry_count { if entries[j].0 == extent { dup = true; break; } }
-                    if !dup {
-                        entries[*entry_count] = (extent, size, dir_lba + s, offset as u32);
-                        *entry_count += 1;
-                    }
-                }
-                if is_dir && extent != dir_lba && *entry_count < 32 {
-                    recursive_find_cfg_with_loc(bio_ref, bio_ptr, mid, iso_lba, extent, size, scratch, entries, entry_count, depth + 1);
+                    recursive_find_files_with_ext(bio_ref, bio_ptr, mid, iso_lba, extent, size, scratch, entries, entry_count, depth + 1, ext);
                     if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, dir_lba + s, scratch) { return; }
                 }
             }

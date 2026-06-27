@@ -188,23 +188,14 @@ fn patch_grub_cfg_impl(
     let has_blscfg = blscfg_count > 0;
 
     // Count options lines for systemd-boot
-    let options_count = {
-        let mut count = 0;
-        let mut pos = 0;
-        while pos < orig.len() {
-            let start = pos;
-            while pos < orig.len() && orig[pos] != b'\n' { pos += 1; }
-            let line = &orig[start..pos];
+    let options_count = orig.split(|&b| b == b'\n')
+        .map(|line| {
             let mut ts = 0;
             while ts < line.len() && (line[ts] == b' ' || line[ts] == b'\t') { ts += 1; }
-            let t = &line[ts..];
-            if t.starts_with(b"options ") || t.starts_with(b"options\t") {
-                count += 1;
-            }
-            if pos < orig.len() { pos += 1; }
-        }
-        count
-    };
+            &line[ts..]
+        })
+        .filter(|t| t.starts_with(b"options ") || t.starts_with(b"options\t"))
+        .count();
 
     let (linux_count, initrd_count) = count_matching_lines(orig);
     let extra = linux_count * (linux_extra.len() + eol_extra_dynamic.len())
@@ -302,13 +293,6 @@ fn patch_grub_cfg_impl(
                 // linux_extra starts with a space; strip it for appending to options.
                 let extra_content = if linux_extra.starts_with(b" ") { &linux_extra[1..] } else { linux_extra };
                 if !extra_content.is_empty() {
-                    // Prepend space if the line doesn't already end with one
-                    let need_space = dst > line_start && out[dst - 1] != b' ' && out[dst - 1] != b'\t';
-                    let mut opt_buf = [0u8; 320];
-                    let mut ob = 0usize;
-                    if need_space { opt_buf[ob] = b' '; ob += 1; }
-                    opt_buf[ob..ob + extra_content.len()].copy_from_slice(extra_content);
-                    ob += extra_content.len();
                     let mut inject_at = dst;
                     if dst > 0 && out[dst - 1] == b'\n' {
                         inject_at -= 1;
@@ -316,6 +300,13 @@ fn patch_grub_cfg_impl(
                     } else if dst > 0 && out[dst - 1] == b'\r' {
                         inject_at -= 1;
                     }
+                    // Prepend space if the line doesn't already end with one
+                    let need_space = inject_at > line_start && out[inject_at - 1] != b' ' && out[inject_at - 1] != b'\t';
+                    let mut opt_buf = [0u8; 320];
+                    let mut ob = 0usize;
+                    if need_space { opt_buf[ob] = b' '; ob += 1; }
+                    opt_buf[ob..ob + extra_content.len()].copy_from_slice(extra_content);
+                    ob += extra_content.len();
                     shift_and_inject(out, inject_at, &mut dst, &opt_buf[..ob]);
                 }
             }

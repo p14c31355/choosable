@@ -145,18 +145,18 @@ impl BootStage for DiscoverPartitionStage {
                     // Partition found by LBA match — keep the MBR-derived LBA
                     ctx.partition_guid = guid;
                     ctx.partition_number = num;
-                } else if let Some((lba, guid)) = disk::find_gpt_data_partition(st, bio_ref, bio_ptr, mid) {
+                } else if let Some((lba, guid, num)) = disk::find_gpt_data_partition(st, bio_ref, bio_ptr, mid) {
                     // LBA match failed, fall back to first Basic Data partition
                     part1_lba = lba;
                     ctx.partition_guid = guid;
-                    ctx.partition_number = disk::count_gpt_partition_number(bio_ref, bio_ptr, mid, &guid) as u32;
+                    ctx.partition_number = num;
                 }
             } else {
                 // No MBR partition, use first valid GPT entry
-                if let Some((lba, guid)) = disk::find_gpt_data_partition(st, bio_ref, bio_ptr, mid) {
+                if let Some((lba, guid, num)) = disk::find_gpt_data_partition(st, bio_ref, bio_ptr, mid) {
                     part1_lba = lba;
                     ctx.partition_guid = guid;
-                    ctx.partition_number = disk::count_gpt_partition_number(bio_ref, bio_ptr, mid, &guid) as u32;
+                    ctx.partition_number = num;
                 }
             }
         }
