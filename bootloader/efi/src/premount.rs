@@ -31,7 +31,7 @@ macro_rules! fixup {
             impl EarlyBootFixup for $name {
                 fn build_initrd(&self, ctx: &BootContext, bs: &mut BootServices) -> Option<PremountBundle> {
                     let p = ctx.selected_payload()?;
-                    let rel = p.file_start_lba - ctx.partition_start_lba;
+                    let rel = p.file_start_lba.checked_sub(ctx.partition_start_lba)?;
                     build_premount_cpio(bs, rel)
                 }
             }
