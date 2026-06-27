@@ -96,6 +96,7 @@ fn remove_iso_locator_args(out: &mut [u8], line_start: usize, dst: &mut usize) {
     let patterns: &[&[u8]] = &[
         b"findiso=", b"iso-scan/filename=", b"choosable.iso_offset=",
         b"choosable.part_guid=", b"choosable.part_num=", b"choosable.iso_path=", b"choosable.iso_size=",
+        b"root=live:", // Fedora BLS original root= overrides our injected value
     ];
 
     let mut pos = line_start;

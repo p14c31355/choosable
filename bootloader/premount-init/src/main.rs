@@ -392,6 +392,10 @@ fn main() {
         do_mkdir("/tmp");
         do_mkdir("/cdrom");
         do_mkdir("/run");
+        // Mount tmpfs on /run before dracut does, so our bind mounts
+        // (/run/initramfs/live/LiveOS for Fedora, /run/archiso/bootmnt
+        // for Arch) survive when dracut skips its own tmpfs mount.
+        do_mount("tmpfs", "/run", "tmpfs", 0);
         for i in 0u32..8 {
             do_mknod_blk(&format!("/dev/loop{}", i), 7, i);
         }
@@ -401,12 +405,17 @@ fn main() {
     let params = parse_cmdline();
     let offset = params.iso_offset.unwrap_or(0);
 
-    // 3. Wait for devices
-    std::thread::sleep(std::time::Duration::from_secs(3));
-
-    // 4. Target partition via PARTUUID (preferred) or partition number
-    let target: Option<String> = params.part_guid.as_ref().and_then(|g| by_partuuid(g))
-        .or_else(|| params.part_num.and_then(|n| by_partnum(n)));
+    // 3. Wait for devices with retry
+    let mut target: Option<String> = None;
+    for attempt in 0..3 {
+        std::thread::sleep(std::time::Duration::from_secs(if attempt == 0 { 3 } else { 2 }));
+        target = params.part_guid.as_ref().and_then(|g| by_partuuid(g))
+            .or_else(|| params.part_num.and_then(|n| by_partnum(n)));
+        if target.is_some() {
+            break;
+        }
+        console_log(&format!("device not ready, retry {}/3", attempt + 1));
+    }
 
     let mounted = match target {
         Some(ref dev) => {

@@ -775,27 +775,40 @@ fn patch_grub_cfg_blockio(
         }
     }
 
-    // Arch ISO uses systemd-boot with /loader/entries/*.conf files
-    // that contain linux/initrd lines and must be patched.
-    // Fedora also uses BLS entries at /loader/entries/*.conf with
-    // "options" lines that need direct injection of our boot params.
+    // Search for BLS / systemd-boot .conf files that contain "options" lines.
+    // Fedora typically has them at /loader/entries/, /boot/loader/entries/,
+    // or /boot/x86_64/loader/entries/.
     if boot_kind == crate::boot_kind::BootKind::ArchIso
         || boot_kind == crate::boot_kind::BootKind::FedoraLive
         || entry_count == 0
     {
-        if let Some(loader_dir) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, b"LOADER", &mut scratch) {
-            if let Some(entries_dir) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, loader_dir.0, loader_dir.1, b"ENTRIES", &mut scratch) {
-                let mut conf_entries: [(u32, u32, u32, u32); 32] = [(0,0,0,0); 32];
-                let mut conf_count = 0usize;
-                recursive_find_files_with_ext(
-                    bio_ref, bio_ptr, mid, iso_lba, entries_dir.0, entries_dir.1,
-                    &mut scratch, &mut conf_entries, &mut conf_count, 0, b"conf",
-                );
-                for i in 0..conf_count {
-                    let (ext_lba, ext_size, dir_sector, dir_offset) = conf_entries[i];
-                    if ext_size == 0 { continue; }
-                    add_cfg_entry(&mut entries, &mut entry_count, ext_lba, ext_size, dir_sector, dir_offset, b"/loader/entries/<.conf>");
-                }
+        // Try /loader/entries/
+        let mut conf_dir = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, b"LOADER", &mut scratch)
+            .and_then(|(lba, sz)| find_in_dir(bio_ref, bio_ptr, mid, iso_lba, lba, sz, b"ENTRIES", &mut scratch));
+        // Try /boot/loader/entries/
+        if conf_dir.is_none() {
+            conf_dir = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, b"BOOT", &mut scratch)
+                .and_then(|(lba, sz)| find_in_dir(bio_ref, bio_ptr, mid, iso_lba, lba, sz, b"LOADER", &mut scratch))
+                .and_then(|(lba, sz)| find_in_dir(bio_ref, bio_ptr, mid, iso_lba, lba, sz, b"ENTRIES", &mut scratch));
+        }
+        // Try /boot/x86_64/loader/entries/
+        if conf_dir.is_none() {
+            conf_dir = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, b"BOOT", &mut scratch)
+                .and_then(|(lba, sz)| find_in_dir(bio_ref, bio_ptr, mid, iso_lba, lba, sz, b"X86_64", &mut scratch))
+                .and_then(|(lba, sz)| find_in_dir(bio_ref, bio_ptr, mid, iso_lba, lba, sz, b"LOADER", &mut scratch))
+                .and_then(|(lba, sz)| find_in_dir(bio_ref, bio_ptr, mid, iso_lba, lba, sz, b"ENTRIES", &mut scratch));
+        }
+        if let Some((dir_lba, dir_size)) = conf_dir {
+            let mut conf_entries: [(u32, u32, u32, u32); 32] = [(0,0,0,0); 32];
+            let mut conf_count = 0usize;
+            recursive_find_files_with_ext(
+                bio_ref, bio_ptr, mid, iso_lba, dir_lba, dir_size,
+                &mut scratch, &mut conf_entries, &mut conf_count, 0, b"conf",
+            );
+            for i in 0..conf_count {
+                let (ext_lba, ext_size, dir_sector, dir_offset) = conf_entries[i];
+                if ext_size == 0 { continue; }
+                add_cfg_entry(&mut entries, &mut entry_count, ext_lba, ext_size, dir_sector, dir_offset, b"/<entries>.conf");
             }
         }
     }
@@ -805,8 +818,8 @@ fn patch_grub_cfg_blockio(
         return;
     }
 
-    // Buffer for "set prefix=(cd0)/boot/grub2\n" (Fedora BLS fix)
-    let mut fedora_prefix_line = [0u8; 64];
+    // Buffer for "set root=(cd0)\nset prefix=(cd0)/boot/grub2\n" (Fedora BLS fix)
+    let mut fedora_prefix_line = [0u8; 96];
     for i in 0..entry_count {
         // For Fedora, GRUB's default prefix may point to the exFAT partition
         // which GRUB cannot read.  Set prefix to the virtual CD-ROM so BLS
@@ -815,12 +828,17 @@ fn patch_grub_cfg_blockio(
             let path_str = core::str::from_utf8(&entries[i].path[..entries[i].path_len]).unwrap_or("");
             if let Some(dir_end) = path_str.rfind('/') {
                 let dir = &path_str[..dir_end];
-                let prefix = b"set prefix=(cd0)";
                 let mut lp = 0usize;
-                fedora_prefix_line[lp..lp + prefix.len()].copy_from_slice(prefix);
-                lp += prefix.len();
+                // set root=(cd0)
+                let root_line = b"set root=(cd0)\n";
+                fedora_prefix_line[lp..lp + root_line.len()].copy_from_slice(root_line);
+                lp += root_line.len();
+                // set prefix=(cd0)/boot/grub2 (or wherever the config is)
+                let prefix_start = b"set prefix=(cd0)";
+                fedora_prefix_line[lp..lp + prefix_start.len()].copy_from_slice(prefix_start);
+                lp += prefix_start.len();
                 let dir_bytes = dir.as_bytes();
-                let dlen = dir_bytes.len().min(64 - lp - 1);
+                let dlen = dir_bytes.len().min(96 - lp - 1);
                 fedora_prefix_line[lp..lp + dlen].copy_from_slice(&dir_bytes[..dlen]);
                 lp += dlen;
                 fedora_prefix_line[lp] = b'\n';
