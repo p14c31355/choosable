@@ -302,7 +302,7 @@ fn patch_grub_cfg_impl(
                     }
                     // Prepend space if the line doesn't already end with one
                     let need_space = inject_at > line_start && out[inject_at - 1] != b' ' && out[inject_at - 1] != b'\t';
-                    let mut opt_buf = [0u8; 320];
+                    let mut opt_buf = [0u8; 513];
                     let mut ob = 0usize;
                     if need_space { opt_buf[ob] = b' '; ob += 1; }
                     opt_buf[ob..ob + extra_content.len()].copy_from_slice(extra_content);
