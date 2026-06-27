@@ -23,9 +23,10 @@ pub trait BootStage {
 }
 
 macro_rules! die_then_halt {
-    ($ctx:expr, $msg:expr) => {
-        die(unsafe { &mut *$ctx.system_table }, $msg)
-    };
+    ($ctx:expr, $msg:expr) => {{
+        die(unsafe { &mut *$ctx.system_table }, $msg);
+        loop { unsafe { core::arch::asm!("hlt") } }
+    }};
 }
 
 // ── Helper: extract *mut SystemTable from raw pointer ───────────────
