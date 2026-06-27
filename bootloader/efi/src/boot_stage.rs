@@ -134,21 +134,30 @@ impl BootStage for DiscoverPartitionStage {
         // Always try GPT when available: read partition GUID + number from GPT
         // even when MBR already found a partition. This gives us the real
         // choosable.part_guid= instead of all-zeros.
-        // Use find_partition_by_lba to match the partition by its known start LBA,
-        // which works regardless of partition type GUID (Basic Data, Linux, ESP, etc).
+        // Prefer LBA-matching over type GUID matching for accuracy.
         if is_gpt || part1_lba == 0 {
             let st = unsafe { &mut *st_from_ctx(ctx) };
             print_raw(st, b"GPT detected, reading partition info...\r\n\0");
-            if let Some((lba, guid)) = disk::find_gpt_data_partition(st, bio_ref, bio_ptr, mid) {
-                // GPT partition found — prefer its start_lba over MBR for accuracy
-                // (MBR may point to a different partition on hybrid setups)
-                part1_lba = lba;
-                ctx.partition_guid = guid;
-                ctx.partition_number = disk::count_gpt_partition_number(bio_ref, bio_ptr, mid, &guid) as u32;
-            } else if let Some((guid, num)) = disk::find_partition_by_lba(st, bio_ref, bio_ptr, mid, part1_lba) {
-                // Partition found by LBA match — more reliable than type GUID matching
-                ctx.partition_guid = guid;
-                ctx.partition_number = num;
+
+            // First, try to match by known LBA from MBR (most reliable)
+            if part1_lba > 0 {
+                if let Some((guid, num)) = disk::find_partition_by_lba(st, bio_ref, bio_ptr, mid, part1_lba) {
+                    // Partition found by LBA match — keep the MBR-derived LBA
+                    ctx.partition_guid = guid;
+                    ctx.partition_number = num;
+                } else if let Some((lba, guid)) = disk::find_gpt_data_partition(st, bio_ref, bio_ptr, mid) {
+                    // LBA match failed, fall back to first Basic Data partition
+                    part1_lba = lba;
+                    ctx.partition_guid = guid;
+                    ctx.partition_number = disk::count_gpt_partition_number(bio_ref, bio_ptr, mid, &guid) as u32;
+                }
+            } else {
+                // No MBR partition, use first valid GPT entry
+                if let Some((lba, guid)) = disk::find_gpt_data_partition(st, bio_ref, bio_ptr, mid) {
+                    part1_lba = lba;
+                    ctx.partition_guid = guid;
+                    ctx.partition_number = disk::count_gpt_partition_number(bio_ref, bio_ptr, mid, &guid) as u32;
+                }
             }
         }
         if part1_lba == 0 {

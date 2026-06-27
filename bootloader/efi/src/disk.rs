@@ -101,6 +101,7 @@ pub fn find_gpt_data_partition(
 
 /// Find a GPT partition by its start LBA (matches the already-known part1_lba).
 /// Returns (partition_guid, partition_number) on success.
+/// The partition_number is the real GPT entry index (1-based), not a compacted count.
 pub fn find_partition_by_lba(
     st: &mut SystemTable,
     bio_ref: &BlockIoProtocol,
@@ -108,12 +109,11 @@ pub fn find_partition_by_lba(
     mid: u32,
     target_lba: u64,
 ) -> Option<(crate::protocol::Guid, u32)> {
-    let mut part_number = 0u32;
-    read_gpt_entries(bio_ref, bio_ptr, mid, &mut |boff, sec| {
-        part_number += 1;
+    read_gpt_entries_with_index(bio_ref, bio_ptr, mid, &mut |entry_index, boff, sec| {
         let start_lba = u64::from_le_bytes(sec[boff + 32..boff + 40].try_into().unwrap());
         if start_lba == target_lba {
             let part_guid = read_partition_guid(sec, boff);
+            let part_number = entry_index + 1;
             print_raw(st, b"Found partition by LBA ");
             print_hex(st, b"0x", start_lba);
             print_raw(st, b" number=");
@@ -170,6 +170,50 @@ fn read_gpt_entries<T>(
     None
 }
 
+/// Iterate over GPT partition entries with the raw entry index (0-based).
+/// Returns the first `Some` result from `f`, or `None` if none match.
+fn read_gpt_entries_with_index<T>(
+    bio_ref: &BlockIoProtocol,
+    bio_ptr: *mut BlockIoProtocol,
+    mid: u32,
+    f: &mut impl FnMut(u32, usize, &[u8; 512]) -> Option<T>,
+) -> Option<T> {
+    // Read GPT header at LBA 1
+    let mut hdr_sec: [u8; 512] = [0; 512];
+    if !read_sector(bio_ref, bio_ptr, mid, 1, &mut hdr_sec) { return None; }
+    if &hdr_sec[0..8] != b"EFI PART" { return None; }
+    let entries_lba = u64::from_le_bytes(hdr_sec[72..80].try_into().unwrap());
+    let n = u32::from_le_bytes(hdr_sec[80..84].try_into().unwrap());
+    let sz = u32::from_le_bytes(hdr_sec[84..88].try_into().unwrap());
+    if sz == 0 || n == 0 { return None; }
+
+    let mut sec: [u8; 512] = [0; 512];
+    let mut current_lba: u64 = 0;
+    let mut loaded = false;
+    for i in 0..n.min(128) {
+        let eoff = i as usize * sz as usize;
+        let lba = entries_lba + (eoff / 512) as u64;
+        let boff = eoff % 512;
+        if boff + 40 > 512 { continue; }
+        if !loaded || lba != current_lba {
+            if !read_sector(bio_ref, bio_ptr, mid, lba, &mut sec) { break; }
+            current_lba = lba;
+            loaded = true;
+        }
+        // Check if this is a valid partition entry (non-zero type GUID)
+        let mut is_zero = true;
+        for j in 0..16 {
+            if sec[boff + j] != 0 { is_zero = false; break; }
+        }
+        if is_zero { continue; }
+
+        if let Some(result) = f(i, boff, &sec) {
+            return Some(result);
+        }
+    }
+    None
+}
+
 /// Read the unique partition GUID from a GPT entry at byte offset boff in sec.
 fn read_partition_guid(sec: &[u8; 512], boff: usize) -> crate::protocol::Guid {
     crate::protocol::Guid {
@@ -185,61 +229,23 @@ fn read_partition_guid(sec: &[u8; 512], boff: usize) -> crate::protocol::Guid {
 }
 
 /// Count the 1-based partition number of a GPT entry by its GUID.
+/// Returns the actual GPT entry ordinal (index + 1), not a compacted count.
 pub fn count_gpt_partition_number(
     bio_ref: &BlockIoProtocol,
     bio_ptr: *mut BlockIoProtocol,
     mid: u32,
     target_guid: &crate::protocol::Guid,
 ) -> usize {
-    // Read GPT header to get entry location
-    let mut hdr_sec: [u8; 512] = [0; 512];
-    if !read_sector(bio_ref, bio_ptr, mid, 1, &mut hdr_sec) {
-        return 0;
-    }
-    if &hdr_sec[0..8] != b"EFI PART" {
-        return 0;
-    }
-    let entries_lba = u64::from_le_bytes(hdr_sec[72..80].try_into().unwrap());
-    let n = u32::from_le_bytes(hdr_sec[80..84].try_into().unwrap());
-    let sz = u32::from_le_bytes(hdr_sec[84..88].try_into().unwrap());
-    if sz == 0 || n == 0 {
-        return 0;
-    }
-
-    let mut count = 0usize;
-    let mut sec: [u8; 512] = [0; 512];
-    let mut current_lba: u64 = 0;
-    let mut loaded = false;
-    for i in 0..n.min(128) {
-        let eoff = i as usize * sz as usize;
-        let lba = entries_lba + (eoff / 512) as u64;
-        let boff = eoff % 512;
-        if boff + 40 > 512 { continue; }
-        if !loaded || lba != current_lba {
-            if !read_sector(bio_ref, bio_ptr, mid, lba, &mut sec) { break; }
-            current_lba = lba;
-            loaded = true;
-        }
-
-        // Check if this is a valid partition entry (non-zero type GUID)
-        let mut is_zero = true;
-        for j in 0..16 {
-            if sec[boff + j] != 0 { is_zero = false; break; }
-        }
-        if is_zero { continue; }
-
-        count += 1;
-
-        // Check if this is the target partition
-        let entry_guid = read_partition_guid(&sec, boff);
-
+    read_gpt_entries_with_index(bio_ref, bio_ptr, mid, &mut |entry_index, boff, sec| {
+        let entry_guid = read_partition_guid(sec, boff);
         if entry_guid.d1 == target_guid.d1
             && entry_guid.d2 == target_guid.d2
             && entry_guid.d3 == target_guid.d3
             && entry_guid.d4 == target_guid.d4
         {
-            return count;
+            Some((entry_index + 1) as usize)
+        } else {
+            None
         }
-    }
-    0
+    }).unwrap_or(0)
 }

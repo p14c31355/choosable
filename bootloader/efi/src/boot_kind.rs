@@ -76,48 +76,72 @@ impl BootKind {
     /// Kernel cmdline arguments to inject after the second argument on linux lines.
     /// `is_popos` is true when the ISO filename contains "pop" or "pop-os".
     /// `iso_location` provides partition GUID, number, offset, path, and size for precise ISO location.
-    /// Writes into `buf` and returns a slice of the used portion.
-    pub fn linux_extra<'a>(&self, is_popos: bool, iso_location: Option<&crate::locator::IsoLocation>, buf: &'a mut [u8]) -> &'a [u8] {
+    /// Writes into `buf` and returns a slice of the used portion, or None if buffer is insufficient.
+    pub fn linux_extra<'a>(&self, is_popos: bool, iso_location: Option<&crate::locator::IsoLocation>, buf: &'a mut [u8]) -> Option<&'a [u8]> {
         let mut pos = 0usize;
+        let initial_cap = buf.len();
 
         match self {
             BootKind::Casper => {
                 if is_popos {
-                    pos += copy_at(buf, pos, b" boot=casper casper_path=pop-os maybe-ubiquity init=/init.choosable");
+                    let chunk = b" boot=casper casper_path=pop-os maybe-ubiquity init=/init.choosable";
+                    if pos + chunk.len() > initial_cap { return None; }
+                    pos += copy_at(buf, pos, chunk);
                 } else {
-                    pos += copy_at(buf, pos, b" boot=casper maybe-ubiquity init=/init.choosable");
+                    let chunk = b" boot=casper maybe-ubiquity init=/init.choosable";
+                    if pos + chunk.len() > initial_cap { return None; }
+                    pos += copy_at(buf, pos, chunk);
                 }
             }
             BootKind::DebianLive => {
-                pos += copy_at(buf, pos, b" boot=live live-media=removable init=/init.choosable");
+                let chunk = b" boot=live live-media=removable init=/init.choosable";
+                if pos + chunk.len() > initial_cap { return None; }
+                pos += copy_at(buf, pos, chunk);
             }
             BootKind::FedoraLive => {
-                pos += copy_at(buf, pos, b" rd.live.image root=live:CDLABEL=CHOOSABLE rd.live.dir=/LiveOS rootdelay=10 init=/init.choosable");
+                let chunk = b" rd.live.image root=live:CDLABEL=CHOOSABLE rd.live.dir=/LiveOS rootdelay=10 init=/init.choosable";
+                if pos + chunk.len() > initial_cap { return None; }
+                pos += copy_at(buf, pos, chunk);
             }
             BootKind::ArchIso => {
                 if let Some(loc) = iso_location {
-                    pos += copy_at(buf, pos, b" archisodevice=/dev/disk/by-partuuid/");
+                    let chunk = b" archisodevice=/dev/disk/by-partuuid/";
+                    if pos + chunk.len() + 36 > initial_cap { return None; }
+                    pos += copy_at(buf, pos, chunk);
                     pos += guid_to_partuuid_bytes(&loc.partition_guid, &mut buf[pos..]);
-                    pos += copy_at(buf, pos, b" archisobasedir=arch copytoram init=/init.choosable");
+                    let chunk2 = b" archisobasedir=arch copytoram init=/init.choosable";
+                    if pos + chunk2.len() > initial_cap { return None; }
+                    pos += copy_at(buf, pos, chunk2);
                 } else {
-                    pos += copy_at(buf, pos, b" archisodevice=LABEL=CHOOSABLE archisobasedir=arch copytoram init=/init.choosable");
+                    let chunk = b" archisodevice=LABEL=CHOOSABLE archisobasedir=arch copytoram init=/init.choosable";
+                    if pos + chunk.len() > initial_cap { return None; }
+                    pos += copy_at(buf, pos, chunk);
                 }
             }
             BootKind::Alpine | BootKind::AlpinePremount => {
-                pos += copy_at(buf, pos, b" init=/init.choosable modules=loop,iso9660");
+                let chunk = b" init=/init.choosable modules=loop,iso9660";
+                if pos + chunk.len() > initial_cap { return None; }
+                pos += copy_at(buf, pos, chunk);
             }
             BootKind::WindowsPE => {}
             BootKind::Unknown => {
-                pos += copy_at(buf, pos, b" boot=casper maybe-ubiquity init=/init.choosable");
+                let chunk = b" boot=casper maybe-ubiquity init=/init.choosable";
+                if pos + chunk.len() > initial_cap { return None; }
+                pos += copy_at(buf, pos, chunk);
             }
         }
 
         // Append choosable.* parameters if IsoLocation is available
         if let Some(loc) = iso_location {
-            pos += append_choosable_params_slice(buf, pos, loc);
+            let new_pos = append_choosable_params_slice(buf, pos, loc);
+            if new_pos == pos && loc.partition_number > 0 {
+                // append_choosable_params_slice returned early due to capacity
+                return None;
+            }
+            pos = new_pos;
         }
 
-        &buf[..pos]
+        Some(&buf[..pos])
     }
 
     /// Extra kernel args appended at the end of linux lines (before newline).
@@ -247,29 +271,42 @@ fn guid_to_partuuid_bytes(guid: &crate::protocol::Guid, buf: &mut [u8]) -> usize
 }
 
 /// Append choosable.* kernel parameters from IsoLocation into buf at position pos.
-/// Returns the new position after writing.
+/// Returns the new position after writing, or the original pos if capacity is insufficient.
 fn append_choosable_params_slice(buf: &mut [u8], mut pos: usize, loc: &crate::locator::IsoLocation) -> usize {
+    let start_pos = pos;
+    let buf_len = buf.len();
+
     // " choosable.part_guid="
-    pos += copy_at(buf, pos, b" choosable.part_guid=");
+    let chunk = b" choosable.part_guid=";
+    if pos + chunk.len() + 36 > buf_len { return start_pos; }
+    pos += copy_at(buf, pos, chunk);
     pos += guid_to_partuuid_bytes(&loc.partition_guid, &mut buf[pos..]);
 
     // " choosable.part_num=<decimal>"
-    pos += copy_at(buf, pos, b" choosable.part_num=");
+    let chunk = b" choosable.part_num=";
+    if pos + chunk.len() + 10 > buf_len { return start_pos; }
+    pos += copy_at(buf, pos, chunk);
     pos += write_u64_decimal(buf, pos, loc.partition_number as u64);
 
     // " choosable.iso_offset=<decimal>"
-    pos += copy_at(buf, pos, b" choosable.iso_offset=");
+    let chunk = b" choosable.iso_offset=";
+    if pos + chunk.len() + 20 > buf_len { return start_pos; }
+    pos += copy_at(buf, pos, chunk);
     pos += write_u64_decimal(buf, pos, loc.offset_bytes());
 
     // " choosable.iso_path=<path>"
     let path = loc.path_without_leading_slash();
     if !path.is_empty() {
-        pos += copy_at(buf, pos, b" choosable.iso_path=");
+        let chunk = b" choosable.iso_path=";
+        if pos + chunk.len() + path.len() > buf_len { return start_pos; }
+        pos += copy_at(buf, pos, chunk);
         pos += copy_at(buf, pos, path);
     }
 
     // " choosable.iso_size=<decimal>"
-    pos += copy_at(buf, pos, b" choosable.iso_size=");
+    let chunk = b" choosable.iso_size=";
+    if pos + chunk.len() + 20 > buf_len { return start_pos; }
+    pos += copy_at(buf, pos, chunk);
     pos += write_u64_decimal(buf, pos, loc.file_size);
 
     pos
@@ -368,7 +405,7 @@ mod tests {
             iso_lba: 100_000,
         };
         let mut buf = [0u8; 512];
-        let extra = BootKind::Casper.linux_extra(false, Some(&loc), &mut buf);
+        let extra = BootKind::Casper.linux_extra(false, Some(&loc), &mut buf).unwrap();
         let s = core::str::from_utf8(extra).unwrap();
         assert!(s.contains("choosable.part_guid=11111111-2222-3333-4455-66778899aabb"));
         assert!(s.contains("choosable.part_num=2"));
@@ -409,13 +446,37 @@ mod tests {
     #[test]
     fn test_boot_kind_linux_extra_values() {
         let mut buf = [0u8; 512];
-        assert_eq!(BootKind::Casper.linux_extra(false, None, &mut buf), b" boot=casper maybe-ubiquity init=/init.choosable");
+        assert_eq!(BootKind::Casper.linux_extra(false, None, &mut buf).unwrap(), b" boot=casper maybe-ubiquity init=/init.choosable");
         let mut buf2 = [0u8; 512];
-        assert_eq!(BootKind::Casper.linux_extra(true, None, &mut buf2), b" boot=casper casper_path=pop-os maybe-ubiquity init=/init.choosable");
+        assert_eq!(BootKind::Casper.linux_extra(true, None, &mut buf2).unwrap(), b" boot=casper casper_path=pop-os maybe-ubiquity init=/init.choosable");
         let mut buf3 = [0u8; 512];
-        assert_eq!(BootKind::WindowsPE.linux_extra(false, None, &mut buf3), b"");
+        assert_eq!(BootKind::WindowsPE.linux_extra(false, None, &mut buf3).unwrap(), b"");
         assert_eq!(BootKind::DebianLive.linux_eol_extra(), b" findiso=");
         assert_eq!(BootKind::Casper.linux_eol_extra(), b" iso-scan/filename=");
+    }
+
+    #[test]
+    fn test_boot_kind_linux_extra_insufficient_buffer() {
+        use crate::locator::IsoLocation;
+        let guid = Guid { d1: 0x11111111, d2: 0x2222, d3: 0x3333, d4: [0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb] };
+        let long_path = {
+            let mut s = [0u8; 256];
+            for i in 0..250 {
+                s[i] = b'x';
+            }
+            s
+        };
+        let loc = IsoLocation {
+            partition_guid: guid,
+            partition_number: 2,
+            file_path: long_path,
+            file_path_len: 250,
+            file_size: 2_000_000_000,
+            part1_lba: 2048,
+            iso_lba: 100_000,
+        };
+        let mut small_buf = [0u8; 50];
+        assert_eq!(BootKind::Casper.linux_extra(false, Some(&loc), &mut small_buf), None);
     }
 
     #[test]

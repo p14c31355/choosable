@@ -39,7 +39,19 @@ macro_rules! fixup {
     };
 }
 
-fixup!(CasperFixup, LiveBootFixup, DracutFixup, AlpinePremountFixup, ArchFixup, AlpineFixup);
+fixup!(LiveBootFixup, DracutFixup, AlpinePremountFixup, ArchFixup, AlpineFixup);
+
+pub struct CasperFixup;
+impl EarlyBootFixup for CasperFixup {
+    fn build_initrd(&self, ctx: &BootContext, bs: &mut BootServices) -> Option<PremountBundle> {
+        let p = ctx.selected_payload()?;
+        if p.file_start_lba < ctx.partition_start_lba {
+            return None;
+        }
+        let rel = p.file_start_lba - ctx.partition_start_lba;
+        build_premount_cpio(bs, rel)
+    }
+}
 
 pub struct WindowsPEFixup;
 impl EarlyBootFixup for WindowsPEFixup {

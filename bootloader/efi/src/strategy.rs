@@ -187,10 +187,30 @@ fn patch_grub_cfg_impl(
     let blscfg_count = orig.windows(6).filter(|w| *w == b"blscfg" || *w == b"BLSCFG").count();
     let has_blscfg = blscfg_count > 0;
 
+    // Count options lines for systemd-boot
+    let options_count = {
+        let mut count = 0;
+        let mut pos = 0;
+        while pos < orig.len() {
+            let start = pos;
+            while pos < orig.len() && orig[pos] != b'\n' { pos += 1; }
+            let line = &orig[start..pos];
+            let mut ts = 0;
+            while ts < line.len() && (line[ts] == b' ' || line[ts] == b'\t') { ts += 1; }
+            let t = &line[ts..];
+            if t.starts_with(b"options ") || t.starts_with(b"options\t") {
+                count += 1;
+            }
+            if pos < orig.len() { pos += 1; }
+        }
+        count
+    };
+
     let (linux_count, initrd_count) = count_matching_lines(orig);
     let extra = linux_count * (linux_extra.len() + eol_extra_dynamic.len())
         + initrd_count * initrd_extra.len()
-        + if has_blscfg { blscfg_count * (b"set kernelopts=\"$kernelopts".len() + linux_extra.len() + b"\"\n".len()) } else { 0 };
+        + if has_blscfg { blscfg_count * (b"set kernelopts=\"$kernelopts".len() + linux_extra.len() + b"\"\n".len()) } else { 0 }
+        + options_count * linux_extra.len();
     let (out_ptr, out_cap) = allocate_output(bs, orig.len(), extra)?;
     let out = unsafe { core::slice::from_raw_parts_mut(out_ptr, out_cap) };
 
@@ -247,16 +267,21 @@ fn patch_grub_cfg_impl(
                 && !linux_extra.is_empty()
             {
                 // Fedora 40+ BLS: inject `set kernelopts="$kernelopts <linux_extra>"` BEFORE the blscfg line.
-                // choosable.* params are now included in linux_extra via BootKind::linux_extra()
+                // This APPENDS linux_extra to the existing $kernelopts instead of replacing it.
                 let mut bls_line = [0u8; 512];
                 let mut bls_len = 0usize;
                 bls_line[bls_len..][..15].copy_from_slice(b"set kernelopts=");
                 bls_len += 15;
                 bls_line[bls_len] = b'"'; bls_len += 1;
+                // Preserve existing $kernelopts
+                let preserve = b"$kernelopts";
+                let pl = preserve.len().min(512 - bls_len - 2);
+                bls_line[bls_len..bls_len + pl].copy_from_slice(&preserve[..pl]);
+                bls_len += pl;
+                // Append linux_extra after existing kernelopts
                 if !linux_extra.is_empty() {
-                    // linux_extra starts with a space; use after_linux_extra = &linux_extra[1..] to strip leading space
-                    let strip = if linux_extra[0] == b' ' { 1 } else { 0 };
-                    let content = &linux_extra[strip..];
+                    // linux_extra already starts with a space, so just append it
+                    let content = linux_extra;
                     let cl = content.len().min(512 - bls_len - 2);
                     bls_line[bls_len..bls_len + cl].copy_from_slice(&content[..cl]);
                     bls_len += cl;
@@ -271,6 +296,9 @@ fn patch_grub_cfg_impl(
             else if t.starts_with(b"options ") || t.starts_with(b"options\t")
             {
                 // systemd-boot .conf format: inject cmdline args onto the options line.
+                // First remove any existing ISO locator arguments to prevent duplicates.
+                remove_iso_locator_args(out, line_start, &mut dst);
+
                 // linux_extra starts with a space; strip it for appending to options.
                 let extra_content = if linux_extra.starts_with(b" ") { &linux_extra[1..] } else { linux_extra };
                 if !extra_content.is_empty() {
@@ -349,7 +377,8 @@ pub fn patch_grub_cfg(
         && matches_any_lower(iso_name, &[b"pop", b"pop-os", b"popos"]);
 
     let mut linux_extra_buf = [0u8; 512];
-    let linux_extra = boot_kind.linux_extra(is_popos, iso_location, &mut linux_extra_buf);
+    let linux_extra = boot_kind.linux_extra(is_popos, iso_location, &mut linux_extra_buf)
+        .unwrap_or(b"");
     let linux_eol_extra = boot_kind.linux_eol_extra();
 
     let mut live_media_uuid = [0u8; 10];

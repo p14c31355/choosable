@@ -245,23 +245,35 @@ fn by_partuuid(guid: &str) -> Option<String> {
     None
 }
 
-/// Fallback: find partition by 1-based number.
+/// Fallback: find partition by 1-based number on a specific disk.
+/// This tries to match partition N on disks that have partitions (sda1, sda2, etc).
+/// It does NOT use a global /proc/partitions index.
 fn by_partnum(target_num: u32) -> Option<String> {
-    let Ok(data) = fs::read_to_string("/proc/partitions") else { return None };
-    let mut i = 0u32;
-    for line in data.lines().skip(2) {
-        let cols: Vec<&str> = line.split_whitespace().collect();
-        if cols.len() < 4 { continue; }
-        let name = cols[3];
-        if name.starts_with("loop") || name.starts_with("ram")
-            || name.starts_with("dm") || name.starts_with("sr")
+    // Scan /sys/block for disks that have partitions
+    let Ok(blocks) = fs::read_dir("/sys/block") else { return None };
+    for block in blocks {
+        let Ok(block) = block else { continue };
+        let block_name = block.file_name();
+        let block_name_s = block_name.to_string_lossy();
+
+        // Skip loop, ram, dm, sr devices
+        if block_name_s.starts_with("loop") || block_name_s.starts_with("ram")
+            || block_name_s.starts_with("dm") || block_name_s.starts_with("sr")
         { continue; }
-        i += 1;
-        if i == target_num {
-            let dev = format!("/dev/{}", name);
-            if std::path::Path::new(&dev).exists() {
-                return Some(dev);
-            }
+
+        // Try to find the Nth partition on this disk
+        let partition_name = if block_name_s.ends_with(|c: char| c.is_numeric()) {
+            // For nvme0n1, mmc0, etc: partition is nvme0n1p1, mmc0p1
+            format!("{}p{}", block_name_s, target_num)
+        } else {
+            // For sda, hda, vda: partition is sda1, hda1, vda1
+            format!("{}{}", block_name_s, target_num)
+        };
+
+        let dev_path = format!("/dev/{}", partition_name);
+        if std::path::Path::new(&dev_path).exists() {
+            console_log(&format!("by_partnum: found {} as partition {} on disk {}", dev_path, target_num, block_name_s));
+            return Some(dev_path);
         }
     }
     None
@@ -304,15 +316,15 @@ fn try_mount_iso(dev_path: &str, offset: u64) -> bool {
         if let Ok(lf) = fs::OpenOptions::new().read(true).write(true).open(&lp) {
             let lfd = lf.as_raw_fd();
             if unsafe { libc::ioctl(lfd, LOOP_SET_FD, dfd) } == 0 {
-                loop_dev = Some((lp, lfd));
+                loop_dev = Some(lp);
                 break;
             }
-            unsafe { libc::close(lfd); }
+            // lf will be dropped here, closing lfd automatically
         }
     }
     drop(df);
 
-    let Some((loop_path, _)) = loop_dev else { return false };
+    let Some(loop_path) = loop_dev else { return false };
 
     if offset > 0 {
         if let Ok(lf) = fs::OpenOptions::new().read(true).write(true).open(&loop_path) {
@@ -322,10 +334,10 @@ fn try_mount_iso(dev_path: &str, offset: u64) -> bool {
             info.lo_flags = LO_FLAGS_READ_ONLY;
             if unsafe { libc::ioctl(lfd, LOOP_SET_STATUS64, &info as *const LoopInfo64) } != 0 {
                 unsafe { libc::ioctl(lfd, LOOP_CLR_FD, 0) };
-                unsafe { libc::close(lfd) };
+                // lf will be dropped here, closing lfd automatically
                 return false;
             }
-            unsafe { libc::close(lfd) };
+            // lf will be dropped here, closing lfd automatically
         } else {
             return false;
         }
@@ -335,6 +347,7 @@ fn try_mount_iso(dev_path: &str, offset: u64) -> bool {
     if !ok {
         if let Ok(lf) = fs::OpenOptions::new().read(true).write(true).open(&loop_path) {
             unsafe { libc::ioctl(lf.as_raw_fd(), LOOP_CLR_FD, 0) };
+            // lf will be dropped here, closing the fd automatically
         }
         return false;
     }
@@ -382,6 +395,9 @@ fn main() {
             if ok && check_distro() {
                 true
             } else {
+                // Target mount or distro check failed, fall back to scan_all
+                console_log("target mount/check failed, falling back to scan_all");
+                scan_all(offset);
                 false
             }
         }
