@@ -229,76 +229,55 @@ unsafe extern "efiapi" fn vblock_read(
         let block_lba = lba + b as u64;
         let block_offset = b * 2048;
 
+        // ── grub.cfg directory entry patch ──────────────────────────
         let is_dir_patched = vbio.dir_entry_patched && block_lba == vbio.dir_entry_sector as u64;
-        let is_premount_patched = vbio.premount_entry_patched && block_lba == vbio.premount_entry_sector as u64;
-        let is_premount_injected = vbio.premount_entry_injected && block_lba == vbio.premount_entry_sector as u64;
-        let sect_handled = is_dir_patched || is_premount_patched || is_premount_injected;
-
         if is_dir_patched {
             if !read_real_iso_sector(vbio, block_lba, dst, block_offset) { return EFI_DEVICE_ERROR; }
             patch_dir_entry(&mut dst[block_offset..block_offset + 2048],
                 vbio.dir_entry_offset as usize, vbio.dir_entry_new_extent, vbio.dir_entry_new_size);
+            continue;
         }
 
-        if is_premount_patched {
-            if !is_dir_patched && !read_real_iso_sector(vbio, block_lba, dst, block_offset) { return EFI_DEVICE_ERROR; }
+        // ── Initrd directory entry patch (extend data length) ──────
+        let is_initrd_patched = vbio.initrd_ext_active && block_lba == vbio.initrd_entry_sector as u64;
+        if is_initrd_patched {
+            if !read_real_iso_sector(vbio, block_lba, dst, block_offset) { return EFI_DEVICE_ERROR; }
+            let new_size = vbio.initrd_orig_size + vbio.initrd_ext_sectors * 2048;
             patch_dir_entry(&mut dst[block_offset..block_offset + 2048],
-                vbio.premount_entry_offset as usize, vbio.premount_entry_new_extent, vbio.premount_entry_new_size);
-            // Also rename the ISO9660 directory entry to "PREMOUNT.CPIO"
-            // so GRUB can resolve the /PREMOUNT.CPIO path from grub.cfg.
-            // The ;1 version suffix is NOT included — GRUB's ISO9660 driver
-            // strips it automatically, and a 13-char name fits in the
-            // minimal 46-byte record (33 + 13 = 46).
-            if vbio.premount_entry_rename {
-                let off = vbio.premount_entry_offset as usize;
-                let name = b"PREMOUNT.CPIO";
-                let name_len_byte = name.len() as u8;
-                if off < 2048 && block_offset + off < dst.len() {
-                    let record_len = dst[block_offset + off] as usize;
-                    // 33 + 13 = 46 — fits in any record ≥ 46 bytes
-                    if off + 33 + name.len() <= 2048 && 33 + name.len() <= record_len {
-                        dst[block_offset + off + 32] = name_len_byte;
-                        dst[block_offset + off + 33..block_offset + off + 33 + name.len()]
-                            .copy_from_slice(name);
-                    }
+                vbio.initrd_entry_offset as usize, vbio.initrd_base_lba, new_size);
+            continue;
+        }
+
+        // ── Initrd extension: serve premount CPIO after original initrd ──
+        if vbio.initrd_ext_active {
+            let initrd_sectors = (vbio.initrd_orig_size as u64 + 2047) / 2048;
+            let cpio_start = vbio.initrd_base_lba as u64 + initrd_sectors;
+            let cpio_end = cpio_start + vbio.initrd_ext_sectors as u64;
+            if block_lba >= cpio_start && block_lba < cpio_end {
+                let off = (block_lba - cpio_start) as usize * 2048;
+                let cpio = unsafe { core::slice::from_raw_parts(vbio.premount_cpio_buf as *const u8, vbio.premount_cpio_size as usize) };
+                let to_copy = (vbio.premount_cpio_size as usize).saturating_sub(off).min(2048);
+                if to_copy > 0 {
+                    dst[block_offset..block_offset + to_copy].copy_from_slice(&cpio[off..off + to_copy]);
                 }
+                // Zero-fill remainder of the sector
+                for j in (block_offset + to_copy)..(block_offset + 2048) {
+                    dst[j] = 0;
+                }
+                continue;
             }
         }
 
-        if is_premount_injected {
-            // The injected sector lives beyond the original ISO end
-            // and must be served purely from memory (unless it was
-            // injected within the existing root directory via EOD).
-            // When root_relocated is true, the injected entry is part
-            // of the relocated root buf, so this path should not fire.
-            if !is_dir_patched && !is_premount_patched && !vbio.premount_root_relocated {
-                if !read_real_iso_sector(vbio, block_lba, dst, block_offset) { return EFI_DEVICE_ERROR; }
-            } else {
-                for j in 0..2048 { dst[block_offset + j] = 0; }
-            }
-            // Overwrite with the pre-built synthetic directory record
-            let off = vbio.premount_entry_offset as usize;
-            let sz = vbio.premount_entry_injected_size as usize;
-            if off + sz <= 2048 {
-                dst[block_offset + off..block_offset + off + sz]
-                    .copy_from_slice(&vbio.premount_entry_injected_blob[..sz]);
-            }
-        }
-
-        if sect_handled { continue; }
-
-        if serve_memory_sector(vbio.premount_root_buf, vbio.premount_root_sectors, vbio.premount_root_start_sector, block_lba, dst, block_offset)
-            || serve_memory_sector(vbio.premount_file_buf, vbio.premount_file_sectors, vbio.premount_file_sector, block_lba, dst, block_offset)
-            || serve_memory_sector(vbio.patched_file_buf, vbio.patched_file_sectors, vbio.patched_file_sector, block_lba, dst, block_offset)
+        // ── Memory-backed patches (grub.cfg content) ────────────────
+        if serve_memory_sector(vbio.patched_file_buf, vbio.patched_file_sectors, vbio.patched_file_sector, block_lba, dst, block_offset)
         {
             continue;
         }
 
+        // ── Read from real ISO disc ─────────────────────────────────
         if !read_real_iso_sector(vbio, block_lba, dst, block_offset) { return EFI_DEVICE_ERROR; }
 
-        // Patch PVD at sector 16 so GRUB's ISO9660 driver accepts
-        // extent references that point to appended sectors and sees
-        // the updated root directory size after synthetic injection.
+        // ── PVD patches (sector 16) ────────────────────────────────
         if block_lba == 16 {
             let new_vol_size = (vbio.media.bim_lb + 1) as u32;
             let off = block_offset;
@@ -306,34 +285,10 @@ unsafe extern "efiapi" fn vblock_read(
             dst[off + 80..off + 84].copy_from_slice(&new_vol_size.to_le_bytes());
             dst[off + 84..off + 88].copy_from_slice(&new_vol_size.to_be_bytes());
 
-            // Previously overwrote Volume ID to "CHOOSABLE" here,
-            // but that broke GRUB's `search -l <original-label>`
-            // command on Fedora and other label-searching distros.
-            // The ISO label is NOT visible to Linux (virtual device),
-            // so LABEL=CHOOSABLE kernel cmdline never works anyway.
-            // premount-init handles ISO mounting without needing
-            // label-based kernel parameters.
-
-            // If premount entry was injected (not patched over existing),
-            // also update the root directory record data length in PVD
-            // so GRUB walks past the synthetic PREMOUNT.CPIO record.
-            if vbio.premount_entry_injected && vbio.premount_new_root_size > 0 {
-                // Root Dir Record Data Length: bytes 166-169 (LE), 170-173 (BE)
-                dst[off + 166..off + 170].copy_from_slice(&vbio.premount_new_root_size.to_le_bytes());
-                dst[off + 170..off + 174].copy_from_slice(&vbio.premount_new_root_size.to_be_bytes());
-            }
-
-            // When root directory is relocated (copied to a new
-            // contiguous extent at the end of the virtual CD-ROM),
-            // redirect PVD root_lba and root_size to the relocated extent.
-            if vbio.premount_root_relocated && vbio.premount_root_start_sector > 0 {
-                // Root Dir Record Extent: bytes 158-161 (LE), 162-165 (BE)
-                dst[off + 158..off + 162].copy_from_slice(&vbio.premount_root_start_sector.to_le_bytes());
-                dst[off + 162..off + 166].copy_from_slice(&vbio.premount_root_start_sector.to_be_bytes());
-                // Root Dir Record Data Length: bytes 166-169 (LE), 170-173 (BE)
-                dst[off + 166..off + 170].copy_from_slice(&vbio.premount_new_root_size.to_le_bytes());
-                dst[off + 170..off + 174].copy_from_slice(&vbio.premount_new_root_size.to_be_bytes());
-            }
+            // If initrd extension is active, update initrd file's
+            // PVD root directory record size so GRUB can find it.
+            // (The actual initrd directory entry is patched in its
+            //  parent directory sector, not in PVD root record.)
         }
     }
 
@@ -440,29 +395,15 @@ pub fn create_virtual_cdrom(
     vbio.dir_entry_new_size = 0;
     vbio.dir_entry_patched = false;
 
-    // Initialize premount fields
+    // Initialize initrd extension fields
     vbio.premount_cpio_buf = core::ptr::null_mut();
     vbio.premount_cpio_size = 0;
-    vbio.premount_squashfs_addr = 0;
-    vbio.premount_squashfs_size = 0;
-    vbio.premount_entry_sector = 0;
-    vbio.premount_entry_offset = 0;
-    vbio.premount_entry_new_extent = 0;
-    vbio.premount_entry_new_size = 0;
-    vbio.premount_entry_patched = false;
-    vbio.premount_entry_rename = false;
-    vbio.premount_file_sector = 0;
-    vbio.premount_file_sectors = 0;
-    vbio.premount_file_buf = core::ptr::null_mut();
-    vbio.premount_entry_injected = false;
-    vbio.premount_entry_injected_blob = [0u8; 128];
-    vbio.premount_entry_injected_size = 0;
-    vbio.premount_new_root_size = 0;
-    vbio.premount_root_relocated = false;
-    vbio.premount_root_buf = core::ptr::null_mut();
-    vbio.premount_root_buf_size = 0;
-    vbio.premount_root_sectors = 0;
-    vbio.premount_root_start_sector = 0;
+    vbio.initrd_base_lba = 0;
+    vbio.initrd_orig_size = 0;
+    vbio.initrd_ext_sectors = 0;
+    vbio.initrd_entry_sector = 0;
+    vbio.initrd_entry_offset = 0;
+    vbio.initrd_ext_active = false;
 
     // ═════════════════════════════════════════════════════════════
     // 3. Install BlockIO protocol (creates the handle)

@@ -310,53 +310,26 @@ pub struct VirtualBlockIo {
     pub dir_entry_new_size: u32,
     /// Whether directory entry patching is active
     pub dir_entry_patched: bool,
-    /// ── Premount cpio data (appended to initrd) ──────────────────
+    /// ── Premount CPIO initrd extension ───────────────────────────
+    /// The premount CPIO is served as extended sectors appended to the
+    /// first initrd file on the virtual CD-ROM.  The initrd's directory
+    /// entry is patched to report a larger data length; when GRUB reads
+    /// sector(s) beyond the original file, the CPIO data is served.
     pub premount_cpio_buf: *mut u8,
-    pub premount_cpio_size: usize,
-    pub premount_squashfs_addr: u64,
-    pub premount_squashfs_size: u64,
-    /// ── Root directory premount entry ─────────────────────────
-    pub premount_file_sector: u32,
-    pub premount_file_sectors: u32,
-    pub premount_file_buf: *mut u8,
-    pub premount_entry_sector: u32,
-    pub premount_entry_offset: u32,
-    pub premount_entry_new_extent: u32,
-    pub premount_entry_new_size: u32,
-    pub premount_entry_patched: bool,
-    /// When premount_entry_patched is true, also rewrite the ISO9660
-    /// name field to "PREMOUNT.CPIO" so that GRUB's initrd directive
-    /// "/PREMOUNT.CPIO" resolves correctly.
-    pub premount_entry_rename: bool,
-    /// ── Injected synthetic entry (when no existing entry to patch) ──
-    /// If true, a complete ISO9660 directory record is written at
-    /// premount_entry_sector/offset (instead of patching extent fields).
-    pub premount_entry_injected: bool,
-    /// Full binary blob of the injected directory record (including
-    /// the trailing EOD marker).
-    pub premount_entry_injected_blob: [u8; 128],
-    /// Length of the injected blob in bytes.
-    pub premount_entry_injected_size: u32,
-    /// When premount_entry_injected is true, this is the updated root
-    /// directory size (original EOD position + injected record size).
-    /// PVD sector 16 root dir record size is patched to this value.
-    pub premount_new_root_size: u32,
-    /// When true, the entire root directory has been relocated to a new
-    /// contiguous extent at the end of the virtual CD-ROM.  All original
-    /// directory records are copied, and the synthetic PREMOUNT.CPIO entry
-    /// is appended.  PVD root_lba and root_size are updated to point to
-    /// the relocated extent served from premount_root_buf.
-    pub premount_root_relocated: bool,
-    /// Pool-allocated buffer containing the relocated root directory
-    /// (original entries + PREMOUNT.CPIO + EOD).  Zero-filled to sector
-    /// alignment.
-    pub premount_root_buf: *mut u8,
-    /// Size of the relocated root directory in bytes.
-    pub premount_root_buf_size: usize,
-    /// Number of 2048-byte sectors in the relocated root directory.
-    pub premount_root_sectors: u32,
-    /// Absolute ISO sector where the relocated root directory starts.
-    pub premount_root_start_sector: u32,
+    pub premount_cpio_size: u32,
+    /// LBA (ISO 2048-byte sector) of the first initrd file extent.
+    pub initrd_base_lba: u32,
+    /// Original file size of the initrd in bytes.
+    pub initrd_orig_size: u32,
+    /// Number of 2048-byte sectors of CPIO data appended after the
+    /// original initrd data.  Sector initrd_base_lba + ceil(orig/2048)
+    /// is the first CPIO sector, up to + ext_sectors.
+    pub initrd_ext_sectors: u32,
+    /// Directory entry location for the initrd file (sector/offset).
+    pub initrd_entry_sector: u32,
+    pub initrd_entry_offset: u32,
+    /// Whether initrd extension patching is active.
+    pub initrd_ext_active: bool,
 }
 
 pub const DEVICE_PATH_PROTOCOL_GUID: Guid = Guid {

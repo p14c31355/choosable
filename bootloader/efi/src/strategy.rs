@@ -324,19 +324,10 @@ fn patch_grub_cfg_impl(
                     shift_and_inject(out, inject_at, &mut dst, &opt_buf[..ob]);
                 }
             }
-            else if (t.starts_with(b"initrd ") || t.starts_with(b"initrd\t")
-                || t.starts_with(b"initrdefi ") || t.starts_with(b"initrdefi\t"))
-                && !effective_target.is_empty()
-                && dedup_slice.len() <= line.len()
-                && !line.windows(dedup_slice.len()).any(|w| w == dedup_slice)
-            {
-                let mut inject_at = dst;
-                if dst > 0 && out[dst - 1] == b'\n' {
-                    inject_at -= 1;
-                    if dst > 1 && out[dst - 2] == b'\r' { inject_at -= 1; }
-                }
-                shift_and_inject(out, inject_at, &mut dst, initrd_extra);
-            }
+            // NOTE: initrd extension (/PREMOUNT.CPIO append) is no longer done here.
+            // The premount CPIO is now served as extended sectors appended to the
+            // original initrd file via directory-entry size patching in VirtualBlockIo.
+            // This avoids fragile ISO root-directory injection.
         }
     }
 
