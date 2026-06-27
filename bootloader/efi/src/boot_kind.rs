@@ -134,7 +134,7 @@ impl BootKind {
         // Append choosable.* parameters if IsoLocation is available
         if let Some(loc) = iso_location {
             let new_pos = append_choosable_params_slice(buf, pos, loc);
-            if new_pos == pos && loc.partition_number > 0 {
+            if new_pos == pos {
                 // append_choosable_params_slice returned early due to capacity
                 return None;
             }
