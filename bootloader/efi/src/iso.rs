@@ -1157,6 +1157,8 @@ pub fn boot_payload_by_type(
     bio_ref: &BlockIoProtocol,
     bio_ptr: *mut BlockIoProtocol,
     mid: u32,
+    partition_guid: &crate::protocol::Guid,
+    partition_number: u32,
 ) -> ! {
     if idx >= payloads.len() {
         print_raw(st, b"ERROR: payload index out of range.\r\n\0");
@@ -1164,7 +1166,7 @@ pub fn boot_payload_by_type(
     }
     let p = &payloads[idx];
     match p.payload_type {
-        PayloadType::Iso => uefi_chainload_iso(st, image_handle, part1_lba, payloads, idx, bio_ref, bio_ptr, mid),
+        PayloadType::Iso => uefi_chainload_iso(st, image_handle, part1_lba, payloads, idx, bio_ref, bio_ptr, mid, partition_guid, partition_number),
         PayloadType::Wim => boot_wim_payload(st, image_handle, part1_lba, payloads, idx, bio_ref, bio_ptr, mid),
         PayloadType::Vhd | PayloadType::Vhdx => boot_vhd_payload(st, image_handle, part1_lba, payloads, idx, bio_ref, bio_ptr, mid),
         PayloadType::Img => boot_img_payload(st, image_handle, part1_lba, payloads, idx, bio_ref, bio_ptr, mid),
@@ -1301,6 +1303,8 @@ fn uefi_chainload_iso(
     bio_ref: &BlockIoProtocol,
     bio_ptr: *mut BlockIoProtocol,
     mid: u32,
+    partition_guid: &crate::protocol::Guid,
+    partition_number: u32,
 ) -> ! {
     let iso_lba = files[idx].file_start_lba;
     let iso_size = files[idx].file_size;
@@ -1558,8 +1562,8 @@ fn uefi_chainload_iso(
 
     let locator = FileBackedIsoLocator::from_payload_entry(
         &files[idx],
-        crate::protocol::Guid { d1: 0, d2: 0, d3: 0, d4: [0u8; 8] },
-        1, part1_lba,
+        *partition_guid,
+        partition_number, part1_lba,
     );
     let iso_loc = locator.locate();
 
@@ -1715,9 +1719,11 @@ pub fn boot_iso(
     bio_ref: &BlockIoProtocol,
     bio_ptr: *mut BlockIoProtocol,
     mid: u32,
+    partition_guid: &crate::protocol::Guid,
+    partition_number: u32,
 ) {
     print_raw(st, b"\r\nBooting ISO (UEFI chainload)...\r\n\0");
-    uefi_chainload_iso(st, image_handle, part1_lba, files, idx, bio_ref, bio_ptr, mid);
+    uefi_chainload_iso(st, image_handle, part1_lba, files, idx, bio_ref, bio_ptr, mid, partition_guid, partition_number);
 }
 
 use crate::fs::scan_payloads;
@@ -1732,6 +1738,8 @@ pub fn show_payload_menu(
     bio_ref: &BlockIoProtocol,
     bio_ptr: *mut BlockIoProtocol,
     mid: u32,
+    partition_guid: &crate::protocol::Guid,
+    partition_number: u32,
 ) -> ! {
     if count == 0 {
         print_raw(st, b"\r\nNo bootable payloads found on partition 1.\r\n\0");
@@ -1781,7 +1789,7 @@ pub fn show_payload_menu(
                     print_raw(st, b"\r\nPayload type not yet implemented. Press any key to continue...\r\n\0");
                     continue;
                 }
-                boot_payload_by_type(st, image_handle, disk_handle, ctx.part1_lba, payloads, idx, bio_ref, bio_ptr, mid);
+                boot_payload_by_type(st, image_handle, disk_handle, ctx.part1_lba, payloads, idx, bio_ref, bio_ptr, mid, partition_guid, partition_number);
             }
         } else if ch == b'0' && count >= 10 {
             let is_supported = matches!(payloads[9].payload_type, PayloadType::Iso | PayloadType::Efi);
@@ -1789,7 +1797,7 @@ pub fn show_payload_menu(
                 print_raw(st, b"\r\nPayload type not yet implemented. Press any key to continue...\r\n\0");
                 continue;
             }
-            boot_payload_by_type(st, image_handle, disk_handle, ctx.part1_lba, payloads, 9, bio_ref, bio_ptr, mid);
+            boot_payload_by_type(st, image_handle, disk_handle, ctx.part1_lba, payloads, 9, bio_ref, bio_ptr, mid, partition_guid, partition_number);
         } else if ch == b'r' || ch == b'R' {
             print_raw(st, b"\r\nRe-scanning...\r\n\0");
             let mut new_payloads: [PayloadEntry; PAYLOAD_SLOT_COUNT] = [PayloadEntry {
@@ -1798,7 +1806,7 @@ pub fn show_payload_menu(
             }; PAYLOAD_SLOT_COUNT];
             let mut new_count: usize = 0;
             scan_payloads(bio_ref, bio_ptr, mid, ctx, &mut new_payloads, &mut new_count);
-            show_payload_menu(st, image_handle, disk_handle, &new_payloads, new_count, ctx, bio_ref, bio_ptr, mid);
+            show_payload_menu(st, image_handle, disk_handle, &new_payloads, new_count, ctx, bio_ref, bio_ptr, mid, partition_guid, partition_number);
         }
     }
 }

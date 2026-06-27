@@ -72,26 +72,27 @@ pub fn read_sector(
     }
 }
 
-/// Find a GPT Basic Data partition from the GPT header
+/// Find a GPT Basic Data partition from the GPT header.
+/// Returns (start_lba, partition_guid) on success, or None.
 pub fn find_gpt_data_partition(
     st: &mut SystemTable,
     bio_ref: &BlockIoProtocol,
     bio_ptr: *mut BlockIoProtocol,
     mid: u32,
-) -> u64 {
+) -> Option<(u64, crate::protocol::Guid)> {
     let mut hdr_sec_aligned: [u64; 64] = [0; 64];
     let hdr_sec: &mut [u8; 512] = unsafe { &mut *(hdr_sec_aligned.as_mut_ptr() as *mut [u8; 512]) };
     if !read_sector(bio_ref, bio_ptr, mid, 1, hdr_sec) {
-        return 0;
+        return None;
     }
     if &hdr_sec[0..8] != b"EFI PART" {
-        return 0;
+        return None;
     }
     let entries_lba = u64::from_le_bytes(hdr_sec[72..80].try_into().unwrap());
     let n = u32::from_le_bytes(hdr_sec[80..84].try_into().unwrap());
     let sz = u32::from_le_bytes(hdr_sec[84..88].try_into().unwrap());
     if sz == 0 || n == 0 {
-        return 0;
+        return None;
     }
 
     let basic_data_guid: [u8; 16] = [
@@ -119,10 +120,92 @@ pub fn find_gpt_data_partition(
         if sec[boff..boff + 16] == basic_data_guid {
             let start_lba =
                 u64::from_le_bytes(sec[boff + 32..boff + 40].try_into().unwrap());
+            // Read the partition GUID (bytes 16-31 of the GPT entry)
+            let part_guid = crate::protocol::Guid {
+                d1: u32::from_le_bytes(sec[boff + 16..boff + 20].try_into().unwrap()),
+                d2: u16::from_le_bytes(sec[boff + 20..boff + 22].try_into().unwrap()),
+                d3: u16::from_le_bytes(sec[boff + 22..boff + 24].try_into().unwrap()),
+                d4: {
+                    let mut d4 = [0u8; 8];
+                    d4.copy_from_slice(&sec[boff + 24..boff + 32]);
+                    d4
+                },
+            };
             print_raw(st, b"Found GPT Basic Data at LBA ");
             print_hex(st, b"0x", start_lba);
             print_raw(st, b"\r\n\0");
-            return start_lba;
+            return Some((start_lba, part_guid));
+        }
+    }
+    None
+}
+
+/// Count the 1-based partition number of a GPT entry by its GUID.
+/// Scans GPT entries and counts all valid partition entries (non-zero type GUID)
+/// before (and including) the one with the matching unique GUID.
+pub fn count_gpt_partition_number(
+    bio_ref: &BlockIoProtocol,
+    bio_ptr: *mut BlockIoProtocol,
+    mid: u32,
+    target_guid: &crate::protocol::Guid,
+) -> usize {
+    // Read GPT header to get entry location
+    let mut hdr_sec: [u8; 512] = [0; 512];
+    if !read_sector(bio_ref, bio_ptr, mid, 1, &mut hdr_sec) {
+        return 0;
+    }
+    if &hdr_sec[0..8] != b"EFI PART" {
+        return 0;
+    }
+    let entries_lba = u64::from_le_bytes(hdr_sec[72..80].try_into().unwrap());
+    let n = u32::from_le_bytes(hdr_sec[80..84].try_into().unwrap());
+    let sz = u32::from_le_bytes(hdr_sec[84..88].try_into().unwrap());
+    if sz == 0 || n == 0 {
+        return 0;
+    }
+
+    let mut count = 0usize;
+    let mut sec: [u8; 512] = [0; 512];
+    let mut current_lba: u64 = 0;
+    let mut loaded = false;
+    for i in 0..n.min(128) {
+        let eoff = i as usize * sz as usize;
+        let lba = entries_lba + (eoff / 512) as u64;
+        let boff = eoff % 512;
+        if boff + 40 > 512 { continue; }
+        if !loaded || lba != current_lba {
+            if !read_sector(bio_ref, bio_ptr, mid, lba, &mut sec) { break; }
+            current_lba = lba;
+            loaded = true;
+        }
+
+        // Check if this is a valid partition entry (non-zero type GUID)
+        let mut is_zero = true;
+        for j in 0..16 {
+            if sec[boff + j] != 0 { is_zero = false; break; }
+        }
+        if is_zero { continue; } // unused entry
+
+        count += 1;
+
+        // Check if this is the target partition
+        let entry_guid = crate::protocol::Guid {
+            d1: u32::from_le_bytes(sec[boff + 16..boff + 20].try_into().unwrap()),
+            d2: u16::from_le_bytes(sec[boff + 20..boff + 22].try_into().unwrap()),
+            d3: u16::from_le_bytes(sec[boff + 22..boff + 24].try_into().unwrap()),
+            d4: {
+                let mut d4 = [0u8; 8];
+                d4.copy_from_slice(&sec[boff + 24..boff + 32]);
+                d4
+            },
+        };
+
+        if entry_guid.d1 == target_guid.d1
+            && entry_guid.d2 == target_guid.d2
+            && entry_guid.d3 == target_guid.d3
+            && entry_guid.d4 == target_guid.d4
+        {
+            return count;
         }
     }
     0

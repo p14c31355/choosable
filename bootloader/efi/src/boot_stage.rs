@@ -134,7 +134,12 @@ impl BootStage for DiscoverPartitionStage {
         if part1_lba == 0 && is_gpt {
             let st = unsafe { &mut *st_from_ctx(ctx) };
             print_raw(st, b"GPT detected, searching for data partition...\r\n\0");
-            part1_lba = disk::find_gpt_data_partition(st, bio_ref, bio_ptr, mid);
+            if let Some((lba, guid)) = disk::find_gpt_data_partition(st, bio_ref, bio_ptr, mid) {
+                part1_lba = lba;
+                ctx.partition_guid = guid;
+                // Count preceding partitions for partition number
+                ctx.partition_number = disk::count_gpt_partition_number(bio_ref, bio_ptr, mid, &guid) as u32;
+            }
         }
         if part1_lba == 0 {
             die_then_halt!(ctx, b"ERROR: No partition 1 found.\r\n\0");
@@ -340,6 +345,8 @@ impl BootStage for SelectPayloadStage {
             bio_ref,
             bio_ptr,
             mid,
+            &ctx.partition_guid,
+            ctx.partition_number,
         );
         loop { unsafe { core::arch::asm!("hlt") } }
     }
@@ -385,6 +392,8 @@ impl BootStage for ExecuteBootStage {
             bio_ref,
             bio_ptr,
             mid,
+            &ctx.partition_guid,
+            ctx.partition_number,
         );
         loop { unsafe { core::arch::asm!("hlt") } }
     }
