@@ -316,7 +316,7 @@ fn try_mount_iso(dev_path: &str, offset: u64) -> bool {
         if let Ok(lf) = fs::OpenOptions::new().read(true).write(true).open(&lp) {
             let lfd = lf.as_raw_fd();
             if unsafe { libc::ioctl(lfd, LOOP_SET_FD, dfd) } == 0 {
-                loop_dev = Some(lp);
+                loop_dev = Some((lp, lf));
                 break;
             }
             // lf will be dropped here, closing lfd automatically
@@ -324,31 +324,22 @@ fn try_mount_iso(dev_path: &str, offset: u64) -> bool {
     }
     drop(df);
 
-    let Some(loop_path) = loop_dev else { return false };
+    let Some((loop_path, lf)) = loop_dev else { return false };
+    let lfd = lf.as_raw_fd();
 
     if offset > 0 {
-        if let Ok(lf) = fs::OpenOptions::new().read(true).write(true).open(&loop_path) {
-            let lfd = lf.as_raw_fd();
-            let mut info: LoopInfo64 = unsafe { core::mem::zeroed() };
-            info.lo_offset = offset;
-            info.lo_flags = LO_FLAGS_READ_ONLY;
-            if unsafe { libc::ioctl(lfd, LOOP_SET_STATUS64, &info as *const LoopInfo64) } != 0 {
-                unsafe { libc::ioctl(lfd, LOOP_CLR_FD, 0) };
-                // lf will be dropped here, closing lfd automatically
-                return false;
-            }
-            // lf will be dropped here, closing lfd automatically
-        } else {
+        let mut info: LoopInfo64 = unsafe { core::mem::zeroed() };
+        info.lo_offset = offset;
+        info.lo_flags = LO_FLAGS_READ_ONLY;
+        if unsafe { libc::ioctl(lfd, LOOP_SET_STATUS64, &info as *const LoopInfo64) } != 0 {
+            unsafe { libc::ioctl(lfd, LOOP_CLR_FD, 0) };
             return false;
         }
     }
 
     let ok = unsafe { do_mount(&loop_path, "/cdrom", "iso9660", MS_RDONLY) == 0 };
     if !ok {
-        if let Ok(lf) = fs::OpenOptions::new().read(true).write(true).open(&loop_path) {
-            unsafe { libc::ioctl(lf.as_raw_fd(), LOOP_CLR_FD, 0) };
-            // lf will be dropped here, closing the fd automatically
-        }
+        unsafe { libc::ioctl(lfd, LOOP_CLR_FD, 0) };
         return false;
     }
 

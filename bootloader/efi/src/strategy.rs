@@ -309,9 +309,13 @@ fn patch_grub_cfg_impl(
                     if need_space { opt_buf[ob] = b' '; ob += 1; }
                     opt_buf[ob..ob + extra_content.len()].copy_from_slice(extra_content);
                     ob += extra_content.len();
-                    let inject_at = if dst > 0 && (out[dst - 1] == b'\n' || out[dst - 1] == b'\r') {
-                        dst - if out[dst - 1] == b'\n' { 1 } else { 0 }
-                    } else { dst };
+                    let mut inject_at = dst;
+                    if dst > 0 && out[dst - 1] == b'\n' {
+                        inject_at -= 1;
+                        if dst > 1 && out[dst - 2] == b'\r' { inject_at -= 1; }
+                    } else if dst > 0 && out[dst - 1] == b'\r' {
+                        inject_at -= 1;
+                    }
                     shift_and_inject(out, inject_at, &mut dst, &opt_buf[..ob]);
                 }
             }

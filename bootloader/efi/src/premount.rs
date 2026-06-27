@@ -45,10 +45,7 @@ pub struct CasperFixup;
 impl EarlyBootFixup for CasperFixup {
     fn build_initrd(&self, ctx: &BootContext, bs: &mut BootServices) -> Option<PremountBundle> {
         let p = ctx.selected_payload()?;
-        if p.file_start_lba < ctx.partition_start_lba {
-            return None;
-        }
-        let rel = p.file_start_lba - ctx.partition_start_lba;
+        let rel = p.file_start_lba.checked_sub(ctx.partition_start_lba)?;
         build_premount_cpio(bs, rel)
     }
 }
