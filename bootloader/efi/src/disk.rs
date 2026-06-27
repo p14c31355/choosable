@@ -170,6 +170,22 @@ fn read_gpt_entries_with_index<T>(
     None
 }
 
+/// Read the 16-byte GUID from MBR sector at byte offset 384.
+/// This is a Choosable/Ventoy convention — the GUID identifies the data partition
+/// for MBR-formatted disks and is written by the installer at install time.
+pub fn read_mbr_guid(mbr: &[u8; 512]) -> crate::protocol::Guid {
+    crate::protocol::Guid {
+        d1: u32::from_le_bytes(mbr[384..388].try_into().unwrap()),
+        d2: u16::from_le_bytes(mbr[388..390].try_into().unwrap()),
+        d3: u16::from_le_bytes(mbr[390..392].try_into().unwrap()),
+        d4: {
+            let mut d4 = [0u8; 8];
+            d4.copy_from_slice(&mbr[392..400]);
+            d4
+        },
+    }
+}
+
 /// Read the unique partition GUID from a GPT entry at byte offset boff in sec.
 fn read_partition_guid(sec: &[u8; 512], boff: usize) -> crate::protocol::Guid {
     crate::protocol::Guid {
