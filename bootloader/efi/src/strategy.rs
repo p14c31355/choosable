@@ -259,21 +259,21 @@ fn patch_grub_cfg_impl(
             {
                 // Fedora 40+ BLS: inject `set kernelopts="$kernelopts <linux_extra>"` BEFORE the blscfg line.
                 // This APPENDS linux_extra to the existing $kernelopts instead of replacing it.
-                let mut bls_line = [0u8; 512];
+                let mut bls_line = [0u8; 1024];
                 let mut bls_len = 0usize;
                 bls_line[bls_len..][..15].copy_from_slice(b"set kernelopts=");
                 bls_len += 15;
                 bls_line[bls_len] = b'"'; bls_len += 1;
                 // Preserve existing $kernelopts
                 let preserve = b"$kernelopts";
-                let pl = preserve.len().min(512 - bls_len - 2);
+                let pl = preserve.len().min(1024 - bls_len - 2);
                 bls_line[bls_len..bls_len + pl].copy_from_slice(&preserve[..pl]);
                 bls_len += pl;
                 // Append linux_extra after existing kernelopts
                 if !linux_extra.is_empty() {
                     // linux_extra already starts with a space, so just append it
                     let content = linux_extra;
-                    let cl = content.len().min(512 - bls_len - 2);
+                    let cl = content.len().min(1024 - bls_len - 2);
                     bls_line[bls_len..bls_len + cl].copy_from_slice(&content[..cl]);
                     bls_len += cl;
                 }
