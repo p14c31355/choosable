@@ -298,10 +298,18 @@ fn scan_all(offset: u64) {
             || name.starts_with("dm") || name.starts_with("sr")
         { continue; }
         let dev = format!("/dev/{}", name);
-        if try_mount_iso(&dev, offset) {
+        if let Some(loop_path) = try_mount_iso(&dev, offset) {
             if check_distro() {
                 console_log("success (fallback scan)");
                 unsafe { do_execve("/init"); }
+            } else {
+                unsafe {
+                    libc::umount2(b"/cdrom\0".as_ptr() as *const i8, libc::MNT_DETACH);
+                }
+                if let Ok(lf) = fs::OpenOptions::new().read(true).write(true).open(&loop_path) {
+                    let lfd = lf.as_raw_fd();
+                    unsafe { libc::ioctl(lfd, LOOP_CLR_FD, 0) };
+                }
             }
         }
     }
@@ -310,9 +318,9 @@ fn scan_all(offset: u64) {
 // ── Loop + mount ───────────────────────────────────────────────────────
 
 /// Try to loopback-mount the ISO at the given partition + offset.
-/// Returns true if mount succeeded (caller still needs check_distro).
-fn try_mount_iso(dev_path: &str, offset: u64) -> bool {
-    let Ok(df) = fs::OpenOptions::new().read(true).write(true).open(dev_path) else { return false };
+/// Returns the loop device path on success, or None.
+fn try_mount_iso(dev_path: &str, offset: u64) -> Option<String> {
+    let Ok(df) = fs::OpenOptions::new().read(true).write(true).open(dev_path) else { return None };
     let dfd = df.as_raw_fd();
 
     let mut loop_dev = None;
@@ -324,12 +332,11 @@ fn try_mount_iso(dev_path: &str, offset: u64) -> bool {
                 loop_dev = Some((lp, lf));
                 break;
             }
-            // lf will be dropped here, closing lfd automatically
         }
     }
     drop(df);
 
-    let Some((loop_path, lf)) = loop_dev else { return false };
+    let Some((loop_path, lf)) = loop_dev else { return None };
     let lfd = lf.as_raw_fd();
 
     if offset > 0 {
@@ -338,18 +345,18 @@ fn try_mount_iso(dev_path: &str, offset: u64) -> bool {
         info.lo_flags = LO_FLAGS_READ_ONLY;
         if unsafe { libc::ioctl(lfd, LOOP_SET_STATUS64, &info as *const LoopInfo64) } != 0 {
             unsafe { libc::ioctl(lfd, LOOP_CLR_FD, 0) };
-            return false;
+            return None;
         }
     }
 
     let ok = unsafe { do_mount(&loop_path, "/cdrom", "iso9660", MS_RDONLY) == 0 };
     if !ok {
         unsafe { libc::ioctl(lfd, LOOP_CLR_FD, 0) };
-        return false;
+        return None;
     }
 
     console_log(&format!("mounted {} on /cdrom (offset={})", loop_path, offset));
-    true
+    Some(loop_path)
 }
 
 // ── Main logic ──────────────────────────────────────────────────────────
@@ -387,12 +394,23 @@ fn main() {
     let mounted = match target {
         Some(ref dev) => {
             console_log(&format!("target: {}", dev));
-            let ok = try_mount_iso(dev, offset);
-            if ok && check_distro() {
-                true
+            if let Some(loop_path) = try_mount_iso(dev, offset) {
+                if check_distro() {
+                    true
+                } else {
+                    unsafe {
+                        libc::umount2(b"/cdrom\0".as_ptr() as *const i8, libc::MNT_DETACH);
+                    }
+                    if let Ok(lf) = fs::OpenOptions::new().read(true).write(true).open(&loop_path) {
+                        let lfd = lf.as_raw_fd();
+                        unsafe { libc::ioctl(lfd, LOOP_CLR_FD, 0) };
+                    }
+                    console_log("target mount/check failed, falling back to scan_all");
+                    scan_all(offset);
+                    false
+                }
             } else {
-                // Target mount or distro check failed, fall back to scan_all
-                console_log("target mount/check failed, falling back to scan_all");
+                console_log("target mount failed, falling back to scan_all");
                 scan_all(offset);
                 false
             }
