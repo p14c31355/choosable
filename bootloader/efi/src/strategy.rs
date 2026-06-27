@@ -90,7 +90,10 @@ fn matches_any_lower(name: &[u8], patterns: &[&[u8]]) -> bool {
 /// Remove all occurrences of ISO locator arguments (findiso=, iso-scan/filename=, choosable.iso_offset=)
 /// from the output buffer between line_start and dst, and adjust dst accordingly.
 fn remove_iso_locator_args(out: &mut [u8], line_start: usize, dst: &mut usize) {
-    let patterns: &[&[u8]] = &[b"findiso=", b"iso-scan/filename=", b"choosable.iso_offset="];
+    let patterns: &[&[u8]] = &[
+        b"findiso=", b"iso-scan/filename=", b"choosable.iso_offset=",
+        b"choosable.part_guid=", b"choosable.part_num=", b"choosable.iso_path=", b"choosable.iso_size=",
+    ];
 
     let mut pos = line_start;
     let mut write_pos = line_start;
@@ -154,10 +157,8 @@ fn patch_grub_cfg_impl(
     dedup_buf[1..1 + name_len].copy_from_slice(&effective_target[..name_len]);
     let dedup_slice = &dedup_buf[..1 + name_len];
 
-    // Build the dynamic value for choosable.iso_offset=  (or findiso= for DebianLive).
-    // choosable.iso_offset= needs the decimal byte offset, not the file path.
-    // DebianLive findiso= needs the file path.
-    // If iso_location is None, skip EOL injection entirely to avoid bare "findiso=" or "choosable.iso_offset=".
+    // Build the dynamic value for distro-specific EOL args (findiso= for DebianLive, iso-scan/filename= for Casper).
+    // If iso_location is None, skip EOL injection entirely to avoid bare "findiso=" or "iso-scan/filename=".
     let mut eol_buf = [0u8; 320];
     let eol_extra_dynamic = if !linux_eol_extra.is_empty() && linux_eol_extra.ends_with(b"=") {
         inp.iso_location.map_or(b"".as_ref(), |loc| {
@@ -173,41 +174,23 @@ fn patch_grub_cfg_impl(
                 eol_buf[plen..plen + pl].copy_from_slice(&fname[..pl]);
                 &eol_buf[..plen + pl]
             } else {
-                let (digits, dpos) = build_decimal_buf(loc.offset_bytes());
-                let off_len = 21 - dpos;
-                eol_buf[..plen].copy_from_slice(linux_eol_extra);
-                let pl = off_len.min(320 - plen);
-                eol_buf[plen..plen + pl].copy_from_slice(&digits[dpos..dpos + pl]);
-                &eol_buf[..plen + pl]
+                &b""[..]
             }
         })
-    } else { linux_eol_extra };
+    } else { &b""[..] };
 
-    // Always build choosable.iso_offset=<decimal> as a separate injection.
-    // This is the primary mechanism for premount-init to locate the ISO at
-    // boot time.  It is injected alongside distro-specific args (findiso=,
-    // iso-scan/filename=) for Casper/DebianLive, and as the sole EOL arg
-    // for all other boot kinds (Fedora, Arch, Alpine, etc.).
-    let mut iso_offset_buf = [0u8; 64];
-    let iso_offset_dynamic = inp.iso_location.map_or(b"".as_ref(), |loc| {
-        let prefix = b" choosable.iso_offset=";
-        let plen = prefix.len();
-        iso_offset_buf[..plen].copy_from_slice(prefix);
-        let (digits, dpos) = build_decimal_buf(loc.offset_bytes());
-        let dlen = 21 - dpos;
-        let wp = plen + dlen;
-        iso_offset_buf[plen..wp].copy_from_slice(&digits[dpos..dpos + dlen]);
-        &iso_offset_buf[..wp]
-    });
+    // NOTE: choosable.iso_offset= and other choosable.* params are now injected
+    // as part of linux_extra (via BootKind::linux_extra). We no longer inject
+    // them separately here to avoid duplication.
 
     // Count blscfg lines for BLS-aware distros (Fedora 40+)
     let blscfg_count = orig.windows(6).filter(|w| *w == b"blscfg" || *w == b"BLSCFG").count();
     let has_blscfg = blscfg_count > 0;
 
     let (linux_count, initrd_count) = count_matching_lines(orig);
-    let extra = linux_count * (linux_extra.len() + eol_extra_dynamic.len() + iso_offset_dynamic.len())
+    let extra = linux_count * (linux_extra.len() + eol_extra_dynamic.len())
         + initrd_count * initrd_extra.len()
-        + if has_blscfg { blscfg_count * (b"set kernelopts=\"$kernelopts".len() + linux_extra.len() + iso_offset_dynamic.len() + b"\"\n".len()) } else { 0 };
+        + if has_blscfg { blscfg_count * (b"set kernelopts=\"$kernelopts".len() + linux_extra.len() + b"\"\n".len()) } else { 0 };
     let (out_ptr, out_cap) = allocate_output(bs, orig.len(), extra)?;
     let out = unsafe { core::slice::from_raw_parts_mut(out_ptr, out_cap) };
 
@@ -238,7 +221,7 @@ fn patch_grub_cfg_impl(
             {
                 // Remove any existing ISO locator arguments to prevent duplicates
                 // and ensure our dynamic value takes precedence.
-                if !eol_extra_dynamic.is_empty() || !iso_offset_dynamic.is_empty() {
+                if !eol_extra_dynamic.is_empty() {
                     remove_iso_locator_args(out, line_start, &mut dst);
                 }
 
@@ -258,21 +241,13 @@ fn patch_grub_cfg_impl(
                     let inj2 = inject_at + linux_extra.len();
                     shift_and_inject(out, inj2, &mut dst, eol_extra_dynamic);
                 }
-
-                // Inject choosable.iso_offset=<decimal> as the final
-                // kernel cmdline argument on this line.  premount-init
-                // reads this from /proc/cmdline to locate the ISO by
-                // raw byte offset and loopback-mount it.
-                if !iso_offset_dynamic.is_empty() {
-                    let inj3 = inject_at + linux_extra.len() + eol_extra_dynamic.len();
-                    shift_and_inject(out, inj3, &mut dst, iso_offset_dynamic);
-                }
             }
             else if has_blscfg
                 && (t.starts_with(b"blscfg") || t.starts_with(b"blscfg\n") || t.starts_with(b"BLSCFG") || t.starts_with(b"BLSCFG\n"))
                 && !linux_extra.is_empty()
             {
-                // Fedora 40+ BLS: inject `set kernelopts="$kernelopts <linux_extra> <choosable.iso_offset>"` BEFORE the blscfg line.
+                // Fedora 40+ BLS: inject `set kernelopts="$kernelopts <linux_extra>"` BEFORE the blscfg line.
+                // choosable.* params are now included in linux_extra via BootKind::linux_extra()
                 let mut bls_line = [0u8; 512];
                 let mut bls_len = 0usize;
                 bls_line[bls_len..][..15].copy_from_slice(b"set kernelopts=");
@@ -286,11 +261,6 @@ fn patch_grub_cfg_impl(
                     bls_line[bls_len..bls_len + cl].copy_from_slice(&content[..cl]);
                     bls_len += cl;
                 }
-                if !iso_offset_dynamic.is_empty() {
-                    let il = iso_offset_dynamic.len().min(512 - bls_len - 2);
-                    bls_line[bls_len..bls_len + il].copy_from_slice(&iso_offset_dynamic[..il]);
-                    bls_len += il;
-                }
                 bls_line[bls_len] = b'"'; bls_len += 1;
                 bls_line[bls_len] = b'\n'; bls_len += 1;
 
@@ -303,9 +273,6 @@ fn patch_grub_cfg_impl(
                 // systemd-boot .conf format: inject cmdline args onto the options line.
                 // linux_extra starts with a space; strip it for appending to options.
                 let extra_content = if linux_extra.starts_with(b" ") { &linux_extra[1..] } else { linux_extra };
-                let opt_extra_len = extra_content.len() + iso_offset_dynamic.len();
-                let opt_inject_at = dst; // append at end of line (before newline)
-                if dst > 0 && out[dst - 1] == b'\n' { /* injection point is before newline */ }
                 if !extra_content.is_empty() {
                     // Prepend space if the line doesn't already end with one
                     let need_space = dst > line_start && out[dst - 1] != b' ' && out[dst - 1] != b'\t';
@@ -314,11 +281,6 @@ fn patch_grub_cfg_impl(
                     if need_space { opt_buf[ob] = b' '; ob += 1; }
                     opt_buf[ob..ob + extra_content.len()].copy_from_slice(extra_content);
                     ob += extra_content.len();
-                    if !iso_offset_dynamic.is_empty() {
-                        let il = iso_offset_dynamic.len().min(320 - ob);
-                        opt_buf[ob..ob + il].copy_from_slice(&iso_offset_dynamic[..il]);
-                        ob += il;
-                    }
                     let inject_at = if dst > 0 && (out[dst - 1] == b'\n' || out[dst - 1] == b'\r') {
                         dst - if out[dst - 1] == b'\n' { 1 } else { 0 }
                     } else { dst };
@@ -386,7 +348,8 @@ pub fn patch_grub_cfg(
     let is_popos = boot_kind == BootKind::Casper
         && matches_any_lower(iso_name, &[b"pop", b"pop-os", b"popos"]);
 
-    let linux_extra = boot_kind.linux_extra(is_popos);
+    let mut linux_extra_buf = [0u8; 512];
+    let linux_extra = boot_kind.linux_extra(is_popos, iso_location, &mut linux_extra_buf);
     let linux_eol_extra = boot_kind.linux_eol_extra();
 
     let mut live_media_uuid = [0u8; 10];
@@ -400,5 +363,5 @@ pub fn patch_grub_cfg(
         premount_target_name,
     };
 
-    patch_grub_cfg_impl(&inp, linux_extra, linux_eol_extra, premount_target_name)
+    patch_grub_cfg_impl(&inp, &linux_extra, linux_eol_extra, premount_target_name)
 }

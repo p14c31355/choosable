@@ -3,12 +3,13 @@
 //  Statically-linked /init.choosable (musl target).
 //  Replaces /init early in boot via init=/init.choosable.
 //  Uses raw syscalls — no external binaries required.
-//  Mounts /proc,/sys,/dev, scans /proc/partitions, loopback-mounts
-//  an ISO using choosable.iso_offset= from the kernel cmdline,
-//  then exec's the real /init.
+//  Mounts /proc,/sys,/dev, reads kernel cmdline for choosable.* params,
+//  locates the ISO by PARTUUID (preferred) or partition number + offset,
+//  loopback-mounts it, then exec's the real /init.
 
 use std::fs;
 use std::io::Read;
+use std::os::fd::AsRawFd;
 
 const MS_RDONLY: libc::c_ulong = 1;
 const MS_BIND: libc::c_ulong = 0x1000;
@@ -45,32 +46,91 @@ struct LoopInfo64 {
 fn console_log(s: &str) {
     if let Ok(mut f) = fs::OpenOptions::new().append(true).open("/dev/console") {
         use std::io::Write;
-        let _ = write!(f, "premount: {}\n", s);
+        let _ = write!(f, "[choosable] {}\n", s);
     }
 }
 
-// ── Cmdline parser ──────────────────────────────────────────────────────
-fn read_offset() -> u64 {
-    let Ok(mut f) = fs::File::open("/proc/cmdline") else { return 0 };
+// ── Kernel cmdline parser ──────────────────────────────────────────────
+#[derive(Default)]
+struct CmdlineParams {
+    iso_offset: Option<u64>,
+    part_guid: Option<String>,
+    part_num: Option<u32>,
+    iso_path: Option<String>,
+    iso_size: Option<u64>,
+}
+
+fn parse_cmdline() -> CmdlineParams {
+    let mut params = CmdlineParams::default();
+    let Ok(mut f) = fs::File::open("/proc/cmdline") else {
+        console_log("cannot open /proc/cmdline");
+        return params;
+    };
     let mut buf = Vec::new();
-    if f.read_to_end(&mut buf).is_err() { return 0 }
-    let marker = b"choosable.iso_offset=";
-    if let Some(pos) = buf.windows(marker.len()).position(|w| w == marker) {
-        let s = pos + marker.len();
-        let mut e = s;
-        while e < buf.len() && buf[e] != b' ' && buf[e] != b'\n' && buf[e] != 0 { e += 1 }
-        let mut v: u64 = 0;
-        for &b in &buf[s..e] {
-            if b < b'0' || b > b'9' { return 0 }
-            v = v.saturating_mul(10).saturating_add((b - b'0') as u64);
-        }
-        if v > 0 && v <= MAX_OFFSET { return v }
+    if f.read_to_end(&mut buf).is_err() {
+        console_log("cannot read /proc/cmdline");
+        return params;
     }
-    0
+
+    // Parse space-separated key=value pairs
+    let mut i = 0;
+    while i < buf.len() {
+        // Skip leading whitespace
+        while i < buf.len() && (buf[i] == b' ' || buf[i] == b'\t' || buf[i] == b'\n') { i += 1; }
+        if i >= buf.len() { break; }
+
+        // Find the end of this token
+        let token_start = i;
+        while i < buf.len() && buf[i] != b' ' && buf[i] != b'\t' && buf[i] != b'\n' { i += 1; }
+        let token = &buf[token_start..i];
+
+        // Split on '=' to get key/value
+        if let Some(eq_pos) = token.iter().position(|&b| b == b'=') {
+            let key = &token[..eq_pos];
+            let val = &token[eq_pos + 1..];
+
+            match key {
+                b"choosable.iso_offset" => {
+                    let mut v: u64 = 0;
+                    for &b in val {
+                        if b < b'0' || b > b'9' { v = 0; break; }
+                        v = v.saturating_mul(10).saturating_add((b - b'0') as u64);
+                    }
+                    if v > 0 && v <= MAX_OFFSET { params.iso_offset = Some(v); }
+                }
+                b"choosable.part_guid" => {
+                    if let Ok(s) = std::str::from_utf8(val) { params.part_guid = Some(s.to_lowercase()); }
+                }
+                b"choosable.part_num" => {
+                    let mut v: u32 = 0;
+                    for &b in val {
+                        if b < b'0' || b > b'9' { v = 0; break; }
+                        v = v.saturating_mul(10).saturating_add((b - b'0') as u32);
+                    }
+                    if v > 0 { params.part_num = Some(v); }
+                }
+                b"choosable.iso_path" => {
+                    if let Ok(s) = std::str::from_utf8(val) { params.iso_path = Some(s.to_string()); }
+                }
+                b"choosable.iso_size" => {
+                    let mut v: u64 = 0;
+                    for &b in val {
+                        if b < b'0' || b > b'9' { v = 0; break; }
+                        v = v.saturating_mul(10).saturating_add((b - b'0') as u64);
+                    }
+                    if v > 0 { params.iso_size = Some(v); }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    console_log(&format!("cmdline: offset={:?} guid={:?} num={:?} path={:?} size={:?}",
+        params.iso_offset, params.part_guid.as_deref(), params.part_num, params.iso_path.as_deref(), params.iso_size));
+    params
 }
 
 // ── Raw syscall wrappers ────────────────────────────────────────────────
-
 unsafe fn do_mount(src: &str, tgt: &str, fstype: &str, flags: libc::c_ulong) -> i32 {
     let s = std::ffi::CString::new(src).unwrap();
     let t = std::ffi::CString::new(tgt).unwrap();
@@ -99,15 +159,15 @@ unsafe fn do_execve(path: &str) -> ! {
 // ── Distro detection ────────────────────────────────────────────────────
 fn check_distro() -> bool {
     if std::path::Path::new("/cdrom/casper").is_dir() {
-        console_log("casper/pop detected");
+        console_log("distro: casper/pop");
         return true;
     }
     if std::path::Path::new("/cdrom/live").is_dir() {
-        console_log("debian-live detected");
+        console_log("distro: debian-live");
         return true;
     }
     if std::path::Path::new("/cdrom/LiveOS").is_dir() {
-        console_log("LiveOS (Fedora) detected");
+        console_log("distro: LiveOS (Fedora)");
         unsafe {
             do_mkdir("/run/initramfs");
             do_mkdir("/run/initramfs/live");
@@ -117,7 +177,7 @@ fn check_distro() -> bool {
         return true;
     }
     if std::path::Path::new("/cdrom/arch").is_dir() {
-        console_log("archiso detected");
+        console_log("distro: archiso");
         unsafe {
             do_mkdir("/run/archiso");
             do_mkdir("/run/archiso/bootmnt");
@@ -128,17 +188,165 @@ fn check_distro() -> bool {
     if std::path::Path::new("/cdrom/.alpine-release").exists()
         || std::path::Path::new("/cdrom/apks").is_dir()
     {
-        console_log("alpine detected");
+        console_log("distro: alpine");
         return true;
     }
-    console_log("unknown distro, mount anyway");
+    console_log("distro: unknown, mount anyway");
+    true
+}
+
+// ── Partition lookup ────────────────────────────────────────────────────
+
+/// Find target partition by PARTUUID. Falls back to scanning /proc/partitions + /sys.
+fn by_partuuid(guid: &str) -> Option<String> {
+    // First try /dev/disk/by-partuuid/ (requires udev/sysfs)
+    let by_partuuid = format!("/dev/disk/by-partuuid/{}", guid);
+    if std::path::Path::new(&by_partuuid).exists() {
+        if let Ok(target) = fs::read_link(&by_partuuid) {
+            let dev = if target.is_absolute() { target } else {
+                std::path::Path::new("/dev/disk/by-partuuid").join(target)
+            };
+            let dev_str = dev.to_string_lossy().to_string();
+            console_log(&format!("PARTUUID match: {} -> {}", by_partuuid, dev_str));
+            return Some(dev_str);
+        }
+        console_log(&format!("PARTUUID path exists but read_link failed: {}", by_partuuid));
+        return Some(by_partuuid);
+    }
+
+    // Fallback: scan /sys/block to find partition by GUID
+    // Each partition has /sys/block/<dev>/<dev>/partition and optional
+    // /sys/block/<dev>/<dev>/uuid (GPT partition UUID)
+    console_log(&format!("PARTUUID {} not found via udev, scanning sysfs", guid));
+    let guid_upper = guid.to_uppercase();
+    let Ok(blocks) = fs::read_dir("/sys/block") else { return None };
+    for block in blocks {
+        let Ok(block) = block else { continue };
+        let block_name = block.file_name();
+        let Ok(parts) = fs::read_dir(block.path()) else { continue };
+        for part in parts {
+            let Ok(part) = part else { continue };
+            let part_name = part.file_name();
+            let part_name_s = part_name.to_string_lossy();
+            // Each partition has a "partition" file and optionally "uuid" (GPT partition GUID)
+            let uuid_path = part.path().join("uuid");
+            if !uuid_path.exists() { continue; }
+            if let Ok(uuid) = fs::read_to_string(&uuid_path) {
+                let uuid = uuid.trim().to_uppercase();
+                if uuid == guid_upper {
+                    let dev = format!("/dev/{}", part_name_s);
+                    console_log(&format!("PARTUUID match via sysfs: {} -> {}", uuid_path.display(), dev));
+                    return Some(dev);
+                }
+            }
+        }
+    }
+    console_log("PARTUUID not found via sysfs either");
+    None
+}
+
+/// Fallback: find partition by 1-based number.
+fn by_partnum(target_num: u32) -> Option<String> {
+    let Ok(data) = fs::read_to_string("/proc/partitions") else { return None };
+    let mut i = 0u32;
+    for line in data.lines().skip(2) {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 4 { continue; }
+        let name = cols[3];
+        if name.starts_with("loop") || name.starts_with("ram")
+            || name.starts_with("dm") || name.starts_with("sr")
+        { continue; }
+        i += 1;
+        if i == target_num {
+            let dev = format!("/dev/{}", name);
+            if std::path::Path::new(&dev).exists() {
+                return Some(dev);
+            }
+        }
+    }
+    None
+}
+
+/// Scan all partitions (legacy fallback).
+fn scan_all(offset: u64) {
+    let Ok(data) = fs::read_to_string("/proc/partitions") else {
+        console_log("cannot read /proc/partitions");
+        return;
+    };
+    for line in data.lines().skip(2) {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 4 { continue; }
+        let name = cols[3];
+        if name.starts_with("loop") || name.starts_with("ram")
+            || name.starts_with("dm") || name.starts_with("sr")
+        { continue; }
+        let dev = format!("/dev/{}", name);
+        if try_mount_iso(&dev, offset) {
+            if check_distro() {
+                console_log("success (fallback scan)");
+                unsafe { do_execve("/init"); }
+            }
+        }
+    }
+}
+
+// ── Loop + mount ───────────────────────────────────────────────────────
+
+/// Try to loopback-mount the ISO at the given partition + offset.
+/// Returns true if mount succeeded (caller still needs check_distro).
+fn try_mount_iso(dev_path: &str, offset: u64) -> bool {
+    let Ok(df) = fs::OpenOptions::new().read(true).write(true).open(dev_path) else { return false };
+    let dfd = df.as_raw_fd();
+
+    let mut loop_dev = None;
+    for i in 0i32..8 {
+        let lp = format!("/dev/loop{}", i);
+        if let Ok(lf) = fs::OpenOptions::new().read(true).write(true).open(&lp) {
+            let lfd = lf.as_raw_fd();
+            if unsafe { libc::ioctl(lfd, LOOP_SET_FD, dfd) } == 0 {
+                loop_dev = Some((lp, lfd));
+                break;
+            }
+            unsafe { libc::close(lfd); }
+        }
+    }
+    drop(df);
+
+    let Some((loop_path, _)) = loop_dev else { return false };
+
+    if offset > 0 {
+        if let Ok(lf) = fs::OpenOptions::new().read(true).write(true).open(&loop_path) {
+            let lfd = lf.as_raw_fd();
+            let mut info: LoopInfo64 = unsafe { core::mem::zeroed() };
+            info.lo_offset = offset;
+            info.lo_flags = LO_FLAGS_READ_ONLY;
+            if unsafe { libc::ioctl(lfd, LOOP_SET_STATUS64, &info as *const LoopInfo64) } != 0 {
+                unsafe { libc::ioctl(lfd, LOOP_CLR_FD, 0) };
+                unsafe { libc::close(lfd) };
+                return false;
+            }
+            unsafe { libc::close(lfd) };
+        } else {
+            return false;
+        }
+    }
+
+    let ok = unsafe { do_mount(&loop_path, "/cdrom", "iso9660", MS_RDONLY) == 0 };
+    if !ok {
+        if let Ok(lf) = fs::OpenOptions::new().read(true).write(true).open(&loop_path) {
+            unsafe { libc::ioctl(lf.as_raw_fd(), LOOP_CLR_FD, 0) };
+        }
+        return false;
+    }
+
+    console_log(&format!("mounted {} on /cdrom (offset={})", loop_path, offset));
     true
 }
 
 // ── Main logic ──────────────────────────────────────────────────────────
 
 fn main() {
-    console_log("starting");
+    console_log("premount started");
 
     // 1. Mount essential filesystems
     unsafe {
@@ -151,108 +359,43 @@ fn main() {
         do_mkdir("/tmp");
         do_mkdir("/cdrom");
         do_mkdir("/run");
-
-        // Create /dev/loop* nodes (loop module creates them via devtmpfs,
-        // but we ensure they exist)
         for i in 0u32..8 {
-            do_mknod_blk(&format!("/dev/loop{i}"), 7, i);
+            do_mknod_blk(&format!("/dev/loop{}", i), 7, i);
         }
     }
 
-    // 2. Read ISO offset from cmdline
-    let offset = read_offset();
-    console_log(&format!("offset={offset}"));
+    // 2. Parse kernel cmdline
+    let params = parse_cmdline();
+    let offset = params.iso_offset.unwrap_or(0);
 
     // 3. Wait for devices
     std::thread::sleep(std::time::Duration::from_secs(3));
 
-    // 4. Scan /proc/partitions
-    let Ok(data) = fs::read_to_string("/proc/partitions") else {
-        console_log("cannot read /proc/partitions");
-        unsafe { do_execve("/init"); }
+    // 4. Target partition via PARTUUID (preferred) or partition number
+    let target: Option<String> = params.part_guid.as_ref().and_then(|g| by_partuuid(g))
+        .or_else(|| params.part_num.and_then(|n| by_partnum(n)));
+
+    let mounted = match target {
+        Some(ref dev) => {
+            console_log(&format!("target: {}", dev));
+            let ok = try_mount_iso(dev, offset);
+            if ok && check_distro() {
+                true
+            } else {
+                false
+            }
+        }
+        None => {
+            console_log("no PARTUUID/partnum, scanning all partitions");
+            scan_all(offset);
+            false
+        }
     };
 
-    let mut found = false;
-    for line in data.lines().skip(2) {
-        let cols: Vec<&str> = line.split_whitespace().collect();
-        if cols.len() < 4 { continue }
-        let name = cols[3];
-        if name.starts_with("loop") || name.starts_with("ram")
-            || name.starts_with("dm") || name.starts_with("sr")
-        { continue }
-
-        let dev = format!("/dev/{name}");
-        let Ok(df) = fs::OpenOptions::new().read(true).write(true).open(&dev) else { continue };
-        use std::os::fd::AsRawFd;
-        let dfd = df.as_raw_fd();
-
-        // Find free loop device and bind
-        let mut loop_i: Option<i32> = None;
-        for i in 0i32..8 {
-            let lp = format!("/dev/loop{i}");
-            if let Ok(lf) = fs::OpenOptions::new().read(true).write(true).open(&lp) {
-                let lfd = lf.as_raw_fd();
-                if unsafe { libc::ioctl(lfd, LOOP_SET_FD, dfd) } == 0 {
-                    loop_i = Some(i);
-                    unsafe { libc::close(lfd); }
-                    break;
-                }
-                unsafe { libc::close(lfd); }
-            }
-        }
-        drop(df); // close dev_fd
-
-        let Some(li) = loop_i else { continue };
-        let lp = format!("/dev/loop{li}");
-
-        // Configure loop device with offset and read-only flag
-        if offset > 0 {
-            if let Ok(lf) = fs::OpenOptions::new().read(true).write(true).open(&lp) {
-                let lfd = lf.as_raw_fd();
-                let mut info: LoopInfo64 = unsafe { core::mem::zeroed() };
-                info.lo_offset = offset;
-                info.lo_flags = LO_FLAGS_READ_ONLY;
-                if unsafe { libc::ioctl(lfd, LOOP_SET_STATUS64, &info as *const LoopInfo64) } != 0 {
-                    // Failed to set offset on loop device - clean up and continue
-                    unsafe { libc::ioctl(lfd, LOOP_CLR_FD, 0) };
-                    continue;
-                }
-            } else {
-                // Failed to open loop device - continue to next
-                continue;
-            }
-        }
-
-        // Mount the loop device (offset is already configured on the device)
-        let mount_ok = unsafe { do_mount(&lp, "/cdrom", "iso9660", MS_RDONLY) == 0 };
-
-        if !mount_ok {
-            // Detach loop
-            if let Ok(lf) = fs::OpenOptions::new().read(true).write(true).open(&lp) {
-                let lfd = lf.as_raw_fd();
-                unsafe { libc::ioctl(lfd, LOOP_CLR_FD, 0) };
-            }
-            continue;
-        }
-
-        if check_distro() {
-            found = true;
-            break;
-        }
-
-        // Not our ISO — clean up
-        unsafe { libc::umount2(b"/cdrom\0".as_ptr() as *const i8, libc::MNT_DETACH); }
-        if let Ok(lf) = fs::OpenOptions::new().read(true).write(true).open(&lp) {
-            let lfd = lf.as_raw_fd();
-            unsafe { libc::ioctl(lfd, LOOP_CLR_FD, 0) };
-        }
-    }
-
-    if found {
+    if mounted {
         console_log("success, exec /init");
     } else {
         console_log("fail, exec /init (fallback)");
     }
-
     unsafe { do_execve("/init"); }
 }
