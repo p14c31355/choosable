@@ -55,65 +55,57 @@ pub trait VirtualMedia {
     fn media_type(&self) -> &'static str;
 }
 
+// ── Common block read implementation shared by all VirtualMedia types ─
+
+fn backing_block_size(bio_ptr: *mut BlockIoProtocol) -> u32 {
+    unsafe {
+        if (*bio_ptr).media.is_null() { 512 }
+        else { (*(*bio_ptr).media).bim_bs }
+    }
+}
+
+fn read_block_at(
+    real_bio_ptr: *mut BlockIoProtocol, real_media_id: u32,
+    block_lba: u64, start_lba: u64, block_size: u32, total_blocks: u64,
+    dst: &mut [u8], dst_offset: usize,
+) -> bool {
+    let block_size_u64 = block_size as u64;
+    if block_lba >= total_blocks
+        || block_size == 0 || block_size > 65536
+        || dst_offset as u64 + block_size_u64 > dst.len() as u64
+    { return false; }
+    let bbs = backing_block_size(real_bio_ptr) as u64;
+    if bbs == 0 || block_size_u64 % bbs != 0 { return false; }
+    let sectors_per_block = block_size_u64 / bbs;
+    let disk_lba = match block_lba.checked_mul(sectors_per_block)
+        .and_then(|off| start_lba.checked_add(off))
+    { Some(lba) => lba, None => return false };
+    unsafe {
+        ((*real_bio_ptr).read_blocks)(
+            real_bio_ptr, real_media_id,
+            disk_lba, block_size as usize,
+            dst.as_mut_ptr().add(dst_offset) as *mut c_void,
+        ) == EFI_SUCCESS
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  IsoMedia — ISO backed by a real disk extent
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Virtual medium backed by an ISO file on a physical block device.
-///
-/// Reads are translated from virtual CD-ROM LBA to physical disk LBA.
 pub struct IsoMedia {
-    /// ISO file start LBA on the physical disk
     pub iso_lba: u64,
-    /// Physical Block I/O protocol pointer
     pub real_bio_ptr: *mut BlockIoProtocol,
-    /// Physical media ID
     pub real_media_id: u32,
-    /// Total number of 2048-byte blocks in the ISO
     pub total_blocks: u64,
 }
 
 impl VirtualMedia for IsoMedia {
     fn read_block(&self, block_lba: u64, dst: &mut [u8], dst_offset: usize) -> bool {
-        if block_lba >= self.total_blocks {
-            return false;
-        }
-        // Guard against overflow: check that dst_offset + 2048 won't overflow and is in bounds
-        if dst_offset > dst.len() || dst.len() - dst_offset < 2048 {
-            return false;
-        }
-        // Validate that 2048-byte ISO sectors are an exact multiple of backing block size
-        let backing_block_size = unsafe {
-            if (*self.real_bio_ptr).media.is_null() {
-                512
-            } else {
-                (*(*self.real_bio_ptr).media).bim_bs
-            }
-        };
-        if backing_block_size == 0 || 2048 % backing_block_size != 0 {
-            return false;
-        }
-        let sectors_per_iso_block = 2048 / backing_block_size;
-        let disk_lba = self.iso_lba + block_lba * sectors_per_iso_block as u64;
-        unsafe {
-            ((*self.real_bio_ptr).read_blocks)(
-                self.real_bio_ptr,
-                self.real_media_id,
-                disk_lba,
-                2048,
-                dst.as_mut_ptr().add(dst_offset) as *mut c_void,
-            ) == EFI_SUCCESS
-        }
+        read_block_at(self.real_bio_ptr, self.real_media_id, block_lba, self.iso_lba, 2048, self.total_blocks, dst, dst_offset)
     }
-
-    fn block_count(&self) -> u64 {
-        self.total_blocks
-    }
-
-    fn block_size(&self) -> u32 {
-        2048
-    }
-
+    fn block_count(&self) -> u64 { self.total_blocks }
+    fn block_size(&self) -> u32 { 2048 }
     fn media_type(&self) -> &'static str { "ISO" }
 }
 
@@ -131,36 +123,8 @@ pub struct RawMedia {
 
 impl VirtualMedia for RawMedia {
     fn read_block(&self, block_lba: u64, dst: &mut [u8], dst_offset: usize) -> bool {
-        if block_lba >= self.total_blocks { return false; }
-        let sector_size = self.sector_size.max(512) as u64;
-        if sector_size > 65536 { return false; }
-        if dst_offset as u64 + sector_size > dst.len() as u64 { return false; }
-        // Validate that virtual sector size is an exact multiple of backing block size
-        let backing_block_size = unsafe {
-            if (*self.real_bio_ptr).media.is_null() {
-                512
-            } else {
-                (*(*self.real_bio_ptr).media).bim_bs
-            }
-        } as u64;
-        if backing_block_size == 0 || sector_size % backing_block_size != 0 {
-            return false;
-        }
-        let sectors_per_block = sector_size / backing_block_size;
-        let disk_lba = match block_lba
-            .checked_mul(sectors_per_block)
-            .and_then(|off| self.start_lba.checked_add(off))
-        {
-            Some(lba) => lba,
-            None => return false,
-        };
-        unsafe {
-            ((*self.real_bio_ptr).read_blocks)(
-                self.real_bio_ptr, self.real_media_id,
-                disk_lba, sector_size as usize,
-                dst.as_mut_ptr().add(dst_offset) as *mut c_void,
-            ) == EFI_SUCCESS
-        }
+        let bs = self.sector_size.max(512);
+        read_block_at(self.real_bio_ptr, self.real_media_id, block_lba, self.start_lba, bs, self.total_blocks, dst, dst_offset)
     }
     fn block_count(&self) -> u64 { self.total_blocks }
     fn block_size(&self) -> u32 { self.sector_size.max(512) }
@@ -187,36 +151,8 @@ pub struct VhdMedia {
 
 impl VirtualMedia for VhdMedia {
     fn read_block(&self, block_lba: u64, dst: &mut [u8], dst_offset: usize) -> bool {
-        if block_lba >= self.total_blocks { return false; }
-        let sector_size = self.sector_size.max(512) as u64;
-        if sector_size > 65536 { return false; }
-        if dst_offset as u64 + sector_size > dst.len() as u64 { return false; }
-        // Validate that virtual sector size is an exact multiple of backing block size
-        let backing_block_size = unsafe {
-            if (*self.real_bio_ptr).media.is_null() {
-                512
-            } else {
-                (*(*self.real_bio_ptr).media).bim_bs
-            }
-        } as u64;
-        if backing_block_size == 0 || sector_size % backing_block_size != 0 {
-            return false;
-        }
-        let sectors_per_block = sector_size / backing_block_size;
-        let disk_lba = match block_lba
-            .checked_mul(sectors_per_block)
-            .and_then(|off| self.data_lba.checked_add(off))
-        {
-            Some(lba) => lba,
-            None => return false,
-        };
-        unsafe {
-            ((*self.real_bio_ptr).read_blocks)(
-                self.real_bio_ptr, self.real_media_id,
-                disk_lba, sector_size as usize,
-                dst.as_mut_ptr().add(dst_offset) as *mut c_void,
-            ) == EFI_SUCCESS
-        }
+        let bs = self.sector_size.max(512);
+        read_block_at(self.real_bio_ptr, self.real_media_id, block_lba, self.data_lba, bs, self.total_blocks, dst, dst_offset)
     }
     fn block_count(&self) -> u64 { self.total_blocks }
     fn block_size(&self) -> u32 { self.sector_size.max(512) }
@@ -308,16 +244,18 @@ unsafe extern "efiapi" fn vblock_read(
             if !is_dir_patched && !read_real_iso_sector(vbio, block_lba, dst, block_offset) { return EFI_DEVICE_ERROR; }
             patch_dir_entry(&mut dst[block_offset..block_offset + 2048],
                 vbio.premount_entry_offset as usize, vbio.premount_entry_new_extent, vbio.premount_entry_new_size);
-            // Also rename the ISO9660 directory entry to "PREMOUNT.CPIO;1"
+            // Also rename the ISO9660 directory entry to "PREMOUNT.CPIO"
             // so GRUB can resolve the /PREMOUNT.CPIO path from grub.cfg.
+            // The ;1 version suffix is NOT included — GRUB's ISO9660 driver
+            // strips it automatically, and a 13-char name fits in the
+            // minimal 46-byte record (33 + 13 = 46).
             if vbio.premount_entry_rename {
                 let off = vbio.premount_entry_offset as usize;
-                let name = b"PREMOUNT.CPIO;1";
-                // ISO9660 name length at byte 32, record length at byte 0
+                let name = b"PREMOUNT.CPIO";
                 let name_len_byte = name.len() as u8;
                 if off < 2048 && block_offset + off < dst.len() {
                     let record_len = dst[block_offset + off] as usize;
-                    // Check both sector boundary and record length can fit the new name
+                    // 33 + 13 = 46 — fits in any record ≥ 46 bytes
                     if off + 33 + name.len() <= 2048 && 33 + name.len() <= record_len {
                         dst[block_offset + off + 32] = name_len_byte;
                         dst[block_offset + off + 33..block_offset + off + 33 + name.len()]
@@ -368,15 +306,13 @@ unsafe extern "efiapi" fn vblock_read(
             dst[off + 80..off + 84].copy_from_slice(&new_vol_size.to_le_bytes());
             dst[off + 84..off + 88].copy_from_slice(&new_vol_size.to_be_bytes());
 
-            // Override Volume ID to "CHOOSABLE" (space-padded to 32 bytes)
-            // so that LABEL=Choosable kernel cmdline parameters
-            // (live-media, archisodevice, rd.live.image, etc.) work.
-            // ISO9660 Volume Identifier: bytes 40-71 (32 bytes, space-padded).
-            {
-                let label = b"CHOOSABLE                       ";
-                // label is exactly 32 bytes
-                dst[off + 40..off + 72].copy_from_slice(&label[0..32]);
-            }
+            // Previously overwrote Volume ID to "CHOOSABLE" here,
+            // but that broke GRUB's `search -l <original-label>`
+            // command on Fedora and other label-searching distros.
+            // The ISO label is NOT visible to Linux (virtual device),
+            // so LABEL=CHOOSABLE kernel cmdline never works anyway.
+            // premount-init handles ISO mounting without needing
+            // label-based kernel parameters.
 
             // If premount entry was injected (not patched over existing),
             // also update the root directory record data length in PVD

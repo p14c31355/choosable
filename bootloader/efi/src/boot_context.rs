@@ -17,7 +17,7 @@ use core::ffi::c_void;
 
 use crate::fs::{FsCtx, FsType, PayloadEntry, PAYLOAD_SLOT_COUNT};
 use crate::locator::IsoLocation;
-use crate::protocol::{BlockIoProtocol, SystemTable};
+use crate::protocol::{BlockIoProtocol, Guid, SystemTable};
 
 /// Complete state of the boot process.
 pub struct BootContext {
@@ -34,6 +34,10 @@ pub struct BootContext {
 
     // ── Partition ─────────────────────────────────────────────────────
     pub partition_start_lba: u64,
+    /// GPT partition GUID (unique partition identifier, not the type GUID)
+    pub partition_guid: Guid,
+    /// 1-based partition number (for fallback if no GPT)
+    pub partition_number: u32,
     pub fs_type: Option<FsType>,
 
     // ── Filesystem ────────────────────────────────────────────────────
@@ -57,6 +61,8 @@ impl BootContext {
             block_io: None,
             media_id: 0,
             partition_start_lba: 0,
+            partition_guid: Guid { d1: 0, d2: 0, d3: 0, d4: [0; 8] },
+            partition_number: 0,
             fs_type: None,
             fs_ctx: None,
             payloads: [PayloadEntry {

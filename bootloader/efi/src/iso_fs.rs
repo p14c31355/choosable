@@ -244,32 +244,29 @@ unsafe extern "efiapi" fn sfs_open_volume(this: *mut SimpleFileSystemProtocol, r
     if root.is_null() { return EFI_INVALID_PARAMETER; }
     let instance = &*(this as *const IsoFsInstance);
     let ctx = &instance.ctx;
-    let bs = unsafe { &mut *ctx.bs };
-    let mut ptr: *mut c_void = core::ptr::null_mut();
-    let status = unsafe { (bs.allocate_pool)(crate::protocol::MemoryType::EfiLoaderData, core::mem::size_of::<VirtualFile>(), &mut ptr) };
-    if status != EFI_SUCCESS || ptr.is_null() { return EFI_OUT_OF_RESOURCES; }
-    let vf = unsafe { &mut *(ptr as *mut VirtualFile) };
-    vf.file = FileProtocol {
-        revision: 0x0001_0000_0000_0001,
-        open: file_open, close: file_close, delete: file_delete,
-        read: file_read_dir, write: file_write_ro,
-        get_position: file_get_position, set_position: file_set_position,
-        get_info: file_get_info, set_info: file_set_info_ro, flush: file_flush,
-    };
-    vf.ctx = ctx as *const IsoFsCtx;
-    vf.is_dir = true;
-    vf.extent_lba = ctx.root_lba;
-    vf.extent_size = ctx.root_size;
-    vf.position = 0;
-    vf.needs_grub_patch = false;
-    vf.patched_buf = core::ptr::null_mut();
-    vf.patched_size = 0; vf.patched = false;
-    vf.is_synthetic = false;
-    vf.synthetic_buf = core::ptr::null_mut();
-    vf.synthetic_size = 0;
-    vf.synthetic_injected = false;
-    *root = ptr as *mut FileProtocol;
+    let fp = new_virtual_file(ctx, true, ctx.root_lba, ctx.root_size, file_read_dir);
+    if fp.is_null() { return EFI_OUT_OF_RESOURCES; }
+    *root = fp;
     EFI_SUCCESS
+}
+
+// ── VirtualFile constructor helper ─────────────────────────────────────
+
+fn new_virtual_file(ctx: &IsoFsCtx, is_dir: bool, lba: u32, size: u32, read_fn: unsafe extern "efiapi" fn(*mut FileProtocol, *mut usize, *mut c_void) -> usize) -> *mut FileProtocol {
+    let bs = unsafe { &mut *ctx.bs };
+    let sz = core::mem::size_of::<VirtualFile>();
+    let mut ptr: *mut c_void = core::ptr::null_mut();
+    if unsafe { (bs.allocate_pool)(crate::protocol::MemoryType::EfiLoaderData, sz, &mut ptr) } != EFI_SUCCESS || ptr.is_null() { return core::ptr::null_mut(); }
+    let vf = unsafe { &mut *(ptr as *mut VirtualFile) };
+    *vf = VirtualFile {
+        file: FileProtocol { revision: 0x0001_0000_0000_0001, open: file_open, close: file_close, delete: file_delete, read: read_fn, write: file_write_ro, get_position: file_get_position, set_position: file_set_position, get_info: file_get_info, set_info: file_set_info_ro, flush: file_flush },
+        ctx: ctx as *const IsoFsCtx,
+        is_dir,
+        extent_lba: lba, extent_size: size, position: 0,
+        needs_grub_patch: false, patched_buf: core::ptr::null_mut(), patched_size: 0, patched: false,
+        is_synthetic: false, synthetic_buf: core::ptr::null_mut(), synthetic_size: 0, synthetic_injected: false,
+    };
+    ptr as *mut FileProtocol
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

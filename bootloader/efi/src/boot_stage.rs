@@ -22,6 +22,13 @@ pub trait BootStage {
     fn execute(&mut self, ctx: &mut BootContext) -> StageResult;
 }
 
+macro_rules! die_then_halt {
+    ($ctx:expr, $msg:expr) => {{
+        die(unsafe { &mut *$ctx.system_table }, $msg);
+        loop { unsafe { core::arch::asm!("hlt") } }
+    }};
+}
+
 // ── Helper: extract *mut SystemTable from raw pointer ───────────────
 fn st_from_ctx(ctx: &BootContext) -> *mut SystemTable {
     ctx.system_table
@@ -30,11 +37,6 @@ fn st_from_ctx(ctx: &BootContext) -> *mut SystemTable {
 // ── Helper: extract *mut BootServices from raw pointer ──────────────
 fn bs_from_ctx(ctx: &BootContext) -> *mut BootServices {
     unsafe { (*ctx.system_table).boot_services }
-}
-
-// ── Helper: extract BlockIo reference from ctx ──────────────────────
-fn bio_ref_from_ctx(ctx: &BootContext) -> &BlockIoProtocol {
-    unsafe { &*ctx.block_io.expect("Block I/O not discovered") }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -54,10 +56,7 @@ impl BootStage for DiscoverDiskStage {
 
         let disk_handle = match disk::find_disk_handle(unsafe { &mut *bs_from_ctx(ctx) }, image_handle) {
             Some(h) => h,
-            None => {
-                die(unsafe { &mut *st_from_ctx(ctx) }, b"ERROR: No disk device found.\r\n\0");
-                loop { unsafe { core::arch::asm!("hlt") } }
-            }
+            None => die_then_halt!(ctx, b"ERROR: No disk device found.\r\n\0"),
         };
 
         let mut bio: *mut BlockIoProtocol = core::ptr::null_mut();
@@ -72,8 +71,7 @@ impl BootStage for DiscoverDiskStage {
             } != EFI_SUCCESS
                 || bio.is_null()
             {
-                die(unsafe { &mut *st_from_ctx(ctx) }, b"ERROR: No Block I/O on disk.\r\n\0");
-                loop { unsafe { core::arch::asm!("hlt") } }
+                die_then_halt!(ctx, b"ERROR: No Block I/O on disk.\r\n\0");
             }
         }
 
@@ -108,8 +106,7 @@ impl BootStage for DiscoverPartitionStage {
         // Read MBR
         let mut mbr: [u8; 512] = [0; 512];
         if !disk::read_sector(bio_ref, bio_ptr, mid, 0, &mut mbr) {
-            die(unsafe { &mut *st_from_ctx(ctx) }, b"ERROR: Cannot read MBR.\r\n\0");
-            loop { unsafe { core::arch::asm!("hlt") } }
+            die_then_halt!(ctx, b"ERROR: Cannot read MBR.\r\n\0");
         }
 
         let mut part1_lba: u64 = 0;
@@ -135,21 +132,43 @@ impl BootStage for DiscoverPartitionStage {
             break;
         }
 
-        if part1_lba == 0 && is_gpt {
+        // Always try GPT when available: read partition GUID + number from GPT
+        // even when MBR already found a partition. This gives us the real
+        // choosable.part_guid= instead of all-zeros.
+        // Prefer LBA-matching over type GUID matching for accuracy.
+        if is_gpt || part1_lba == 0 {
             let st = unsafe { &mut *st_from_ctx(ctx) };
-            print_raw(st, b"GPT detected, searching for data partition...\r\n\0");
-            part1_lba = disk::find_gpt_data_partition(st, bio_ref, bio_ptr, mid);
+            print_raw(st, b"GPT detected, reading partition info...\r\n\0");
+
+            // First, try to match by known LBA from MBR (most reliable)
+            if part1_lba > 0 {
+                if let Some((guid, num)) = disk::find_partition_by_lba(st, bio_ref, bio_ptr, mid, part1_lba) {
+                    // Partition found by LBA match — keep the MBR-derived LBA
+                    ctx.partition_guid = guid;
+                    ctx.partition_number = num;
+                } else if let Some((lba, guid, num)) = disk::find_gpt_data_partition(st, bio_ref, bio_ptr, mid) {
+                    // LBA match failed, fall back to first Basic Data partition
+                    part1_lba = lba;
+                    ctx.partition_guid = guid;
+                    ctx.partition_number = num;
+                }
+            } else {
+                // No MBR partition, use first valid GPT entry
+                if let Some((lba, guid, num)) = disk::find_gpt_data_partition(st, bio_ref, bio_ptr, mid) {
+                    part1_lba = lba;
+                    ctx.partition_guid = guid;
+                    ctx.partition_number = num;
+                }
+            }
         }
         if part1_lba == 0 {
-            die(unsafe { &mut *st_from_ctx(ctx) }, b"ERROR: No partition 1 found.\r\n\0");
-            loop { unsafe { core::arch::asm!("hlt") } }
+            die_then_halt!(ctx, b"ERROR: No partition 1 found.\r\n\0");
         }
 
         // Read partition 1 VBR
         let mut vbr: [u8; 512] = [0; 512];
         if !disk::read_sector(bio_ref, bio_ptr, mid, part1_lba, &mut vbr) {
-            die(unsafe { &mut *st_from_ctx(ctx) }, b"ERROR: Cannot read partition 1.\r\n\0");
-            loop { unsafe { core::arch::asm!("hlt") } }
+            die_then_halt!(ctx, b"ERROR: Cannot read partition 1.\r\n\0");
         }
 
         let fs = if &vbr[3..11] == b"EXFAT   " {
@@ -193,8 +212,7 @@ impl BootStage for MountFilesystemStage {
 
         let mut vbr: [u8; 512] = [0; 512];
         if !disk::read_sector(bio_ref, bio_ptr, mid, part1_lba, &mut vbr) {
-            die(unsafe { &mut *st_from_ctx(ctx) }, b"ERROR: Cannot re-read partition 1 VBR.\r\n\0");
-            loop { unsafe { core::arch::asm!("hlt") } }
+            die_then_halt!(ctx, b"ERROR: Cannot re-read partition 1 VBR.\r\n\0");
         }
 
         let mut fs_ctx = fs::FsCtx {
@@ -215,8 +233,7 @@ impl BootStage for MountFilesystemStage {
             fs::FsType::Exfat => {
                 let spc_shift = vbr[109] as u32;
                 if spc_shift > 16 {
-                    die(unsafe { &mut *st_from_ctx(ctx) }, b"ERROR: Invalid SectorsPerClusterShift.\r\n\0");
-                    loop { unsafe { core::arch::asm!("hlt") } }
+                    die_then_halt!(ctx, b"ERROR: Invalid SectorsPerClusterShift.\r\n\0");
                 }
                 let cluster_bytes = (1u32 << spc_shift) * 512;
                 let fat_off = u32::from_le_bytes([vbr[80], vbr[81], vbr[82], vbr[83]]) as u64;
@@ -235,8 +252,7 @@ impl BootStage for MountFilesystemStage {
             fs::FsType::Fat32 => {
                 let spc = vbr[13] as u32;
                 if spc == 0 {
-                    die(unsafe { &mut *st_from_ctx(ctx) }, b"ERROR: Invalid sectors per cluster.\r\n\0");
-                    loop { unsafe { core::arch::asm!("hlt") } }
+                    die_then_halt!(ctx, b"ERROR: Invalid sectors per cluster.\r\n\0");
                 }
                 let reserved = u16::from_le_bytes([vbr[14], vbr[15]]) as u64;
                 let num_fats = vbr[16] as u64;
@@ -257,8 +273,7 @@ impl BootStage for MountFilesystemStage {
             fs::FsType::Ntfs => {
                 let spc = vbr[13] as u32;
                 if spc == 0 {
-                    die(unsafe { &mut *st_from_ctx(ctx) }, b"ERROR: Invalid sectors per cluster.\r\n\0");
-                    loop { unsafe { core::arch::asm!("hlt") } }
+                    die_then_halt!(ctx, b"ERROR: Invalid sectors per cluster.\r\n\0");
                 }
                 let cluster_bytes = spc as u64 * 512;
                 let mft_lcn = i64::from_le_bytes(vbr[0x30..0x38].try_into().unwrap());
@@ -272,8 +287,7 @@ impl BootStage for MountFilesystemStage {
                     0
                 };
                 if mft_record_size == 0 || mft_record_size > 4096 {
-                    die(unsafe { &mut *st_from_ctx(ctx) }, b"ERROR: Invalid MFT record size.\r\n\0");
-                    loop { unsafe { core::arch::asm!("hlt") } }
+                    die_then_halt!(ctx, b"ERROR: Invalid MFT record size.\r\n\0");
                 }
 
                 fs_ctx.spc = spc;
@@ -351,6 +365,8 @@ impl BootStage for SelectPayloadStage {
             bio_ref,
             bio_ptr,
             mid,
+            &ctx.partition_guid,
+            ctx.partition_number,
         );
         loop { unsafe { core::arch::asm!("hlt") } }
     }
@@ -396,6 +412,8 @@ impl BootStage for ExecuteBootStage {
             bio_ref,
             bio_ptr,
             mid,
+            &ctx.partition_guid,
+            ctx.partition_number,
         );
         loop { unsafe { core::arch::asm!("hlt") } }
     }

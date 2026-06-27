@@ -30,7 +30,7 @@ pub struct FsCtx {
     pub mft_record_size: u64,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PayloadType {
     Iso,
     Wim,
@@ -241,19 +241,8 @@ fn scan_exfat_dir(
 
 let depth = path_prefix.iter().filter(|&&c| c == b'/').count();
                     if is_dir && start_cl >= 2 && *count < 64 && depth < 12 {
-                        // Build sub-path and recurse
-                        let prefix_len = path_prefix.len();
                         let mut sub_path = [0u8; 256];
-                        let mut sp = 0usize;
-                        sub_path[sp..sp + prefix_len].copy_from_slice(path_prefix);
-                        sp += prefix_len;
-                        if prefix_len != 1 || path_prefix[0] != b'/' {
-                            if sp < 256 { sub_path[sp] = b'/'; sp += 1; }
-                        }
-                        let cl = name_pos.min(256 - sp);
-                        sub_path[sp..sp + cl].copy_from_slice(&name_buf[..cl]);
-                        sp += cl;
-
+                        let sp = build_full_path(path_prefix, &name_buf[..name_pos], &mut sub_path);
                         scan_exfat_dir(
                             bio_ref, bio_ptr, mid, start_cl, spc, fat_start, heap_start,
                             files, count, &sub_path[..sp],
@@ -264,18 +253,8 @@ let depth = path_prefix.iter().filter(|&&c| c == b'/').count();
                         let file_lba = heap_start
                             + (start_cl as u64 - 2) * spc as u64;
 
-                        let prefix_len = path_prefix.len();
                         let mut full_buf = [0u8; 256];
-                        let mut fp = 0usize;
-                        full_buf[fp..fp + prefix_len].copy_from_slice(path_prefix);
-                        fp += prefix_len;
-                        if prefix_len == 1 && path_prefix[0] == b'/' {
-                        } else {
-                            if fp < 256 { full_buf[fp] = b'/'; fp += 1; }
-                        }
-                        let cl = name_pos.min(256 - fp);
-                        full_buf[fp..fp + cl].copy_from_slice(&name_buf[..cl]);
-                        fp += cl;
+                        let fp = build_full_path(path_prefix, &name_buf[..name_pos], &mut full_buf);
 
                         files[*count] = IsoEntry {
                             name: full_buf,
@@ -467,19 +446,8 @@ let depth = path_prefix.iter().filter(|&&c| c == b'/').count();
                         buf[off + 20],
                         buf[off + 21],
                     ]);
-                    // Build sub-path
-                    let prefix_len = path_prefix.len();
                     let mut sub_path = [0u8; 256];
-                    let mut sp = 0usize;
-                    sub_path[sp..sp + prefix_len].copy_from_slice(path_prefix);
-                    sp += prefix_len;
-                    if prefix_len != 1 || path_prefix[0] != b'/' {
-                        if sp < 256 { sub_path[sp] = b'/'; sp += 1; }
-                    }
-                    let copy_len = name_len.min(256 - sp);
-                    sub_path[sp..sp + copy_len].copy_from_slice(&name_buf[..copy_len]);
-                    sp += copy_len;
-
+                    let sp = build_full_path(path_prefix, &name_buf[..name_len], &mut sub_path);
                     scan_fat32_dir(
                         bio_ref, bio_ptr, mid, dir_cl, spc, fat_start, data_start,
                         files, count,
@@ -506,18 +474,8 @@ let depth = path_prefix.iter().filter(|&&c| c == b'/').count();
                     let file_lba = data_start
                         + (file_cl as u64 - 2) * spc as u64;
 
-                    let prefix_len = path_prefix.len();
                     let mut full_buf = [0u8; 256];
-                    let mut fp = 0usize;
-                    full_buf[fp..fp + prefix_len].copy_from_slice(path_prefix);
-                    fp += prefix_len;
-                    if prefix_len == 1 && path_prefix[0] == b'/' {
-                    } else {
-                        if fp < 256 { full_buf[fp] = b'/'; fp += 1; }
-                    }
-                    let cl = name_len.min(256 - fp);
-                    full_buf[fp..fp + cl].copy_from_slice(&name_buf[..cl]);
-                    fp += cl;
+                    let fp = build_full_path(path_prefix, &name_buf[..name_len], &mut full_buf);
 
                     files[*count] = IsoEntry {
                         name: full_buf,
@@ -862,20 +820,8 @@ fn parse_ntfs_index_entries(
                             mft_rec,
                         )
                     {
-                        // Build full path: prefix + "/" + name
-                        let prefix_len = path_prefix.len();
                         let mut full_buf = [0u8; 256];
-                        let mut fp = 0usize;
-                        full_buf[fp..fp + prefix_len].copy_from_slice(path_prefix);
-                        fp += prefix_len;
-                        if prefix_len == 1 && path_prefix[0] == b'/' {
-                            // root: "/" + "name" = "/name"
-                        } else {
-                            if fp < 256 { full_buf[fp] = b'/'; fp += 1; }
-                        }
-                        let cl = np.min(256 - fp);
-                        full_buf[fp..fp + cl].copy_from_slice(&name_buf[..cl]);
-                        fp += cl;
+                        let fp = build_full_path(path_prefix, &name_buf[..np], &mut full_buf);
 
                         files[*count] = IsoEntry {
                             name: full_buf,
@@ -900,6 +846,19 @@ fn parse_ntfs_index_entries(
 //  Unified scan dispatcher
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Build a full path: prefix + "/" + name, with bounds checking.
+fn build_full_path(prefix: &[u8], name: &[u8], out: &mut [u8; 256]) -> usize {
+    let prefix_len = prefix.len();
+    out[..prefix_len].copy_from_slice(prefix);
+    let mut fp = prefix_len;
+    if prefix_len != 1 || prefix[0] != b'/' {
+        if fp < 256 { out[fp] = b'/'; fp += 1; }
+    }
+    let name_len = name.len().min(256 - fp);
+    out[fp..fp + name_len].copy_from_slice(&name[..name_len]);
+    fp + name_len
+}
+
 /// Returns true if the filename extension matches a known bootable format.
 pub fn is_bootable_extension(name: &[u8], name_len: usize) -> bool {
     (name_len >= 4 && (name[name_len - 4..name_len].eq_ignore_ascii_case(b".iso")
@@ -908,6 +867,87 @@ pub fn is_bootable_extension(name: &[u8], name_len: usize) -> bool {
         || name[name_len - 4..name_len].eq_ignore_ascii_case(b".img")
         || name[name_len - 4..name_len].eq_ignore_ascii_case(b".efi")))
     || (name_len >= 5 && name[name_len - 5..name_len].eq_ignore_ascii_case(b".vhdx"))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_bootable_extension_iso() {
+        assert!(is_bootable_extension(b"test.ISO", 8));
+        assert!(is_bootable_extension(b"test.iso", 8));
+        assert!(!is_bootable_extension(b"test.txt", 8));
+    }
+
+    #[test]
+    fn test_is_bootable_extension_vhdx() {
+        assert!(is_bootable_extension(b"disk.VHDX", 9));
+        assert!(is_bootable_extension(b"disk.vhdx", 9));
+    }
+
+    #[test]
+    fn test_is_bootable_extension_vhd() {
+        assert!(is_bootable_extension(b"disk.vhd", 8));
+        assert!(is_bootable_extension(b"disk.VHD", 8));
+    }
+
+    #[test]
+    fn test_is_bootable_extension_wim() {
+        assert!(is_bootable_extension(b"boot.wim", 8));
+    }
+
+    #[test]
+    fn test_is_bootable_extension_img() {
+        assert!(is_bootable_extension(b"disk.img", 8));
+    }
+
+    #[test]
+    fn test_is_bootable_extension_efi() {
+        assert!(is_bootable_extension(b"BOOTX64.EFI", 11));
+    }
+
+    #[test]
+    fn test_is_bootable_extension_short_name() {
+        assert!(!is_bootable_extension(b"a", 1));
+        assert!(!is_bootable_extension(b"ab.is", 5));
+    }
+
+    #[test]
+    fn test_classify_payload_type() {
+        assert_eq!(classify_payload_type(b"test.iso", 8), PayloadType::Iso);
+        assert_eq!(classify_payload_type(b"boot.wim", 8), PayloadType::Wim);
+        assert_eq!(classify_payload_type(b"disk.vhd", 8), PayloadType::Vhd);
+        assert_eq!(classify_payload_type(b"disk.vhdx", 9), PayloadType::Vhdx);
+        assert_eq!(classify_payload_type(b"disk.img", 8), PayloadType::Img);
+        assert_eq!(classify_payload_type(b"BOOTX64.EFI", 11), PayloadType::Efi);
+        assert_eq!(classify_payload_type(b"unknown.bin", 11), PayloadType::Iso); // fallback
+    }
+
+    #[test]
+    fn test_build_full_path_root() {
+        let mut buf = [0u8; 256];
+        let len = build_full_path(b"/", b"file.iso", &mut buf);
+        assert_eq!(&buf[..len], b"/file.iso");
+    }
+
+    #[test]
+    fn test_build_full_path_subdir() {
+        let mut buf = [0u8; 256];
+        let len = build_full_path(b"/boot", b"ubuntu.iso", &mut buf);
+        assert_eq!(&buf[..len], b"/boot/ubuntu.iso");
+    }
+
+    #[test]
+    fn test_build_full_path_empty_prefix() {
+        let mut buf = [0u8; 256];
+        let len = build_full_path(b"", b"test.iso", &mut buf);
+        assert_eq!(&buf[..len], b"/test.iso");
+    }
 }
 
 /// Returns the `PayloadType` for a filename based on its extension.

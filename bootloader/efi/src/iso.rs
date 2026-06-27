@@ -238,8 +238,8 @@ fn find_first_file_in_dir(
                     continue;
                 }
 
-                // Skip records that are too small to be renamed to "PREMOUNT.CPIO;1" (requires 48 bytes)
-                if record_len < 48 {
+                // Skip records that are too small to be renamed to "PREMOUNT.CPIO" (requires 46 bytes)
+                if record_len < 46 {
                     offset += record_len;
                     continue;
                 }
@@ -476,6 +476,7 @@ fn find_efi_boot(
     bio_ptr: *mut BlockIoProtocol,
     mid: u32,
     iso_lba: u64,
+    boot_kind: crate::boot_kind::BootKind,
 ) -> Option<(u32, u32, &'static [u8])> {
     let mut scratch = [0u8; 2048];
     let (root_lba, root_size) = get_root_dir(st, bio_ref, bio_ptr, mid, iso_lba)?;
@@ -500,20 +501,31 @@ fn find_efi_boot(
     }
     let (boot_lba, boot_size) = boot_dir?;
 
-    // Prefer GRUB/shim over systemd-boot shell.  SHELL*.EFI are last
-    // because loading them produces an interactive EFI shell instead of
-    // booting the OS.  systemd-boot (Arch) is loaded via BOOTX64.EFI.
-    let efi_names: &[&[u8]] = &[
-        b"GRUBX64.EFI",
-        b"SHIMX64.EFI",
-        b"BOOTX64.EFI",
-        b"BOOTIA32.EFI",
-        b"SYSTEMD-BOOTX64.EFI",
-        b"SYSTEMD-BOOTIA32.EFI",
-        // SHELL*.EFI are fallbacks only — they start an EFI shell, not an OS.
-        b"SHELLX64.EFI",
-        b"SHELLIA32.EFI",
-    ];
+    // Arch ISO uses systemd-boot (BOOTX64.EFI), NOT GRUB.
+    // Prefer BOOTX64.EFI first for ArchIso, otherwise GRUB/shim first.
+    let efi_names: &[&[u8]] = if boot_kind == crate::boot_kind::BootKind::ArchIso {
+        &[
+            b"BOOTX64.EFI",
+            b"SYSTEMD-BOOTX64.EFI",
+            b"GRUBX64.EFI",
+            b"SHIMX64.EFI",
+            b"BOOTIA32.EFI",
+            b"SYSTEMD-BOOTIA32.EFI",
+            b"SHELLX64.EFI",
+            b"SHELLIA32.EFI",
+        ]
+    } else {
+        &[
+            b"GRUBX64.EFI",
+            b"SHIMX64.EFI",
+            b"BOOTX64.EFI",
+            b"BOOTIA32.EFI",
+            b"SYSTEMD-BOOTX64.EFI",
+            b"SYSTEMD-BOOTIA32.EFI",
+            b"SHELLX64.EFI",
+            b"SHELLIA32.EFI",
+        ]
+    };
     for &name in efi_names {
         if let Some(v) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, boot_lba, boot_size, name, &mut scratch) {
             return Some((v.0, v.1, name));
@@ -604,7 +616,9 @@ fn try_patch_candidate(
     let has_blscfg = (orig.len() >= 6 && orig.windows(6).any(|w| w == b"blscfg" || w == b"BLSCFG"))
         || (orig.len() >= 9 && orig.windows(9).any(|w| w == b"blscfg\n" || w == b"BLSCFG\n"))
         || (orig.len() >= 7 && orig.windows(7).any(|w| w == b"\nblscfg" || w == b"\nBLSCFG"));
-    let has_relevant_directive = has_linux || has_menuentry || has_blscfg;
+    // systemd-boot .conf files have "options" lines instead of "linux"
+    let has_options = orig.len() >= 8 && orig.windows(8).any(|w| w == b"options " || w == b"options\t");
+    let has_relevant_directive = has_linux || has_menuentry || has_blscfg || has_options;
     if !has_relevant_directive {
         unsafe { (bs.free_pool)(orig_ptr as *mut c_void); }
         return false;
@@ -748,14 +762,34 @@ fn patch_grub_cfg_blockio(
     if entry_count == 0 {
         let mut raw_entries: [(u32, u32, u32, u32); 32] = [(0,0,0,0); 32];
         let mut raw_count = 0usize;
-        recursive_find_cfg_with_loc(
+        recursive_find_files_with_ext(
             bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size,
-            &mut scratch, &mut raw_entries, &mut raw_count, 0,
+            &mut scratch, &mut raw_entries, &mut raw_count, 0, b"cfg",
         );
         for i in 0..raw_count {
             let (ext_lba, ext_size, dir_sector, dir_offset) = raw_entries[i];
             if ext_size == 0 { continue; }
             add_cfg_entry(&mut entries, &mut entry_count, ext_lba, ext_size, dir_sector, dir_offset, b"/<recursive>.cfg");
+        }
+    }
+
+    // Arch ISO uses systemd-boot with /loader/entries/*.conf files
+    // that contain linux/initrd lines and must be patched.
+    if boot_kind == crate::boot_kind::BootKind::ArchIso || entry_count == 0 {
+        if let Some(loader_dir) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, b"LOADER", &mut scratch) {
+            if let Some(entries_dir) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, loader_dir.0, loader_dir.1, b"ENTRIES", &mut scratch) {
+                let mut conf_entries: [(u32, u32, u32, u32); 32] = [(0,0,0,0); 32];
+                let mut conf_count = 0usize;
+                recursive_find_files_with_ext(
+                    bio_ref, bio_ptr, mid, iso_lba, entries_dir.0, entries_dir.1,
+                    &mut scratch, &mut conf_entries, &mut conf_count, 0, b"conf",
+                );
+                for i in 0..conf_count {
+                    let (ext_lba, ext_size, dir_sector, dir_offset) = conf_entries[i];
+                    if ext_size == 0 { continue; }
+                    add_cfg_entry(&mut entries, &mut entry_count, ext_lba, ext_size, dir_sector, dir_offset, b"/loader/entries/<.conf>");
+                }
+            }
         }
     }
 
@@ -775,7 +809,7 @@ fn patch_grub_cfg_blockio(
     print_raw(st, b"[grub.cfg] No patchable .CFG found (none have 'linux', 'menuentry', or 'blscfg').\r\n\0");
 }
 
-fn recursive_find_cfg_with_loc(
+fn recursive_find_files_with_ext(
     bio_ref: &BlockIoProtocol,
     bio_ptr: *mut BlockIoProtocol,
     mid: u32,
@@ -786,6 +820,7 @@ fn recursive_find_cfg_with_loc(
     entries: &mut [(u32, u32, u32, u32); 32],
     entry_count: &mut usize,
     depth: usize,
+    ext: &[u8],
 ) {
     if depth > 16 || *entry_count >= 32 { return; }
     let total_sectors = ((dir_size as u64 + 2047) / 2048) as u32;
@@ -811,12 +846,11 @@ fn recursive_find_cfg_with_loc(
                 } else {
                     name_len
                 };
-                let has_cfg = eff_len >= 4 && {
-                    let ofs = name_offset + eff_len - 4;
-                    scratch[ofs] == b'.' && (scratch[ofs+1] | 0x20) == b'c'
-                        && (scratch[ofs+2] | 0x20) == b'f' && (scratch[ofs+3] | 0x20) == b'g'
+                let has_ext = eff_len >= ext.len() + 1 && {
+                    let ofs = name_offset + eff_len - (ext.len() + 1);
+                    scratch[ofs] == b'.' && scratch[ofs+1..ofs+1+ext.len()].iter().zip(ext.iter()).all(|(&a, &b)| (a | 0x20) == (b | 0x20))
                 };
-                if has_cfg && !is_dir && *entry_count < 32 {
+                if has_ext && !is_dir && *entry_count < 32 {
                     let mut dup = false;
                     for j in 0..*entry_count { if entries[j].0 == extent { dup = true; break; } }
                     if !dup {
@@ -825,7 +859,7 @@ fn recursive_find_cfg_with_loc(
                     }
                 }
                 if is_dir && extent != dir_lba && *entry_count < 32 {
-                    recursive_find_cfg_with_loc(bio_ref, bio_ptr, mid, iso_lba, extent, size, scratch, entries, entry_count, depth + 1);
+                    recursive_find_files_with_ext(bio_ref, bio_ptr, mid, iso_lba, extent, size, scratch, entries, entry_count, depth + 1, ext);
                     if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, dir_lba + s, scratch) { return; }
                 }
             }
@@ -1062,6 +1096,8 @@ pub fn boot_payload_by_type(
     bio_ref: &BlockIoProtocol,
     bio_ptr: *mut BlockIoProtocol,
     mid: u32,
+    partition_guid: &crate::protocol::Guid,
+    partition_number: u32,
 ) -> ! {
     if idx >= payloads.len() {
         print_raw(st, b"ERROR: payload index out of range.\r\n\0");
@@ -1069,7 +1105,7 @@ pub fn boot_payload_by_type(
     }
     let p = &payloads[idx];
     match p.payload_type {
-        PayloadType::Iso => uefi_chainload_iso(st, image_handle, part1_lba, payloads, idx, bio_ref, bio_ptr, mid),
+        PayloadType::Iso => uefi_chainload_iso(st, image_handle, part1_lba, payloads, idx, bio_ref, bio_ptr, mid, partition_guid, partition_number),
         PayloadType::Wim => boot_wim_payload(st, image_handle, part1_lba, payloads, idx, bio_ref, bio_ptr, mid),
         PayloadType::Vhd | PayloadType::Vhdx => boot_vhd_payload(st, image_handle, part1_lba, payloads, idx, bio_ref, bio_ptr, mid),
         PayloadType::Img => boot_img_payload(st, image_handle, part1_lba, payloads, idx, bio_ref, bio_ptr, mid),
@@ -1206,6 +1242,8 @@ fn uefi_chainload_iso(
     bio_ref: &BlockIoProtocol,
     bio_ptr: *mut BlockIoProtocol,
     mid: u32,
+    partition_guid: &crate::protocol::Guid,
+    partition_number: u32,
 ) -> ! {
     let iso_lba = files[idx].file_start_lba;
     let iso_size = files[idx].file_size;
@@ -1324,9 +1362,12 @@ fn uefi_chainload_iso(
                     let sfs = unsafe { &mut *sfs_instance };
                     sfs.ctx.premount_cpio_buf = bundle.cpio_buf;
                     sfs.ctx.premount_cpio_size = bundle.cpio_size;
-                    let tlen = name_len.min(15);
-                    sfs.ctx.premount_target_name[..tlen].copy_from_slice(&name_buf[..tlen]);
-                    sfs.ctx.premount_target_name_len = tlen;
+                    // CRITICAL: set premount_target_name to "PREMOUNT.CPIO"
+                    // (the name the grub.cfg initrd line references), not the
+                    // original filename.  The directory entry is renamed via
+                    // Block I/O patch, so the path must match.
+                    sfs.ctx.premount_target_name = *b"PREMOUNT.CPIO___";
+                    sfs.ctx.premount_target_name_len = 13;
                 }
 
                 print_raw(st, b"[premount] overwriting \0");
@@ -1460,15 +1501,15 @@ fn uefi_chainload_iso(
 
     let locator = FileBackedIsoLocator::from_payload_entry(
         &files[idx],
-        crate::protocol::Guid { d1: 0, d2: 0, d3: 0, d4: [0u8; 8] },
-        1, part1_lba,
+        *partition_guid,
+        partition_number, part1_lba,
     );
     let iso_loc = locator.locate();
 
     patch_grub_cfg_blockio(st, bs, vbio_ptr, sfs_instance, bio_ref, bio_ptr, mid, iso_lba, iso_name,
         Some(&iso_loc), boot_kind);
 
-    let (efi_lba, efi_size, efi_filename) = match find_efi_boot(st, bio_ref, bio_ptr, mid, iso_lba) {
+    let (efi_lba, efi_size, efi_filename) = match find_efi_boot(st, bio_ref, bio_ptr, mid, iso_lba, boot_kind) {
         Some(v) => v,
         None => {
             print_raw(st, b"ERROR: /EFI/BOOT/BOOTX64.EFI not found in ISO.\r\n\0");
@@ -1617,9 +1658,11 @@ pub fn boot_iso(
     bio_ref: &BlockIoProtocol,
     bio_ptr: *mut BlockIoProtocol,
     mid: u32,
+    partition_guid: &crate::protocol::Guid,
+    partition_number: u32,
 ) {
     print_raw(st, b"\r\nBooting ISO (UEFI chainload)...\r\n\0");
-    uefi_chainload_iso(st, image_handle, part1_lba, files, idx, bio_ref, bio_ptr, mid);
+    uefi_chainload_iso(st, image_handle, part1_lba, files, idx, bio_ref, bio_ptr, mid, partition_guid, partition_number);
 }
 
 use crate::fs::scan_payloads;
@@ -1634,6 +1677,8 @@ pub fn show_payload_menu(
     bio_ref: &BlockIoProtocol,
     bio_ptr: *mut BlockIoProtocol,
     mid: u32,
+    partition_guid: &crate::protocol::Guid,
+    partition_number: u32,
 ) -> ! {
     if count == 0 {
         print_raw(st, b"\r\nNo bootable payloads found on partition 1.\r\n\0");
@@ -1683,7 +1728,7 @@ pub fn show_payload_menu(
                     print_raw(st, b"\r\nPayload type not yet implemented. Press any key to continue...\r\n\0");
                     continue;
                 }
-                boot_payload_by_type(st, image_handle, disk_handle, ctx.part1_lba, payloads, idx, bio_ref, bio_ptr, mid);
+                boot_payload_by_type(st, image_handle, disk_handle, ctx.part1_lba, payloads, idx, bio_ref, bio_ptr, mid, partition_guid, partition_number);
             }
         } else if ch == b'0' && count >= 10 {
             let is_supported = matches!(payloads[9].payload_type, PayloadType::Iso | PayloadType::Efi);
@@ -1691,7 +1736,7 @@ pub fn show_payload_menu(
                 print_raw(st, b"\r\nPayload type not yet implemented. Press any key to continue...\r\n\0");
                 continue;
             }
-            boot_payload_by_type(st, image_handle, disk_handle, ctx.part1_lba, payloads, 9, bio_ref, bio_ptr, mid);
+            boot_payload_by_type(st, image_handle, disk_handle, ctx.part1_lba, payloads, 9, bio_ref, bio_ptr, mid, partition_guid, partition_number);
         } else if ch == b'r' || ch == b'R' {
             print_raw(st, b"\r\nRe-scanning...\r\n\0");
             let mut new_payloads: [PayloadEntry; PAYLOAD_SLOT_COUNT] = [PayloadEntry {
@@ -1700,7 +1745,7 @@ pub fn show_payload_menu(
             }; PAYLOAD_SLOT_COUNT];
             let mut new_count: usize = 0;
             scan_payloads(bio_ref, bio_ptr, mid, ctx, &mut new_payloads, &mut new_count);
-            show_payload_menu(st, image_handle, disk_handle, &new_payloads, new_count, ctx, bio_ref, bio_ptr, mid);
+            show_payload_menu(st, image_handle, disk_handle, &new_payloads, new_count, ctx, bio_ref, bio_ptr, mid, partition_guid, partition_number);
         }
     }
 }
