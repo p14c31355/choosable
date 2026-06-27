@@ -167,6 +167,7 @@ impl BootStage for DiscoverPartitionStage {
             ctx.partition_guid = disk::read_mbr_guid(&mbr);
             // The first non-protective MBR partition is the data partition (partition 1)
             ctx.partition_number = 1;
+            ctx.is_mbr = true;
         }
         if part1_lba == 0 {
             die_then_halt!(ctx, b"ERROR: No partition 1 found.\r\n\0");
@@ -374,6 +375,7 @@ impl BootStage for SelectPayloadStage {
             mid,
             &ctx.partition_guid,
             ctx.partition_number,
+            ctx.is_mbr,
         );
         loop { unsafe { core::arch::asm!("hlt") } }
     }
@@ -421,6 +423,7 @@ impl BootStage for ExecuteBootStage {
             mid,
             &ctx.partition_guid,
             ctx.partition_number,
+            ctx.is_mbr,
         );
         loop { unsafe { core::arch::asm!("hlt") } }
     }

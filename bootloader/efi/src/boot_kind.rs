@@ -106,9 +106,15 @@ impl BootKind {
             BootKind::ArchIso => {
                 if let Some(loc) = iso_location {
                     let chunk = b" archisodevice=/dev/disk/by-partuuid/";
-                    if pos + chunk.len() + 36 > initial_cap { return None; }
-                    pos += copy_at(buf, pos, chunk);
-                    pos += guid_to_partuuid_bytes(&loc.partition_guid, &mut buf[pos..]);
+                    if loc.is_mbr {
+                        if pos + chunk.len() + 11 > initial_cap { return None; }
+                        pos += copy_at(buf, pos, chunk);
+                        pos += mbr_guid_to_partuuid_bytes(&loc.partition_guid, loc.partition_number, &mut buf[pos..]);
+                    } else {
+                        if pos + chunk.len() + 36 > initial_cap { return None; }
+                        pos += copy_at(buf, pos, chunk);
+                        pos += guid_to_partuuid_bytes(&loc.partition_guid, &mut buf[pos..]);
+                    }
                     let chunk2 = b" archisobasedir=arch copytoram init=/init.choosable";
                     if pos + chunk2.len() > initial_cap { return None; }
                     pos += copy_at(buf, pos, chunk2);
@@ -270,6 +276,22 @@ fn guid_to_partuuid_bytes(guid: &crate::protocol::Guid, buf: &mut [u8]) -> usize
     pos
 }
 
+/// Write a GUID as MBR-style PARTUUID string into buf.
+/// MBR PARTUUID format: <disk_sig_hex>-<part_num_hex> (11 bytes)
+/// Disk signature is d4[4..8] as LE u32 (bytes 440-443 of MBR).
+fn mbr_guid_to_partuuid_bytes(guid: &crate::protocol::Guid, part_num: u32, buf: &mut [u8]) -> usize {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut pos = 0usize;
+    let disk_sig = u32::from_le_bytes([guid.d4[4], guid.d4[5], guid.d4[6], guid.d4[7]]);
+    for i in (0..8).rev() {
+        if pos < buf.len() { buf[pos] = HEX[((disk_sig >> (i * 4)) & 0xF) as usize]; pos += 1; }
+    }
+    if pos < buf.len() { buf[pos] = b'-'; pos += 1; }
+    if pos < buf.len() { buf[pos] = HEX[((part_num >> 4) & 0xF) as usize]; pos += 1; }
+    if pos < buf.len() { buf[pos] = HEX[(part_num & 0xF) as usize]; pos += 1; }
+    pos
+}
+
 /// Append choosable.* kernel parameters from IsoLocation into buf at position pos.
 /// Returns the new position after writing, or the original pos if capacity is insufficient.
 fn append_choosable_params_slice(buf: &mut [u8], mut pos: usize, loc: &crate::locator::IsoLocation) -> usize {
@@ -278,9 +300,15 @@ fn append_choosable_params_slice(buf: &mut [u8], mut pos: usize, loc: &crate::lo
 
     // " choosable.part_guid="
     let chunk = b" choosable.part_guid=";
-    if pos + chunk.len() + 36 > buf_len { return start_pos; }
-    pos += copy_at(buf, pos, chunk);
-    pos += guid_to_partuuid_bytes(&loc.partition_guid, &mut buf[pos..]);
+    if loc.is_mbr {
+        if pos + chunk.len() + 11 > buf_len { return start_pos; }
+        pos += copy_at(buf, pos, chunk);
+        pos += mbr_guid_to_partuuid_bytes(&loc.partition_guid, loc.partition_number, &mut buf[pos..]);
+    } else {
+        if pos + chunk.len() + 36 > buf_len { return start_pos; }
+        pos += copy_at(buf, pos, chunk);
+        pos += guid_to_partuuid_bytes(&loc.partition_guid, &mut buf[pos..]);
+    }
 
     // " choosable.part_num=<decimal>"
     let chunk = b" choosable.part_num=";
@@ -393,6 +421,7 @@ mod tests {
         let loc = IsoLocation {
             partition_guid: guid,
             partition_number: 2,
+            is_mbr: false,
             file_path: {
                 let mut fp = [0u8; 256];
                 let plen = file_path_str.len();
@@ -469,6 +498,7 @@ mod tests {
         let loc = IsoLocation {
             partition_guid: guid,
             partition_number: 2,
+            is_mbr: false,
             file_path: long_path,
             file_path_len: 250,
             file_size: 2_000_000_000,
