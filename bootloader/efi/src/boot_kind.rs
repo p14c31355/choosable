@@ -83,18 +83,23 @@ impl BootKind {
 
         match self {
             BootKind::Casper => {
+                // Casper (Ubuntu, Mint, Pop!_OS) has its own ISO scanner via
+                // iso-scan/filename= (injected as eol_extra). No need for
+                // init=/init.choosable — it conflicts with casper's own init.
                 if is_popos {
-                    let chunk = b" boot=casper casper_path=pop-os maybe-ubiquity init=/init.choosable";
+                    let chunk = b" boot=casper casper_path=pop-os maybe-ubiquity";
                     if pos + chunk.len() > initial_cap { return None; }
                     pos += copy_at(buf, pos, chunk);
                 } else {
-                    let chunk = b" boot=casper maybe-ubiquity init=/init.choosable";
+                    let chunk = b" boot=casper maybe-ubiquity";
                     if pos + chunk.len() > initial_cap { return None; }
                     pos += copy_at(buf, pos, chunk);
                 }
             }
             BootKind::DebianLive => {
-                let chunk = b" boot=live live-media=removable init=/init.choosable";
+                // Debian Live has its own ISO scanner via findiso=
+                // (injected as eol_extra). No need for init=/init.choosable.
+                let chunk = b" boot=live live-media=removable";
                 if pos + chunk.len() > initial_cap { return None; }
                 pos += copy_at(buf, pos, chunk);
             }
@@ -131,7 +136,7 @@ impl BootKind {
             }
             BootKind::WindowsPE => {}
             BootKind::Unknown => {
-                let chunk = b" boot=casper maybe-ubiquity init=/init.choosable";
+                let chunk = b" boot=casper maybe-ubiquity";
                 if pos + chunk.len() > initial_cap { return None; }
                 pos += copy_at(buf, pos, chunk);
             }
@@ -475,9 +480,9 @@ mod tests {
     #[test]
     fn test_boot_kind_linux_extra_values() {
         let mut buf = [0u8; 512];
-        assert_eq!(BootKind::Casper.linux_extra(false, None, &mut buf).unwrap(), b" boot=casper maybe-ubiquity init=/init.choosable");
+        assert_eq!(BootKind::Casper.linux_extra(false, None, &mut buf).unwrap(), b" boot=casper maybe-ubiquity");
         let mut buf2 = [0u8; 512];
-        assert_eq!(BootKind::Casper.linux_extra(true, None, &mut buf2).unwrap(), b" boot=casper casper_path=pop-os maybe-ubiquity init=/init.choosable");
+        assert_eq!(BootKind::Casper.linux_extra(true, None, &mut buf2).unwrap(), b" boot=casper casper_path=pop-os maybe-ubiquity");
         let mut buf3 = [0u8; 512];
         assert_eq!(BootKind::WindowsPE.linux_extra(false, None, &mut buf3).unwrap(), b"");
         assert_eq!(BootKind::DebianLive.linux_eol_extra(), b" findiso=");

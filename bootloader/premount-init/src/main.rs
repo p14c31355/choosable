@@ -295,7 +295,7 @@ fn by_partnum(target_num: u32) -> Option<String> {
             fallback = Some(dev_path);
         }
     }
-    if let Some(path) = fallback {
+    if let Some(ref path) = fallback {
         console_log(&format!("by_partnum: fallback to non-removable {}", path));
     }
     fallback

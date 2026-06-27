@@ -23,6 +23,9 @@ pub struct PatchInput<'a> {
     pub live_media_uuid: &'a [u8; 10],
     pub iso_location: Option<&'a IsoLocation>,
     pub premount_target_name: &'a [u8],
+    /// If non-empty, prepend this line (e.g. "set prefix=...\n")
+    /// at the beginning of the patched output.
+    pub prefix_set_line: &'a [u8],
 }
 
 pub struct PatchOutput {
@@ -208,6 +211,16 @@ fn patch_grub_cfg_impl(
     let mut src = 0usize;
     let mut dst = 0usize;
 
+    // Prepend prefix set line (e.g. "set prefix=(cd0)/boot/grub2\n") for
+    // distros whose GRUB prefix defaults to an unreadable filesystem.
+    if !inp.prefix_set_line.is_empty() {
+        let plen = inp.prefix_set_line.len().min(out_cap.saturating_sub(dst));
+        if plen > 0 {
+            out[dst..dst + plen].copy_from_slice(&inp.prefix_set_line[..plen]);
+            dst += plen;
+        }
+    }
+
     while src < orig.len() {
         let ch = orig[src];
         out[dst] = ch;
@@ -367,6 +380,7 @@ pub fn patch_grub_cfg(
     iso_location: Option<&IsoLocation>,
     premount_target_name: &[u8],
     bs: *mut BootServices,
+    prefix_set_line: &[u8],
 ) -> Option<PatchOutput> {
     let is_popos = boot_kind == BootKind::Casper
         && matches_any_lower(iso_name, &[b"pop", b"pop-os", b"popos"]);
@@ -385,6 +399,7 @@ pub fn patch_grub_cfg(
         live_media_uuid: &live_media_uuid,
         iso_location,
         premount_target_name,
+        prefix_set_line,
     };
 
     patch_grub_cfg_impl(&inp, &linux_extra, linux_eol_extra, premount_target_name)

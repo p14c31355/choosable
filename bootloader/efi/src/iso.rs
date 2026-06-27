@@ -586,6 +586,7 @@ fn try_patch_candidate(
     ext_lba: u32, ext_size: u32, dir_sector: u32, dir_offset: u32,
     iso_location: Option<&crate::locator::IsoLocation>,
     boot_kind: crate::boot_kind::BootKind,
+    prefix_set_line: &[u8],
 ) -> bool {
     let (orig_ptr, orig_len) = match read_extent(bs, bio_ref, bio_ptr, mid, iso_lba, ext_lba, ext_size) {
         Some(v) => v,
@@ -631,6 +632,7 @@ fn try_patch_candidate(
         iso_location,
         &premount_target_name[..premount_target_name_len],
         bs as *mut BootServices,
+        prefix_set_line,
     );
 
     let (patched_buf, patched_size) = match patch {
@@ -775,7 +777,12 @@ fn patch_grub_cfg_blockio(
 
     // Arch ISO uses systemd-boot with /loader/entries/*.conf files
     // that contain linux/initrd lines and must be patched.
-    if boot_kind == crate::boot_kind::BootKind::ArchIso || entry_count == 0 {
+    // Fedora also uses BLS entries at /loader/entries/*.conf with
+    // "options" lines that need direct injection of our boot params.
+    if boot_kind == crate::boot_kind::BootKind::ArchIso
+        || boot_kind == crate::boot_kind::BootKind::FedoraLive
+        || entry_count == 0
+    {
         if let Some(loader_dir) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, b"LOADER", &mut scratch) {
             if let Some(entries_dir) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, loader_dir.0, loader_dir.1, b"ENTRIES", &mut scratch) {
                 let mut conf_entries: [(u32, u32, u32, u32); 32] = [(0,0,0,0); 32];
@@ -798,11 +805,38 @@ fn patch_grub_cfg_blockio(
         return;
     }
 
+    // Buffer for "set prefix=(cd0)/boot/grub2\n" (Fedora BLS fix)
+    let mut fedora_prefix_line = [0u8; 64];
     for i in 0..entry_count {
+        // For Fedora, GRUB's default prefix may point to the exFAT partition
+        // which GRUB cannot read.  Set prefix to the virtual CD-ROM so BLS
+        // entries (at $prefix/loader/entries/) are found on the ISO.
+        let prefix_set_line = if boot_kind == crate::boot_kind::BootKind::FedoraLive {
+            let path_str = core::str::from_utf8(&entries[i].path[..entries[i].path_len]).unwrap_or("");
+            if let Some(dir_end) = path_str.rfind('/') {
+                let dir = &path_str[..dir_end];
+                let prefix = b"set prefix=(cd0)";
+                let mut lp = 0usize;
+                fedora_prefix_line[lp..lp + prefix.len()].copy_from_slice(prefix);
+                lp += prefix.len();
+                let dir_bytes = dir.as_bytes();
+                let dlen = dir_bytes.len().min(64 - lp - 1);
+                fedora_prefix_line[lp..lp + dlen].copy_from_slice(&dir_bytes[..dlen]);
+                lp += dlen;
+                fedora_prefix_line[lp] = b'\n';
+                lp += 1;
+                &fedora_prefix_line[..lp]
+            } else {
+                b""
+            }
+        } else {
+            b""
+        };
+
         if try_patch_candidate(st, bs, vb, sfs_instance, bio_ref, bio_ptr, mid, iso_lba, iso_name,
             entries[i].ext_lba, entries[i].ext_size,
             entries[i].dir_sector, entries[i].dir_offset,
-            iso_location, boot_kind) {
+            iso_location, boot_kind, prefix_set_line) {
             return;
         }
     }
