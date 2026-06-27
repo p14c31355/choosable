@@ -200,9 +200,14 @@ fn patch_grub_cfg_impl(
         &iso_offset_buf[..wp]
     });
 
+    // Count blscfg lines for BLS-aware distros (Fedora 40+)
+    let blscfg_count = orig.windows(6).filter(|w| *w == b"blscfg" || *w == b"BLSCFG").count();
+    let has_blscfg = blscfg_count > 0;
+
     let (linux_count, initrd_count) = count_matching_lines(orig);
     let extra = linux_count * (linux_extra.len() + eol_extra_dynamic.len() + iso_offset_dynamic.len())
-        + initrd_count * initrd_extra.len();
+        + initrd_count * initrd_extra.len()
+        + if has_blscfg { blscfg_count * (b"set kernelopts=\"$kernelopts".len() + linux_extra.len() + iso_offset_dynamic.len() + b"\"\n".len()) } else { 0 };
     let (out_ptr, out_cap) = allocate_output(bs, orig.len(), extra)?;
     let out = unsafe { core::slice::from_raw_parts_mut(out_ptr, out_cap) };
 
@@ -261,6 +266,63 @@ fn patch_grub_cfg_impl(
                 if !iso_offset_dynamic.is_empty() {
                     let inj3 = inject_at + linux_extra.len() + eol_extra_dynamic.len();
                     shift_and_inject(out, inj3, &mut dst, iso_offset_dynamic);
+                }
+            }
+            else if has_blscfg
+                && (t.starts_with(b"blscfg") || t.starts_with(b"blscfg\n") || t.starts_with(b"BLSCFG") || t.starts_with(b"BLSCFG\n"))
+                && !linux_extra.is_empty()
+            {
+                // Fedora 40+ BLS: inject `set kernelopts="$kernelopts <linux_extra> <choosable.iso_offset>"` BEFORE the blscfg line.
+                let mut bls_line = [0u8; 512];
+                let mut bls_len = 0usize;
+                bls_line[bls_len..][..15].copy_from_slice(b"set kernelopts=");
+                bls_len += 15;
+                bls_line[bls_len] = b'"'; bls_len += 1;
+                if !linux_extra.is_empty() {
+                    // linux_extra starts with a space; use after_linux_extra = &linux_extra[1..] to strip leading space
+                    let strip = if linux_extra[0] == b' ' { 1 } else { 0 };
+                    let content = &linux_extra[strip..];
+                    let cl = content.len().min(512 - bls_len - 2);
+                    bls_line[bls_len..bls_len + cl].copy_from_slice(&content[..cl]);
+                    bls_len += cl;
+                }
+                if !iso_offset_dynamic.is_empty() {
+                    let il = iso_offset_dynamic.len().min(512 - bls_len - 2);
+                    bls_line[bls_len..bls_len + il].copy_from_slice(&iso_offset_dynamic[..il]);
+                    bls_len += il;
+                }
+                bls_line[bls_len] = b'"'; bls_len += 1;
+                bls_line[bls_len] = b'\n'; bls_len += 1;
+
+                // Inject BEFORE the current blscfg line (at line_start)
+                let inject_at = line_start;
+                shift_and_inject(out, inject_at, &mut dst, &bls_line[..bls_len]);
+            }
+            else if t.starts_with(b"options ") || t.starts_with(b"options\t")
+            {
+                // systemd-boot .conf format: inject cmdline args onto the options line.
+                // linux_extra starts with a space; strip it for appending to options.
+                let extra_content = if linux_extra.starts_with(b" ") { &linux_extra[1..] } else { linux_extra };
+                let opt_extra_len = extra_content.len() + iso_offset_dynamic.len();
+                let opt_inject_at = dst; // append at end of line (before newline)
+                if dst > 0 && out[dst - 1] == b'\n' { /* injection point is before newline */ }
+                if !extra_content.is_empty() {
+                    // Prepend space if the line doesn't already end with one
+                    let need_space = dst > line_start && out[dst - 1] != b' ' && out[dst - 1] != b'\t';
+                    let mut opt_buf = [0u8; 320];
+                    let mut ob = 0usize;
+                    if need_space { opt_buf[ob] = b' '; ob += 1; }
+                    opt_buf[ob..ob + extra_content.len()].copy_from_slice(extra_content);
+                    ob += extra_content.len();
+                    if !iso_offset_dynamic.is_empty() {
+                        let il = iso_offset_dynamic.len().min(320 - ob);
+                        opt_buf[ob..ob + il].copy_from_slice(&iso_offset_dynamic[..il]);
+                        ob += il;
+                    }
+                    let inject_at = if dst > 0 && (out[dst - 1] == b'\n' || out[dst - 1] == b'\r') {
+                        dst - if out[dst - 1] == b'\n' { 1 } else { 0 }
+                    } else { dst };
+                    shift_and_inject(out, inject_at, &mut dst, &opt_buf[..ob]);
                 }
             }
             else if (t.starts_with(b"initrd ") || t.starts_with(b"initrd\t")

@@ -244,16 +244,18 @@ unsafe extern "efiapi" fn vblock_read(
             if !is_dir_patched && !read_real_iso_sector(vbio, block_lba, dst, block_offset) { return EFI_DEVICE_ERROR; }
             patch_dir_entry(&mut dst[block_offset..block_offset + 2048],
                 vbio.premount_entry_offset as usize, vbio.premount_entry_new_extent, vbio.premount_entry_new_size);
-            // Also rename the ISO9660 directory entry to "PREMOUNT.CPIO;1"
+            // Also rename the ISO9660 directory entry to "PREMOUNT.CPIO"
             // so GRUB can resolve the /PREMOUNT.CPIO path from grub.cfg.
+            // The ;1 version suffix is NOT included — GRUB's ISO9660 driver
+            // strips it automatically, and a 13-char name fits in the
+            // minimal 46-byte record (33 + 13 = 46).
             if vbio.premount_entry_rename {
                 let off = vbio.premount_entry_offset as usize;
-                let name = b"PREMOUNT.CPIO;1";
-                // ISO9660 name length at byte 32, record length at byte 0
+                let name = b"PREMOUNT.CPIO";
                 let name_len_byte = name.len() as u8;
                 if off < 2048 && block_offset + off < dst.len() {
                     let record_len = dst[block_offset + off] as usize;
-                    // Check both sector boundary and record length can fit the new name
+                    // 33 + 13 = 46 — fits in any record ≥ 46 bytes
                     if off + 33 + name.len() <= 2048 && 33 + name.len() <= record_len {
                         dst[block_offset + off + 32] = name_len_byte;
                         dst[block_offset + off + 33..block_offset + off + 33 + name.len()]
@@ -304,15 +306,13 @@ unsafe extern "efiapi" fn vblock_read(
             dst[off + 80..off + 84].copy_from_slice(&new_vol_size.to_le_bytes());
             dst[off + 84..off + 88].copy_from_slice(&new_vol_size.to_be_bytes());
 
-            // Override Volume ID to "CHOOSABLE" (space-padded to 32 bytes)
-            // so that LABEL=Choosable kernel cmdline parameters
-            // (live-media, archisodevice, rd.live.image, etc.) work.
-            // ISO9660 Volume Identifier: bytes 40-71 (32 bytes, space-padded).
-            {
-                let label = b"CHOOSABLE                       ";
-                // label is exactly 32 bytes
-                dst[off + 40..off + 72].copy_from_slice(&label[0..32]);
-            }
+            // Previously overwrote Volume ID to "CHOOSABLE" here,
+            // but that broke GRUB's `search -l <original-label>`
+            // command on Fedora and other label-searching distros.
+            // The ISO label is NOT visible to Linux (virtual device),
+            // so LABEL=CHOOSABLE kernel cmdline never works anyway.
+            // premount-init handles ISO mounting without needing
+            // label-based kernel parameters.
 
             // If premount entry was injected (not patched over existing),
             // also update the root directory record data length in PVD

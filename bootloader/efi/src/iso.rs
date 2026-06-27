@@ -238,8 +238,8 @@ fn find_first_file_in_dir(
                     continue;
                 }
 
-                // Skip records that are too small to be renamed to "PREMOUNT.CPIO;1" (requires 48 bytes)
-                if record_len < 48 {
+                // Skip records that are too small to be renamed to "PREMOUNT.CPIO" (requires 46 bytes)
+                if record_len < 46 {
                     offset += record_len;
                     continue;
                 }
@@ -476,6 +476,7 @@ fn find_efi_boot(
     bio_ptr: *mut BlockIoProtocol,
     mid: u32,
     iso_lba: u64,
+    boot_kind: crate::boot_kind::BootKind,
 ) -> Option<(u32, u32, &'static [u8])> {
     let mut scratch = [0u8; 2048];
     let (root_lba, root_size) = get_root_dir(st, bio_ref, bio_ptr, mid, iso_lba)?;
@@ -500,20 +501,31 @@ fn find_efi_boot(
     }
     let (boot_lba, boot_size) = boot_dir?;
 
-    // Prefer GRUB/shim over systemd-boot shell.  SHELL*.EFI are last
-    // because loading them produces an interactive EFI shell instead of
-    // booting the OS.  systemd-boot (Arch) is loaded via BOOTX64.EFI.
-    let efi_names: &[&[u8]] = &[
-        b"GRUBX64.EFI",
-        b"SHIMX64.EFI",
-        b"BOOTX64.EFI",
-        b"BOOTIA32.EFI",
-        b"SYSTEMD-BOOTX64.EFI",
-        b"SYSTEMD-BOOTIA32.EFI",
-        // SHELL*.EFI are fallbacks only — they start an EFI shell, not an OS.
-        b"SHELLX64.EFI",
-        b"SHELLIA32.EFI",
-    ];
+    // Arch ISO uses systemd-boot (BOOTX64.EFI), NOT GRUB.
+    // Prefer BOOTX64.EFI first for ArchIso, otherwise GRUB/shim first.
+    let efi_names: &[&[u8]] = if boot_kind == crate::boot_kind::BootKind::ArchIso {
+        &[
+            b"BOOTX64.EFI",
+            b"SYSTEMD-BOOTX64.EFI",
+            b"GRUBX64.EFI",
+            b"SHIMX64.EFI",
+            b"BOOTIA32.EFI",
+            b"SYSTEMD-BOOTIA32.EFI",
+            b"SHELLX64.EFI",
+            b"SHELLIA32.EFI",
+        ]
+    } else {
+        &[
+            b"GRUBX64.EFI",
+            b"SHIMX64.EFI",
+            b"BOOTX64.EFI",
+            b"BOOTIA32.EFI",
+            b"SYSTEMD-BOOTX64.EFI",
+            b"SYSTEMD-BOOTIA32.EFI",
+            b"SHELLX64.EFI",
+            b"SHELLIA32.EFI",
+        ]
+    };
     for &name in efi_names {
         if let Some(v) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, boot_lba, boot_size, name, &mut scratch) {
             return Some((v.0, v.1, name));
@@ -604,7 +616,9 @@ fn try_patch_candidate(
     let has_blscfg = (orig.len() >= 6 && orig.windows(6).any(|w| w == b"blscfg" || w == b"BLSCFG"))
         || (orig.len() >= 9 && orig.windows(9).any(|w| w == b"blscfg\n" || w == b"BLSCFG\n"))
         || (orig.len() >= 7 && orig.windows(7).any(|w| w == b"\nblscfg" || w == b"\nBLSCFG"));
-    let has_relevant_directive = has_linux || has_menuentry || has_blscfg;
+    // systemd-boot .conf files have "options" lines instead of "linux"
+    let has_options = orig.len() >= 8 && orig.windows(8).any(|w| w == b"options " || w == b"options\t");
+    let has_relevant_directive = has_linux || has_menuentry || has_blscfg || has_options;
     if !has_relevant_directive {
         unsafe { (bs.free_pool)(orig_ptr as *mut c_void); }
         return false;
@@ -1405,9 +1419,12 @@ fn uefi_chainload_iso(
                     let sfs = unsafe { &mut *sfs_instance };
                     sfs.ctx.premount_cpio_buf = bundle.cpio_buf;
                     sfs.ctx.premount_cpio_size = bundle.cpio_size;
-                    let tlen = name_len.min(15);
-                    sfs.ctx.premount_target_name[..tlen].copy_from_slice(&name_buf[..tlen]);
-                    sfs.ctx.premount_target_name_len = tlen;
+                    // CRITICAL: set premount_target_name to "PREMOUNT.CPIO"
+                    // (the name the grub.cfg initrd line references), not the
+                    // original filename.  The directory entry is renamed via
+                    // Block I/O patch, so the path must match.
+                    sfs.ctx.premount_target_name = *b"PREMOUNT.CPIO___";
+                    sfs.ctx.premount_target_name_len = 13;
                 }
 
                 print_raw(st, b"[premount] overwriting \0");
@@ -1549,7 +1566,7 @@ fn uefi_chainload_iso(
     patch_grub_cfg_blockio(st, bs, vbio_ptr, sfs_instance, bio_ref, bio_ptr, mid, iso_lba, iso_name,
         Some(&iso_loc), boot_kind);
 
-    let (efi_lba, efi_size, efi_filename) = match find_efi_boot(st, bio_ref, bio_ptr, mid, iso_lba) {
+    let (efi_lba, efi_size, efi_filename) = match find_efi_boot(st, bio_ref, bio_ptr, mid, iso_lba, boot_kind) {
         Some(v) => v,
         None => {
             print_raw(st, b"ERROR: /EFI/BOOT/BOOTX64.EFI not found in ISO.\r\n\0");
