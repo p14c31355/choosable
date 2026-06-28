@@ -311,20 +311,21 @@ pub struct VirtualBlockIo {
     /// Whether directory entry patching is active
     pub dir_entry_patched: bool,
     /// ── Premount CPIO initrd extension ───────────────────────────
-    /// The premount CPIO is served as extended sectors appended to the
-    /// first initrd file on the virtual CD-ROM.  The initrd's directory
-    /// entry is patched to report a larger data length; when GRUB reads
-    /// sector(s) beyond the original file, the CPIO data is served.
+    /// The premount CPIO is served as extended sectors appended beyond
+    /// the original ISO media end, not after the initrd file itself.
+    /// The initrd's directory entry is patched to report a larger data
+    /// length and point to a relocated extent that includes both the
+    /// original initrd and the CPIO extension.
     pub premount_cpio_buf: *mut u8,
     pub premount_cpio_size: u32,
     /// LBA (ISO 2048-byte sector) of the first initrd file extent.
     pub initrd_base_lba: u32,
     /// Original file size of the initrd in bytes.
     pub initrd_orig_size: u32,
-    /// Number of 2048-byte sectors of CPIO data appended after the
-    /// original initrd data.  Sector initrd_base_lba + ceil(orig/2048)
-    /// is the first CPIO sector, up to + ext_sectors.
+    /// Number of 2048-byte sectors of CPIO data.
     pub initrd_ext_sectors: u32,
+    /// Absolute LBA where the CPIO extension sectors start (beyond ISO media end).
+    pub initrd_cpio_start_lba: u32,
     /// Directory entry location for the initrd file (sector/offset).
     pub initrd_entry_sector: u32,
     pub initrd_entry_offset: u32,

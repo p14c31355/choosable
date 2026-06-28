@@ -170,17 +170,22 @@ fn read_gpt_entries_with_index<T>(
     None
 }
 
-/// Read the 16-byte GUID from MBR sector at byte offset 384.
-/// This is a Choosable/Ventoy convention — the GUID identifies the data partition
-/// for MBR-formatted disks and is written by the installer at install time.
+/// Read MBR disk signature and convert to GUID for PARTUUID matching.
+/// Linux MBR PARTUUID convention:
+///   - 4-byte disk signature at offset 0x1B8 (bytes 440-443)
+///   - Partition number at offset 0x1BC (typically 2 hex digits)
+///   - Formatted as: <sig_hex_le>-<partnum_hex> e.g. "aabbccdd-01"
+/// For GUID representation, map the 4-byte signature into d1 and partition into d4[4..8].
 pub fn read_mbr_guid(mbr: &[u8; 512]) -> crate::protocol::Guid {
+    let disk_sig = u32::from_le_bytes(mbr[440..444].try_into().unwrap());
+    let part_num = mbr[446]; // First partition entry starts at 446, partition number implicit as 1
     crate::protocol::Guid {
-        d1: u32::from_le_bytes(mbr[384..388].try_into().unwrap()),
-        d2: u16::from_le_bytes(mbr[388..390].try_into().unwrap()),
-        d3: u16::from_le_bytes(mbr[390..392].try_into().unwrap()),
+        d1: disk_sig,
+        d2: 0,
+        d3: 0,
         d4: {
             let mut d4 = [0u8; 8];
-            d4.copy_from_slice(&mbr[392..400]);
+            d4[4] = part_num;
             d4
         },
     }

@@ -408,13 +408,13 @@ fn main() {
     // 3. Wait for devices with retry
     let mut target: Option<String> = None;
     for attempt in 0..3 {
-        std::thread::sleep(std::time::Duration::from_secs(if attempt == 0 { 3 } else { 2 }));
         target = params.part_guid.as_ref().and_then(|g| by_partuuid(g))
             .or_else(|| params.part_num.and_then(|n| by_partnum(n)));
         if target.is_some() {
             break;
         }
         console_log(&format!("device not ready, retry {}/3", attempt + 1));
+        std::thread::sleep(std::time::Duration::from_secs(if attempt == 0 { 3 } else { 2 }));
     }
 
     let mounted = match target {

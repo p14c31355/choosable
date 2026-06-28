@@ -229,32 +229,41 @@ unsafe extern "efiapi" fn vblock_read(
         let block_lba = lba + b as u64;
         let block_offset = b * 2048;
 
-        // ── grub.cfg directory entry patch ──────────────────────────
-        let is_dir_patched = vbio.dir_entry_patched && block_lba == vbio.dir_entry_sector as u64;
-        if is_dir_patched {
+        // ── Directory entry patches ──────────────────────────────
+        // Both grub.cfg and initrd directory entries may be in the same sector,
+        // so we need to read the sector once and apply both patches if needed.
+        let needs_grub_patch = vbio.dir_entry_patched && block_lba == vbio.dir_entry_sector as u64;
+        let needs_initrd_patch = vbio.initrd_ext_active && block_lba == vbio.initrd_entry_sector as u64;
+
+        if needs_grub_patch || needs_initrd_patch {
             if !read_real_iso_sector(vbio, block_lba, dst, block_offset) { return EFI_DEVICE_ERROR; }
-            patch_dir_entry(&mut dst[block_offset..block_offset + 2048],
-                vbio.dir_entry_offset as usize, vbio.dir_entry_new_extent, vbio.dir_entry_new_size);
+
+            if needs_grub_patch {
+                patch_dir_entry(&mut dst[block_offset..block_offset + 2048],
+                    vbio.dir_entry_offset as usize, vbio.dir_entry_new_extent, vbio.dir_entry_new_size);
+            }
+
+            if needs_initrd_patch {
+                // Calculate total size: original initrd + CPIO extension, aligned to sector boundary
+                let initrd_sectors = (vbio.initrd_orig_size as u64 + 2047) / 2048;
+                let new_size = (initrd_sectors + vbio.initrd_ext_sectors as u64) * 2048;
+                patch_dir_entry(&mut dst[block_offset..block_offset + 2048],
+                    vbio.initrd_entry_offset as usize, vbio.initrd_base_lba, new_size as u32);
+            }
             continue;
         }
 
-        // ── Initrd directory entry patch (extend data length) ──────
-        let is_initrd_patched = vbio.initrd_ext_active && block_lba == vbio.initrd_entry_sector as u64;
-        if is_initrd_patched {
-            if !read_real_iso_sector(vbio, block_lba, dst, block_offset) { return EFI_DEVICE_ERROR; }
-            let new_size = vbio.initrd_orig_size + vbio.initrd_ext_sectors * 2048;
-            patch_dir_entry(&mut dst[block_offset..block_offset + 2048],
-                vbio.initrd_entry_offset as usize, vbio.initrd_base_lba, new_size);
-            continue;
-        }
-
-        // ── Initrd extension: serve premount CPIO after original initrd ──
+        // ── Initrd extension: redirect reads beyond original initrd to CPIO buffer ──
+        // When GRUB reads the extended initrd, sectors beyond the original file
+        // should come from the CPIO buffer, not from the actual ISO sectors
+        // (which may contain unrelated files).
         if vbio.initrd_ext_active {
             let initrd_sectors = (vbio.initrd_orig_size as u64 + 2047) / 2048;
-            let cpio_start = vbio.initrd_base_lba as u64 + initrd_sectors;
-            let cpio_end = cpio_start + vbio.initrd_ext_sectors as u64;
-            if block_lba >= cpio_start && block_lba < cpio_end {
-                let off = (block_lba - cpio_start) as usize * 2048;
+            let initrd_end = vbio.initrd_base_lba as u64 + initrd_sectors;
+            let ext_end = initrd_end + vbio.initrd_ext_sectors as u64;
+            // If GRUB is reading the CPIO extension region
+            if block_lba >= initrd_end && block_lba < ext_end {
+                let off = (block_lba - initrd_end) as usize * 2048;
                 let cpio = unsafe { core::slice::from_raw_parts(vbio.premount_cpio_buf as *const u8, vbio.premount_cpio_size as usize) };
                 let to_copy = (vbio.premount_cpio_size as usize).saturating_sub(off).min(2048);
                 if to_copy > 0 {
@@ -401,6 +410,7 @@ pub fn create_virtual_cdrom(
     vbio.initrd_base_lba = 0;
     vbio.initrd_orig_size = 0;
     vbio.initrd_ext_sectors = 0;
+    vbio.initrd_cpio_start_lba = 0;
     vbio.initrd_entry_sector = 0;
     vbio.initrd_entry_offset = 0;
     vbio.initrd_ext_active = false;

@@ -1370,6 +1370,19 @@ fn uefi_chainload_iso(
         print_raw(st, b"[premount] allocation failed, skipping\r\n\0");
     }
 
+    // ── Build locator and patch grub.cfg first ──
+    // This must happen before initrd extension setup so vb.patched_file_buf is populated
+    let locator = FileBackedIsoLocator::from_payload_entry(
+        &files[idx],
+        *partition_guid,
+        partition_number, part1_lba,
+        is_mbr,
+    );
+    let iso_loc = locator.locate();
+
+    patch_grub_cfg_blockio(st, bs, vbio_ptr, sfs_instance, bio_ref, bio_ptr, mid, iso_lba, iso_name,
+        Some(&iso_loc), boot_kind);
+
     // ── Initrd extension: append premount CPIO to original initrd ──
     // Instead of injecting PREMOUNT.CPIO into the ISO directory (fragile),
     // we patch the initrd file's directory entry to report a larger size.
@@ -1383,9 +1396,11 @@ fn uefi_chainload_iso(
         vb.premount_cpio_buf = bundle.cpio_buf;
         vb.premount_cpio_size = bundle.cpio_size as u32;
 
-        // Extend the virtual CD-ROM to include the CPIO data
+        // Place CPIO data beyond the current ISO media end to avoid overlapping existing files
         let cpio_sectors = ((bundle.cpio_size as u64 + 2047) / 2048) as u32;
-        vb.media.bim_lb = vb.media.bim_lb + cpio_sectors as u64;
+        let orig_last_block = vb.media.bim_lb;
+        let cpio_start_lba = (orig_last_block + 1) as u32;
+        vb.media.bim_lb = orig_last_block + cpio_sectors as u64;
 
         // Scan the patched grub.cfg for the first initrd line
         let mut initrd_path: [u8; 256] = [0; 256];
@@ -1498,6 +1513,7 @@ fn uefi_chainload_iso(
                             vb.initrd_base_lba = file_lba;
                             vb.initrd_orig_size = file_size;
                             vb.initrd_ext_sectors = cpio_sectors;
+                            vb.initrd_cpio_start_lba = cpio_start_lba;
                             vb.initrd_entry_sector = entry_sector;
                             vb.initrd_entry_offset = entry_offset;
                             vb.initrd_ext_active = true;
@@ -1521,17 +1537,6 @@ fn uefi_chainload_iso(
             print_raw(st, b"[initrd] no initrd line in patched config\r\n\0");
         }
     }
-
-    let locator = FileBackedIsoLocator::from_payload_entry(
-        &files[idx],
-        *partition_guid,
-        partition_number, part1_lba,
-        is_mbr,
-    );
-    let iso_loc = locator.locate();
-
-    patch_grub_cfg_blockio(st, bs, vbio_ptr, sfs_instance, bio_ref, bio_ptr, mid, iso_lba, iso_name,
-        Some(&iso_loc), boot_kind);
 
     let (efi_lba, efi_size, efi_filename) = match find_efi_boot(st, bio_ref, bio_ptr, mid, iso_lba, boot_kind) {
         Some(v) => v,
