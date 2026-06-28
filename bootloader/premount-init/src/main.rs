@@ -254,8 +254,12 @@ fn by_partuuid(guid: &str) -> Option<String> {
 /// This tries to match partition N on disks that have partitions (sda1, sda2, etc).
 /// It does NOT use a global /proc/partitions index.
 fn by_partnum(target_num: u32) -> Option<String> {
-    // Scan /sys/block for disks that have partitions
+    // Scan /sys/block for disks that have partitions.
+    // Prefer removable disks (USB) to avoid hitting the system disk.
     let Ok(blocks) = fs::read_dir("/sys/block") else { return None };
+
+    // First pass: look for a removable disk with the target partition
+    let mut fallback: Option<String> = None;
     for block in blocks {
         let Ok(block) = block else { continue };
         let block_name = block.file_name();
@@ -266,22 +270,35 @@ fn by_partnum(target_num: u32) -> Option<String> {
             || block_name_s.starts_with("dm") || block_name_s.starts_with("sr")
         { continue; }
 
-        // Try to find the Nth partition on this disk
         let partition_name = if block_name_s.ends_with(|c: char| c.is_numeric()) {
-            // For nvme0n1, mmc0, etc: partition is nvme0n1p1, mmc0p1
             format!("{}p{}", block_name_s, target_num)
         } else {
-            // For sda, hda, vda: partition is sda1, hda1, vda1
             format!("{}{}", block_name_s, target_num)
         };
 
         let dev_path = format!("/dev/{}", partition_name);
-        if std::path::Path::new(&dev_path).exists() {
-            console_log(&format!("by_partnum: found {} as partition {} on disk {}", dev_path, target_num, block_name_s));
+        if !std::path::Path::new(&dev_path).exists() { continue; }
+
+        // Check if the disk is removable (USB). sysfs has a "removable" file.
+        let removable_path = block.path().join("removable");
+        let is_removable = fs::read_to_string(&removable_path)
+            .ok()
+            .map(|s| s.trim() == "1")
+            .unwrap_or(false);
+
+        if is_removable {
+            console_log(&format!("by_partnum: found removable {} -> {}", block_name_s, dev_path));
             return Some(dev_path);
         }
+        // Keep first non-removable match as fallback
+        if fallback.is_none() {
+            fallback = Some(dev_path);
+        }
     }
-    None
+    if let Some(ref path) = fallback {
+        console_log(&format!("by_partnum: fallback to non-removable {}", path));
+    }
+    fallback
 }
 
 /// Scan all partitions (legacy fallback).
@@ -375,6 +392,10 @@ fn main() {
         do_mkdir("/tmp");
         do_mkdir("/cdrom");
         do_mkdir("/run");
+        // Mount tmpfs on /run before dracut does, so our bind mounts
+        // (/run/initramfs/live/LiveOS for Fedora, /run/archiso/bootmnt
+        // for Arch) survive when dracut skips its own tmpfs mount.
+        do_mount("tmpfs", "/run", "tmpfs", 0);
         for i in 0u32..8 {
             do_mknod_blk(&format!("/dev/loop{}", i), 7, i);
         }
@@ -384,12 +405,17 @@ fn main() {
     let params = parse_cmdline();
     let offset = params.iso_offset.unwrap_or(0);
 
-    // 3. Wait for devices
-    std::thread::sleep(std::time::Duration::from_secs(3));
-
-    // 4. Target partition via PARTUUID (preferred) or partition number
-    let target: Option<String> = params.part_guid.as_ref().and_then(|g| by_partuuid(g))
-        .or_else(|| params.part_num.and_then(|n| by_partnum(n)));
+    // 3. Wait for devices with retry
+    let mut target: Option<String> = None;
+    for attempt in 0..3 {
+        target = params.part_guid.as_ref().and_then(|g| by_partuuid(g))
+            .or_else(|| params.part_num.and_then(|n| by_partnum(n)));
+        if target.is_some() {
+            break;
+        }
+        console_log(&format!("device not ready, retry {}/3", attempt + 1));
+        std::thread::sleep(std::time::Duration::from_secs(if attempt == 0 { 3 } else { 2 }));
+    }
 
     let mounted = match target {
         Some(ref dev) => {

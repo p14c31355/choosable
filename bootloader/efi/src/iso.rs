@@ -586,6 +586,7 @@ fn try_patch_candidate(
     ext_lba: u32, ext_size: u32, dir_sector: u32, dir_offset: u32,
     iso_location: Option<&crate::locator::IsoLocation>,
     boot_kind: crate::boot_kind::BootKind,
+    prefix_set_line: &[u8],
 ) -> bool {
     let (orig_ptr, orig_len) = match read_extent(bs, bio_ref, bio_ptr, mid, iso_lba, ext_lba, ext_size) {
         Some(v) => v,
@@ -631,6 +632,7 @@ fn try_patch_candidate(
         iso_location,
         &premount_target_name[..premount_target_name_len],
         bs as *mut BootServices,
+        prefix_set_line,
     );
 
     let (patched_buf, patched_size) = match patch {
@@ -773,22 +775,40 @@ fn patch_grub_cfg_blockio(
         }
     }
 
-    // Arch ISO uses systemd-boot with /loader/entries/*.conf files
-    // that contain linux/initrd lines and must be patched.
-    if boot_kind == crate::boot_kind::BootKind::ArchIso || entry_count == 0 {
-        if let Some(loader_dir) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, b"LOADER", &mut scratch) {
-            if let Some(entries_dir) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, loader_dir.0, loader_dir.1, b"ENTRIES", &mut scratch) {
-                let mut conf_entries: [(u32, u32, u32, u32); 32] = [(0,0,0,0); 32];
-                let mut conf_count = 0usize;
-                recursive_find_files_with_ext(
-                    bio_ref, bio_ptr, mid, iso_lba, entries_dir.0, entries_dir.1,
-                    &mut scratch, &mut conf_entries, &mut conf_count, 0, b"conf",
-                );
-                for i in 0..conf_count {
-                    let (ext_lba, ext_size, dir_sector, dir_offset) = conf_entries[i];
-                    if ext_size == 0 { continue; }
-                    add_cfg_entry(&mut entries, &mut entry_count, ext_lba, ext_size, dir_sector, dir_offset, b"/loader/entries/<.conf>");
-                }
+    // Search for BLS / systemd-boot .conf files that contain "options" lines.
+    // Fedora typically has them at /loader/entries/, /boot/loader/entries/,
+    // or /boot/x86_64/loader/entries/.
+    if boot_kind == crate::boot_kind::BootKind::ArchIso
+        || boot_kind == crate::boot_kind::BootKind::FedoraLive
+        || entry_count == 0
+    {
+        // Try /loader/entries/
+        let mut conf_dir = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, b"LOADER", &mut scratch)
+            .and_then(|(lba, sz)| find_in_dir(bio_ref, bio_ptr, mid, iso_lba, lba, sz, b"ENTRIES", &mut scratch));
+        // Try /boot/loader/entries/
+        if conf_dir.is_none() {
+            conf_dir = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, b"BOOT", &mut scratch)
+                .and_then(|(lba, sz)| find_in_dir(bio_ref, bio_ptr, mid, iso_lba, lba, sz, b"LOADER", &mut scratch))
+                .and_then(|(lba, sz)| find_in_dir(bio_ref, bio_ptr, mid, iso_lba, lba, sz, b"ENTRIES", &mut scratch));
+        }
+        // Try /boot/x86_64/loader/entries/
+        if conf_dir.is_none() {
+            conf_dir = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, b"BOOT", &mut scratch)
+                .and_then(|(lba, sz)| find_in_dir(bio_ref, bio_ptr, mid, iso_lba, lba, sz, b"X86_64", &mut scratch))
+                .and_then(|(lba, sz)| find_in_dir(bio_ref, bio_ptr, mid, iso_lba, lba, sz, b"LOADER", &mut scratch))
+                .and_then(|(lba, sz)| find_in_dir(bio_ref, bio_ptr, mid, iso_lba, lba, sz, b"ENTRIES", &mut scratch));
+        }
+        if let Some((dir_lba, dir_size)) = conf_dir {
+            let mut conf_entries: [(u32, u32, u32, u32); 32] = [(0,0,0,0); 32];
+            let mut conf_count = 0usize;
+            recursive_find_files_with_ext(
+                bio_ref, bio_ptr, mid, iso_lba, dir_lba, dir_size,
+                &mut scratch, &mut conf_entries, &mut conf_count, 0, b"conf",
+            );
+            for i in 0..conf_count {
+                let (ext_lba, ext_size, dir_sector, dir_offset) = conf_entries[i];
+                if ext_size == 0 { continue; }
+                add_cfg_entry(&mut entries, &mut entry_count, ext_lba, ext_size, dir_sector, dir_offset, b"/<entries>.conf");
             }
         }
     }
@@ -798,11 +818,43 @@ fn patch_grub_cfg_blockio(
         return;
     }
 
+    // Buffer for "set root=(cd0)\nset prefix=(cd0)/boot/grub2\n" (Fedora BLS fix)
+    let mut fedora_prefix_line = [0u8; 96];
     for i in 0..entry_count {
+        // For Fedora, GRUB's default prefix may point to the exFAT partition
+        // which GRUB cannot read.  Set prefix to the virtual CD-ROM so BLS
+        // entries (at $prefix/loader/entries/) are found on the ISO.
+        let prefix_set_line = if boot_kind == crate::boot_kind::BootKind::FedoraLive {
+            let path_str = core::str::from_utf8(&entries[i].path[..entries[i].path_len]).unwrap_or("");
+            if let Some(dir_end) = path_str.rfind('/') {
+                let dir = &path_str[..dir_end];
+                let mut lp = 0usize;
+                // set root=(cd0)
+                let root_line = b"set root=(cd0)\n";
+                fedora_prefix_line[lp..lp + root_line.len()].copy_from_slice(root_line);
+                lp += root_line.len();
+                // set prefix=(cd0)/boot/grub2 (or wherever the config is)
+                let prefix_start = b"set prefix=(cd0)";
+                fedora_prefix_line[lp..lp + prefix_start.len()].copy_from_slice(prefix_start);
+                lp += prefix_start.len();
+                let dir_bytes = dir.as_bytes();
+                let dlen = dir_bytes.len().min(96 - lp - 1);
+                fedora_prefix_line[lp..lp + dlen].copy_from_slice(&dir_bytes[..dlen]);
+                lp += dlen;
+                fedora_prefix_line[lp] = b'\n';
+                lp += 1;
+                &fedora_prefix_line[..lp]
+            } else {
+                b""
+            }
+        } else {
+            b""
+        };
+
         if try_patch_candidate(st, bs, vb, sfs_instance, bio_ref, bio_ptr, mid, iso_lba, iso_name,
             entries[i].ext_lba, entries[i].ext_size,
             entries[i].dir_sector, entries[i].dir_offset,
-            iso_location, boot_kind) {
+            iso_location, boot_kind, prefix_set_line) {
             return;
         }
     }
@@ -1098,6 +1150,7 @@ pub fn boot_payload_by_type(
     mid: u32,
     partition_guid: &crate::protocol::Guid,
     partition_number: u32,
+    is_mbr: bool,
 ) -> ! {
     if idx >= payloads.len() {
         print_raw(st, b"ERROR: payload index out of range.\r\n\0");
@@ -1105,7 +1158,7 @@ pub fn boot_payload_by_type(
     }
     let p = &payloads[idx];
     match p.payload_type {
-        PayloadType::Iso => uefi_chainload_iso(st, image_handle, part1_lba, payloads, idx, bio_ref, bio_ptr, mid, partition_guid, partition_number),
+        PayloadType::Iso => uefi_chainload_iso(st, image_handle, part1_lba, payloads, idx, bio_ref, bio_ptr, mid, partition_guid, partition_number, is_mbr),
         PayloadType::Wim => boot_wim_payload(st, image_handle, part1_lba, payloads, idx, bio_ref, bio_ptr, mid),
         PayloadType::Vhd | PayloadType::Vhdx => boot_vhd_payload(st, image_handle, part1_lba, payloads, idx, bio_ref, bio_ptr, mid),
         PayloadType::Img => boot_img_payload(st, image_handle, part1_lba, payloads, idx, bio_ref, bio_ptr, mid),
@@ -1244,6 +1297,7 @@ fn uefi_chainload_iso(
     mid: u32,
     partition_guid: &crate::protocol::Guid,
     partition_number: u32,
+    is_mbr: bool,
 ) -> ! {
     let iso_lba = files[idx].file_start_lba;
     let iso_size = files[idx].file_size;
@@ -1316,198 +1370,173 @@ fn uefi_chainload_iso(
         print_raw(st, b"[premount] allocation failed, skipping\r\n\0");
     }
 
-    // ── BlockIO premount injection ────────────────────────────────────
-    if !vbio_ptr.is_null() && premount_bundle.is_some() {
-        let vb = unsafe { &mut *vbio_ptr };
-        let bundle = premount_bundle.as_ref().unwrap();
-        // Only zero-fill up to the actual allocation boundary.
-        // bundle.cpio_alloc_size is the real pool size; writing beyond
-        // it would corrupt the UEFI pool heap.
-        let alloc_size = bundle.cpio_alloc_size;
-        {
-            let dst = unsafe { core::slice::from_raw_parts_mut(bundle.cpio_buf, alloc_size) };
-            dst[bundle.cpio_size..].fill(0);
-        }
-        // Effective cpio size (zero-padded to alloc_size, rounded to sectors)
-        let premount_cpio_sectors = ((alloc_size as u64 + 2047) / 2048) as u32;
-        let orig_end = vb.media.bim_lb + 1;
-        vb.premount_file_sector = orig_end as u32;
-        vb.premount_file_sectors = premount_cpio_sectors;
-        vb.premount_file_buf = bundle.cpio_buf;
-        vb.media.bim_lb = orig_end + premount_cpio_sectors as u64 - 1;
-
-        let mut pvd = [0u8; 2048];
-        if read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, 16, &mut pvd)
-            && pvd[0] == 1 && &pvd[1..6] == b"CD001"
-        {
-            let root_lba = u32::from_le_bytes(pvd[158..162].try_into().unwrap());
-            let root_size = u32::from_le_bytes(pvd[166..170].try_into().unwrap());
-            let mut scratch = [0u8; 2048];
-
-            if let Some((dir_sector, dir_offset, name_buf, name_len)) =
-                find_first_file_in_dir(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, &mut scratch)
-            {
-                vb.premount_entry_sector = dir_sector;
-                vb.premount_entry_offset = dir_offset;
-                vb.premount_entry_new_extent = vb.premount_file_sector;
-                vb.premount_entry_new_size = bundle.cpio_size as u32;
-                vb.premount_entry_patched = true;
-                // Also patch the directory entry's NAME to "PREMOUNT.CPIO"
-                // so GRUB can find it at the path referenced in grub.cfg.
-                // The original entry keeps its name otherwise, which doesn't
-                // match "/PREMOUNT.CPIO" and causes initrd load failure.
-                vb.premount_entry_rename = true;
-
-                if !sfs_instance.is_null() {
-                    let sfs = unsafe { &mut *sfs_instance };
-                    sfs.ctx.premount_cpio_buf = bundle.cpio_buf;
-                    sfs.ctx.premount_cpio_size = bundle.cpio_size;
-                    // CRITICAL: set premount_target_name to "PREMOUNT.CPIO"
-                    // (the name the grub.cfg initrd line references), not the
-                    // original filename.  The directory entry is renamed via
-                    // Block I/O patch, so the path must match.
-                    sfs.ctx.premount_target_name = *b"PREMOUNT.CPIO___";
-                    sfs.ctx.premount_target_name_len = 13;
-                }
-
-                print_raw(st, b"[premount] overwriting \0");
-                print_raw(st, &name_buf[..name_len.min(15)]);
-                print_raw(st, b" dir entry at sector=\0");
-                print_dec(st, dir_sector as u64);
-                print_raw(st, b" off=\0");
-                print_dec(st, dir_offset as u64);
-                print_raw(st, b" size=\0");
-                print_dec(st, bundle.cpio_size as u64);
-                print_raw(st, b" bytes\r\n\0");
-            } else {
-                // Fallback: inject a complete synthetic PREMOUNT.CPIO
-                // directory record at the first EOD byte of the root directory.
-                // GRUB reads ISO9660 directly from Block I/O, not via SFS, so
-                // merely setting SFS premount fields is insufficient.
-                //
-                // Strategy: scan root dir for the EOD marker byte 0x00,
-                // and overwrite it + subsequent bytes with a complete
-                // ISO9660 directory record naming "PREMOUNT.CPIO;1".
-                let mut new_root_size: u32 = 0;
-                if let Some((eod_sector, eod_offset)) =
-                    find_eod_in_dir(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, &mut scratch, &mut new_root_size)
-                {
-                    let mut blob = [0u8; 128];
-                    let blob_len = build_premount_cpio_entry(
-                        &mut blob,
-                        vb.premount_file_sector,
-                        bundle.cpio_size as u32,
-                    );
-                    vb.premount_entry_sector = eod_sector;
-                    vb.premount_entry_offset = eod_offset;
-                    vb.premount_entry_injected_blob = blob;
-                    vb.premount_entry_injected_size = blob_len;
-                    vb.premount_entry_injected = true;
-                    vb.premount_new_root_size = new_root_size + blob_len;
-
-                    if !sfs_instance.is_null() {
-                        let sfs = unsafe { &mut *sfs_instance };
-                        sfs.ctx.premount_cpio_buf = bundle.cpio_buf;
-                        sfs.ctx.premount_cpio_size = bundle.cpio_size;
-                        sfs.ctx.premount_target_name = *b"PREMOUNT.CPIO___";
-                        sfs.ctx.premount_target_name_len = 13;
-                    }
-
-                    print_raw(st, b"[premount] injected synthetic PREMOUNT.CPIO entry at sector=\0");
-                    print_dec(st, eod_sector as u64);
-                    print_raw(st, b" off=\0");
-                    print_dec(st, eod_offset as u64);
-                    print_raw(st, b"\r\n\0");
-                } else {
-                    // Root directory is full (no free space for EOD injection
-                    // and no safe file to overwrite).  Relocate the entire
-                    // root directory to a new contiguous extent at the end of
-                    // the virtual CD-ROM, appending the synthetic PREMOUNT.CPIO
-                    // entry.  GRUB's ISO9660 driver reads directories sequentially,
-                    // so the relocated extent must be contiguous.
-                    let root_sectors = ((root_size as u64 + 2047) / 2048) as u32;
-                    // Extra sector for the synthetic entry if needed
-                    let extra_sectors = if root_size % 2048 == 0 || root_size % 2048 + 47 > 2048 { 1u32 } else { 0u32 };
-                    let relocated_sectors = root_sectors + extra_sectors;
-                    let relocated_bytes = relocated_sectors as usize * 2048;
-
-                    let mut relocated_ptr: *mut c_void = core::ptr::null_mut();
-                    if unsafe { (bs.allocate_pool)(MemoryType::EfiLoaderData, relocated_bytes, &mut relocated_ptr) } != EFI_SUCCESS || relocated_ptr.is_null() {
-                        print_raw(st, b"[premount] relocation alloc failed\r\n\0");
-                    } else {
-                        let reloc = unsafe { core::slice::from_raw_parts_mut(relocated_ptr as *mut u8, relocated_bytes) };
-                        // Zero-fill first
-                        for b in reloc.iter_mut() { *b = 0; }
-                        // Copy all original root directory sectors, tracking success
-                        let mut all_sectors_ok = true;
-                        for s in 0..root_sectors {
-                            let mut sec = [0u8; 2048];
-                            if read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, root_lba + s, &mut sec) {
-                                let off = s as usize * 2048;
-                                let copy = ((root_size as usize).saturating_sub(off)).min(2048);
-                                reloc[off..off + copy].copy_from_slice(&sec[..copy]);
-                            } else {
-                                all_sectors_ok = false;
-                                break;
-                            }
-                        }
-                        if !all_sectors_ok {
-                            // Failed to read the full root directory; abort relocation.
-                            unsafe { (bs.free_pool)(relocated_ptr); }
-                            print_raw(st, b"[premount] relocation read failed\r\n\0");
-                        } else {
-                        // Build the synthetic entry at the end of the relocated data
-                        let insert_off = root_size as usize;
-                        let mut blob = [0u8; 128];
-                        let blob_len = build_premount_cpio_entry(
-                            &mut blob,
-                            vb.premount_file_sector,
-                            bundle.cpio_size as u32,
-                        );
-                        reloc[insert_off..insert_off + blob_len as usize].copy_from_slice(&blob[..blob_len as usize]);
-                        let new_root_size = insert_off as u32 + blob_len;
-
-                        let relocated_start = (vb.media.bim_lb + 1) as u32;
-                        vb.media.bim_lb = relocated_start as u64 + relocated_sectors as u64 - 1;
-                        vb.premount_root_relocated = true;
-                        vb.premount_root_buf = relocated_ptr as *mut u8;
-                        vb.premount_root_buf_size = relocated_bytes;
-                        vb.premount_root_sectors = relocated_sectors;
-                        vb.premount_root_start_sector = relocated_start;
-                        vb.premount_new_root_size = new_root_size;
-                        vb.premount_entry_injected = false; // synthetic entry is in reloc, not a separate injected sector
-
-                        if !sfs_instance.is_null() {
-                            let sfs = unsafe { &mut *sfs_instance };
-                            sfs.ctx.premount_cpio_buf = bundle.cpio_buf;
-                            sfs.ctx.premount_cpio_size = bundle.cpio_size;
-                            sfs.ctx.premount_target_name = *b"PREMOUNT.CPIO___";
-                            sfs.ctx.premount_target_name_len = 13;
-                        }
-
-                        print_raw(st, b"[premount] root dir relocated to sector=\0");
-                        print_dec(st, relocated_start as u64);
-                        print_raw(st, b" sectors=\0");
-                        print_dec(st, relocated_sectors as u64);
-                        print_raw(st, b" new_root_size=\0");
-                        print_dec(st, new_root_size as u64);
-                        print_raw(st, b"\r\n\0");
-                        }
-                    }
-                }
-            }
-        }
-    }
-
+    // ── Build locator and patch grub.cfg first ──
+    // This must happen before initrd extension setup so vb.patched_file_buf is populated
     let locator = FileBackedIsoLocator::from_payload_entry(
         &files[idx],
         *partition_guid,
         partition_number, part1_lba,
+        is_mbr,
     );
     let iso_loc = locator.locate();
 
     patch_grub_cfg_blockio(st, bs, vbio_ptr, sfs_instance, bio_ref, bio_ptr, mid, iso_lba, iso_name,
         Some(&iso_loc), boot_kind);
+
+    // ── Initrd extension: append premount CPIO to original initrd ──
+    // Instead of injecting PREMOUNT.CPIO into the ISO directory (fragile),
+    // we patch the initrd file's directory entry to report a larger size.
+    // The virtual Block I/O layer serves the premount CPIO data at sectors
+    // beyond the original initrd file.  This works regardless of ISO structure.
+    if !vbio_ptr.is_null() && premount_bundle.is_some() {
+        let vb = unsafe { &mut *vbio_ptr };
+        let bundle = premount_bundle.as_ref().unwrap();
+
+        // Store premount CPIO data in VirtualBlockIo
+        vb.premount_cpio_buf = bundle.cpio_buf;
+        vb.premount_cpio_size = bundle.cpio_size as u32;
+
+        // Place CPIO data beyond the current ISO media end to avoid overlapping existing files
+        let cpio_sectors = ((bundle.cpio_size as u64 + 2047) / 2048) as u32;
+        let orig_last_block = vb.media.bim_lb;
+        let cpio_start_lba = (orig_last_block + 1) as u32;
+        vb.media.bim_lb = orig_last_block + cpio_sectors as u64;
+
+        // Scan the patched grub.cfg for the first initrd line
+        let mut initrd_path: [u8; 256] = [0; 256];
+        let mut initrd_path_len = 0usize;
+
+        if !vb.patched_file_buf.is_null() && vb.patched_file_sectors > 0 {
+            let patched = unsafe {
+                core::slice::from_raw_parts(vb.patched_file_buf as *const u8, vb.patched_file_sectors as usize * 2048)
+            };
+            let mut pos = 0usize;
+            while pos < patched.len() {
+                // Look for "initrd " or "initrd\t" at the start of a line
+                let line_start = pos;
+                while pos < patched.len() && patched[pos] != b'\n' { pos += 1; }
+                let line = &patched[line_start..pos];
+                let mut ts = 0;
+                while ts < line.len() && (line[ts] == b' ' || line[ts] == b'\t') { ts += 1; }
+                if (line[ts..].starts_with(b"initrd ") || line[ts..].starts_with(b"initrd\t"))
+                    || (line[ts..].starts_with(b"initrdefi ") || line[ts..].starts_with(b"initrdefi\t"))
+                {
+                    // Extract first argument (skip "initrd"/"initrdefi" and whitespace)
+                    let mut ap = ts;
+                    while ap < line.len() && line[ap] != b' ' && line[ap] != b'\t' { ap += 1; }
+                    while ap < line.len() && (line[ap] == b' ' || line[ap] == b'\t') { ap += 1; }
+                    // Skip GRUB variable prefix like "($root)" or "($prefix)"
+                    let mut path_start = ap;
+                    if path_start < line.len() && line[path_start] == b'(' {
+                        while path_start < line.len() && line[path_start] != b')' { path_start += 1; }
+                        if path_start < line.len() { path_start += 1; } // skip ')'
+                    }
+                    // Skip leading '/'
+                    while path_start < line.len() && line[path_start] == b'/' { path_start += 1; }
+                    let mut path_end = path_start;
+                    while path_end < line.len() && line[path_end] != b' ' && line[path_end] != b'\t' && line[path_end] != b'\n' && line[path_end] != b'\r' {
+                        path_end += 1;
+                    }
+                    let plen = path_end - path_start;
+                    if plen > 0 && plen < 256 {
+                        initrd_path[..plen].copy_from_slice(&line[path_start..path_end]);
+                        initrd_path_len = plen;
+                    }
+                    break;
+                }
+                if pos < patched.len() { pos += 1; }
+            }
+        }
+
+        if initrd_path_len > 0 {
+            // Find the initrd file in the ISO directory tree
+            // Split path into components: "boot/x86_64/loader/initrd" or "casper/initrd"
+            let mut components: [&[u8]; 16] = [b""; 16];
+            let mut comp_count = 0usize;
+            let mut seg_start = 0usize;
+            for i in 0..=initrd_path_len {
+                if i == initrd_path_len || initrd_path[i] == b'/' {
+                    if i > seg_start {
+                        if comp_count < 16 {
+                            components[comp_count] = &initrd_path[seg_start..i];
+                            comp_count += 1;
+                        }
+                    }
+                    seg_start = i + 1;
+                }
+            }
+
+            if comp_count > 0 {
+                let filename = components[comp_count - 1];
+                let parent_components = &components[..comp_count - 1];
+
+                let mut pvd = [0u8; 2048];
+                if read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, 16, &mut pvd)
+                    && pvd[0] == 1 && &pvd[1..6] == b"CD001"
+                {
+                    let root_lba = u32::from_le_bytes(pvd[158..162].try_into().unwrap());
+                    let root_size = u32::from_le_bytes(pvd[166..170].try_into().unwrap());
+                    let mut scratch = [0u8; 2048];
+
+                    // Traverse parent directories
+                    let mut dir_lba = root_lba;
+                    let mut dir_size = root_size;
+                    let mut found = true;
+                    for &comp in parent_components {
+                        let comp_upper: [u8; 64] = {
+                            let mut buf = [0u8; 64];
+                            let len = comp.len().min(64);
+                            for i in 0..len { buf[i] = comp[i].to_ascii_uppercase(); }
+                            buf
+                        };
+                        if let Some((cl, cs)) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, dir_lba, dir_size, &comp_upper[..comp.len().min(64)], &mut scratch) {
+                            dir_lba = cl;
+                            dir_size = cs;
+                        } else {
+                            found = false;
+                            break;
+                        }
+                    }
+
+                    if found {
+                        // Look up the initrd file in the final directory
+                        let filename_upper: [u8; 128] = {
+                            let mut buf = [0u8; 128];
+                            let len = filename.len().min(128);
+                            for i in 0..len { buf[i] = filename[i].to_ascii_uppercase(); }
+                            buf
+                        };
+                        if let Some((file_lba, file_size, entry_sector, entry_offset)) =
+                            find_in_dir_with_loc(bio_ref, bio_ptr, mid, iso_lba, dir_lba, dir_size, &filename_upper[..filename.len().min(128)], &mut scratch)
+                        {
+                            // Set up initrd extension in VirtualBlockIo
+                            vb.initrd_base_lba = file_lba;
+                            vb.initrd_orig_size = file_size;
+                            vb.initrd_ext_sectors = cpio_sectors;
+                            vb.initrd_cpio_start_lba = cpio_start_lba;
+                            vb.initrd_entry_sector = entry_sector;
+                            vb.initrd_entry_offset = entry_offset;
+                            vb.initrd_ext_active = true;
+
+                            print_raw(st, b"[initrd] extending \0");
+                            print_raw(st, &initrd_path[..initrd_path_len.min(60)]);
+                            print_raw(st, b" lba=\0");
+                            print_dec(st, file_lba as u64);
+                            print_raw(st, b" + \0");
+                            print_dec(st, cpio_sectors as u64);
+                            print_raw(st, b" sectors (premount CPIO)\r\n\0");
+                        } else {
+                            print_raw(st, b"[initrd] file not found in ISO\r\n\0");
+                        }
+                    } else {
+                        print_raw(st, b"[initrd] parent directory not found\r\n\0");
+                    }
+                }
+            }
+        } else {
+            print_raw(st, b"[initrd] no initrd line in patched config\r\n\0");
+        }
+    }
 
     let (efi_lba, efi_size, efi_filename) = match find_efi_boot(st, bio_ref, bio_ptr, mid, iso_lba, boot_kind) {
         Some(v) => v,
@@ -1660,9 +1689,10 @@ pub fn boot_iso(
     mid: u32,
     partition_guid: &crate::protocol::Guid,
     partition_number: u32,
+    is_mbr: bool,
 ) {
     print_raw(st, b"\r\nBooting ISO (UEFI chainload)...\r\n\0");
-    uefi_chainload_iso(st, image_handle, part1_lba, files, idx, bio_ref, bio_ptr, mid, partition_guid, partition_number);
+    uefi_chainload_iso(st, image_handle, part1_lba, files, idx, bio_ref, bio_ptr, mid, partition_guid, partition_number, is_mbr);
 }
 
 use crate::fs::scan_payloads;
@@ -1679,6 +1709,7 @@ pub fn show_payload_menu(
     mid: u32,
     partition_guid: &crate::protocol::Guid,
     partition_number: u32,
+    is_mbr: bool,
 ) -> ! {
     if count == 0 {
         print_raw(st, b"\r\nNo bootable payloads found on partition 1.\r\n\0");
@@ -1728,7 +1759,7 @@ pub fn show_payload_menu(
                     print_raw(st, b"\r\nPayload type not yet implemented. Press any key to continue...\r\n\0");
                     continue;
                 }
-                boot_payload_by_type(st, image_handle, disk_handle, ctx.part1_lba, payloads, idx, bio_ref, bio_ptr, mid, partition_guid, partition_number);
+                boot_payload_by_type(st, image_handle, disk_handle, ctx.part1_lba, payloads, idx, bio_ref, bio_ptr, mid, partition_guid, partition_number, is_mbr);
             }
         } else if ch == b'0' && count >= 10 {
             let is_supported = matches!(payloads[9].payload_type, PayloadType::Iso | PayloadType::Efi);
@@ -1736,7 +1767,7 @@ pub fn show_payload_menu(
                 print_raw(st, b"\r\nPayload type not yet implemented. Press any key to continue...\r\n\0");
                 continue;
             }
-            boot_payload_by_type(st, image_handle, disk_handle, ctx.part1_lba, payloads, 9, bio_ref, bio_ptr, mid, partition_guid, partition_number);
+            boot_payload_by_type(st, image_handle, disk_handle, ctx.part1_lba, payloads, 9, bio_ref, bio_ptr, mid, partition_guid, partition_number, is_mbr);
         } else if ch == b'r' || ch == b'R' {
             print_raw(st, b"\r\nRe-scanning...\r\n\0");
             let mut new_payloads: [PayloadEntry; PAYLOAD_SLOT_COUNT] = [PayloadEntry {
@@ -1745,7 +1776,7 @@ pub fn show_payload_menu(
             }; PAYLOAD_SLOT_COUNT];
             let mut new_count: usize = 0;
             scan_payloads(bio_ref, bio_ptr, mid, ctx, &mut new_payloads, &mut new_count);
-            show_payload_menu(st, image_handle, disk_handle, &new_payloads, new_count, ctx, bio_ref, bio_ptr, mid, partition_guid, partition_number);
+            show_payload_menu(st, image_handle, disk_handle, &new_payloads, new_count, ctx, bio_ref, bio_ptr, mid, partition_guid, partition_number, is_mbr);
         }
     }
 }

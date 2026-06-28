@@ -170,6 +170,26 @@ fn read_gpt_entries_with_index<T>(
     None
 }
 
+/// Read MBR disk signature and convert to GUID for PARTUUID matching.
+/// Linux MBR PARTUUID convention:
+///   - 4-byte disk signature at offset 0x1B8 (bytes 440-443)
+///   - Partition number at offset 0x1BC (typically 2 hex digits)
+///   - Formatted as: <sig_hex_le>-<partnum_hex> e.g. "aabbccdd-01"
+/// For GUID representation, store the raw 4-byte disk signature in d4[4..8].
+pub fn read_mbr_guid(mbr: &[u8; 512]) -> crate::protocol::Guid {
+    let disk_sig: [u8; 4] = mbr[440..444].try_into().unwrap();
+    crate::protocol::Guid {
+        d1: 0,
+        d2: 0,
+        d3: 0,
+        d4: {
+            let mut d4 = [0u8; 8];
+            d4[4..8].copy_from_slice(&disk_sig);
+            d4
+        },
+    }
+}
+
 /// Read the unique partition GUID from a GPT entry at byte offset boff in sec.
 fn read_partition_guid(sec: &[u8; 512], boff: usize) -> crate::protocol::Guid {
     crate::protocol::Guid {

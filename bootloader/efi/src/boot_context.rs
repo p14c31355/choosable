@@ -38,6 +38,8 @@ pub struct BootContext {
     pub partition_guid: Guid,
     /// 1-based partition number (for fallback if no GPT)
     pub partition_number: u32,
+    /// false = GPT, true = MBR (affects PARTUUID format)
+    pub is_mbr: bool,
     pub fs_type: Option<FsType>,
 
     // ── Filesystem ────────────────────────────────────────────────────
@@ -63,6 +65,7 @@ impl BootContext {
             partition_start_lba: 0,
             partition_guid: Guid { d1: 0, d2: 0, d3: 0, d4: [0; 8] },
             partition_number: 0,
+            is_mbr: false,
             fs_type: None,
             fs_ctx: None,
             payloads: [PayloadEntry {

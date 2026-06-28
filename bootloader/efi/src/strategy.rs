@@ -23,6 +23,9 @@ pub struct PatchInput<'a> {
     pub live_media_uuid: &'a [u8; 10],
     pub iso_location: Option<&'a IsoLocation>,
     pub premount_target_name: &'a [u8],
+    /// If non-empty, prepend this line (e.g. "set prefix=...\n")
+    /// at the beginning of the patched output.
+    pub prefix_set_line: &'a [u8],
 }
 
 pub struct PatchOutput {
@@ -93,6 +96,7 @@ fn remove_iso_locator_args(out: &mut [u8], line_start: usize, dst: &mut usize) {
     let patterns: &[&[u8]] = &[
         b"findiso=", b"iso-scan/filename=", b"choosable.iso_offset=",
         b"choosable.part_guid=", b"choosable.part_num=", b"choosable.iso_path=", b"choosable.iso_size=",
+        b"root=live:", // Fedora BLS original root= overrides our injected value
     ];
 
     let mut pos = line_start;
@@ -208,6 +212,16 @@ fn patch_grub_cfg_impl(
     let mut src = 0usize;
     let mut dst = 0usize;
 
+    // Prepend prefix set line (e.g. "set prefix=(cd0)/boot/grub2\n") for
+    // distros whose GRUB prefix defaults to an unreadable filesystem.
+    if !inp.prefix_set_line.is_empty() {
+        let plen = inp.prefix_set_line.len().min(out_cap.saturating_sub(dst));
+        if plen > 0 {
+            out[dst..dst + plen].copy_from_slice(&inp.prefix_set_line[..plen]);
+            dst += plen;
+        }
+    }
+
     while src < orig.len() {
         let ch = orig[src];
         out[dst] = ch;
@@ -310,19 +324,10 @@ fn patch_grub_cfg_impl(
                     shift_and_inject(out, inject_at, &mut dst, &opt_buf[..ob]);
                 }
             }
-            else if (t.starts_with(b"initrd ") || t.starts_with(b"initrd\t")
-                || t.starts_with(b"initrdefi ") || t.starts_with(b"initrdefi\t"))
-                && !effective_target.is_empty()
-                && dedup_slice.len() <= line.len()
-                && !line.windows(dedup_slice.len()).any(|w| w == dedup_slice)
-            {
-                let mut inject_at = dst;
-                if dst > 0 && out[dst - 1] == b'\n' {
-                    inject_at -= 1;
-                    if dst > 1 && out[dst - 2] == b'\r' { inject_at -= 1; }
-                }
-                shift_and_inject(out, inject_at, &mut dst, initrd_extra);
-            }
+            // NOTE: initrd extension (/PREMOUNT.CPIO append) is no longer done here.
+            // The premount CPIO is now served as extended sectors appended to the
+            // original initrd file via directory-entry size patching in VirtualBlockIo.
+            // This avoids fragile ISO root-directory injection.
         }
     }
 
@@ -367,6 +372,7 @@ pub fn patch_grub_cfg(
     iso_location: Option<&IsoLocation>,
     premount_target_name: &[u8],
     bs: *mut BootServices,
+    prefix_set_line: &[u8],
 ) -> Option<PatchOutput> {
     let is_popos = boot_kind == BootKind::Casper
         && matches_any_lower(iso_name, &[b"pop", b"pop-os", b"popos"]);
@@ -385,6 +391,7 @@ pub fn patch_grub_cfg(
         live_media_uuid: &live_media_uuid,
         iso_location,
         premount_target_name,
+        prefix_set_line,
     };
 
     patch_grub_cfg_impl(&inp, &linux_extra, linux_eol_extra, premount_target_name)
