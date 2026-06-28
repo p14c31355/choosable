@@ -173,7 +173,7 @@ fn patch_grub_cfg_impl(
                 eol_buf[plen..plen + pl].copy_from_slice(&path[..pl]);
                 &eol_buf[..plen + pl]
             } else if linux_eol_extra == b" iso-scan/filename=" {
-                let fname = loc.file_name(); let pl = fname.len().min(320 - plen);
+                let fname = loc.path_without_leading_slash(); let pl = fname.len().min(320 - plen);
                 eol_buf[..plen].copy_from_slice(linux_eol_extra);
                 eol_buf[plen..plen + pl].copy_from_slice(&fname[..pl]);
                 &eol_buf[..plen + pl]
@@ -324,10 +324,13 @@ fn patch_grub_cfg_impl(
                     shift_and_inject(out, inject_at, &mut dst, &opt_buf[..ob]);
                 }
             }
-            // NOTE: initrd extension (/PREMOUNT.CPIO append) is no longer done here.
-            // The premount CPIO is now served as extended sectors appended to the
-            // original initrd file via directory-entry size patching in VirtualBlockIo.
-            // This avoids fragile ISO root-directory injection.
+            // NOTE: initrd line modification (/PREMOUNT.CPIO append) is NOT done here.
+            // GRUB uses its own ISO9660 driver (not EFI SFS), so synthetic SFS files
+            // are invisible to GRUB. Instead, the premount CPIO is delivered by
+            // patching the initrd file's directory entry at the Block I/O level
+            // (see try_extend_initrd_in_iso in iso.rs).  When that fails, the system
+            // boots without premount-init, falling back to the distro's native
+            // boot mechanisms.
         }
     }
 

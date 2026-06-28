@@ -470,6 +470,144 @@ fn build_premount_cpio_entry(
     (record_len as u32) + 1 // record (46) + EOD (1) = 47
 }
 
+/// Try to find the initrd file in the ISO directory tree and patch its
+/// directory entry so extra CPIO sectors are served after the original file.
+/// Returns true if the initrd was found and extended successfully.
+fn try_extend_initrd_in_iso(
+    st: &mut SystemTable,
+    bs: &mut BootServices,
+    vb: &mut crate::protocol::VirtualBlockIo,
+    bio_ref: &BlockIoProtocol,
+    bio_ptr: *mut BlockIoProtocol,
+    mid: u32,
+    iso_lba: u64,
+    cpio_size: u32,
+) -> bool {
+    if vb.patched_file_buf.is_null() || vb.patched_file_sectors == 0 {
+        return false;
+    }
+
+    // Scan the patched config for the first initrd line
+    let patched = unsafe {
+        core::slice::from_raw_parts(vb.patched_file_buf as *const u8, vb.patched_file_sectors as usize * 2048)
+    };
+    let mut initrd_path: [u8; 256] = [0; 256];
+    let mut initrd_path_len = 0usize;
+    let mut pos = 0usize;
+
+    while pos < patched.len() {
+        let line_start = pos;
+        while pos < patched.len() && patched[pos] != b'\n' { pos += 1; }
+        let line = &patched[line_start..pos];
+        let mut ts = 0;
+        while ts < line.len() && (line[ts] == b' ' || line[ts] == b'\t') { ts += 1; }
+        if (line[ts..].starts_with(b"initrd ") || line[ts..].starts_with(b"initrd\t"))
+            || (line[ts..].starts_with(b"initrdefi ") || line[ts..].starts_with(b"initrdefi\t"))
+        {
+            let mut ap = ts;
+            while ap < line.len() && line[ap] != b' ' && line[ap] != b'\t' { ap += 1; }
+            while ap < line.len() && (line[ap] == b' ' || line[ap] == b'\t') { ap += 1; }
+            let mut path_start = ap;
+            if path_start < line.len() && line[path_start] == b'(' {
+                while path_start < line.len() && line[path_start] != b')' { path_start += 1; }
+                if path_start < line.len() { path_start += 1; }
+            }
+            while path_start < line.len() && line[path_start] == b'/' { path_start += 1; }
+            let mut path_end = path_start;
+            while path_end < line.len() && line[path_end] != b' ' && line[path_end] != b'\t' && line[path_end] != b'\n' && line[path_end] != b'\r' {
+                path_end += 1;
+            }
+            let plen = path_end - path_start;
+            if plen > 0 && plen < 256 {
+                initrd_path[..plen].copy_from_slice(&line[path_start..path_end]);
+                initrd_path_len = plen;
+            }
+            break;
+        }
+        if pos < patched.len() { pos += 1; }
+    }
+
+    if initrd_path_len == 0 {
+        print_raw(st, b"[initrd] no initrd line in patched config\r\n\0");
+        return false;
+    }
+
+    // Split path into components
+    let mut components: [&[u8]; 16] = [b""; 16];
+    let mut comp_count = 0usize;
+    let mut seg_start = 0usize;
+    for i in 0..=initrd_path_len {
+        if i == initrd_path_len || initrd_path[i] == b'/' {
+            if i > seg_start && comp_count < 16 {
+                components[comp_count] = &initrd_path[seg_start..i];
+                comp_count += 1;
+            }
+            seg_start = i + 1;
+        }
+    }
+    if comp_count == 0 { return false; }
+
+    let filename = components[comp_count - 1];
+    let parent_components = &components[..comp_count - 1];
+
+    let mut pvd = [0u8; 2048];
+    if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, 16, &mut pvd)
+        || pvd[0] != 1 || &pvd[1..6] != b"CD001"
+    {
+        print_raw(st, b"[initrd] PVD read failed\r\n\0");
+        return false;
+    }
+    let root_lba = u32::from_le_bytes(pvd[158..162].try_into().unwrap());
+    let root_size = u32::from_le_bytes(pvd[166..170].try_into().unwrap());
+    let mut scratch = [0u8; 2048];
+
+    // Traverse parent directories
+    let mut dir_lba = root_lba;
+    let mut dir_size = root_size;
+    for &comp in parent_components {
+        let mut comp_upper = [0u8; 64];
+        let len = comp.len().min(64);
+        for i in 0..len { comp_upper[i] = comp[i].to_ascii_uppercase(); }
+        match find_in_dir(bio_ref, bio_ptr, mid, iso_lba, dir_lba, dir_size, &comp_upper[..len], &mut scratch) {
+            Some((cl, cs)) => { dir_lba = cl; dir_size = cs; }
+            None => {
+                print_raw(st, b"[initrd] parent dir not found\r\n\0");
+                return false;
+            }
+        }
+    }
+
+    // Look up initrd file
+    let mut filename_upper = [0u8; 128];
+    let flen = filename.len().min(128);
+    for i in 0..flen { filename_upper[i] = filename[i].to_ascii_uppercase(); }
+    match find_in_dir_with_loc(bio_ref, bio_ptr, mid, iso_lba, dir_lba, dir_size, &filename_upper[..flen], &mut scratch) {
+        Some((file_lba, file_size, entry_sector, entry_offset)) => {
+            let cpio_sectors = ((cpio_size as u64 + 2047) / 2048) as u32;
+            vb.initrd_base_lba = file_lba;
+            vb.initrd_orig_size = file_size;
+            vb.initrd_ext_sectors = cpio_sectors;
+            vb.initrd_entry_sector = entry_sector;
+            vb.initrd_entry_offset = entry_offset;
+            vb.initrd_ext_active = true;
+            print_raw(st, b"[initrd] extending \0");
+            print_raw(st, &initrd_path[..initrd_path_len.min(60)]);
+            print_raw(st, b" lba=\0");
+            print_dec(st, file_lba as u64);
+            print_raw(st, b" + \0");
+            print_dec(st, cpio_sectors as u64);
+            print_raw(st, b" sectors\r\n\0");
+            true
+        }
+        None => {
+            print_raw(st, b"[initrd] file not found in ISO: \0");
+            print_raw(st, &initrd_path[..initrd_path_len.min(60)]);
+            print_raw(st, b"\r\n\0");
+            false
+        }
+    }
+}
+
 fn find_efi_boot(
     st: &mut SystemTable,
     bio_ref: &BlockIoProtocol,
@@ -825,28 +963,12 @@ fn patch_grub_cfg_blockio(
         // which GRUB cannot read.  Set prefix to the virtual CD-ROM so BLS
         // entries (at $prefix/loader/entries/) are found on the ISO.
         let prefix_set_line = if boot_kind == crate::boot_kind::BootKind::FedoraLive {
-            let path_str = core::str::from_utf8(&entries[i].path[..entries[i].path_len]).unwrap_or("");
-            if let Some(dir_end) = path_str.rfind('/') {
-                let dir = &path_str[..dir_end];
-                let mut lp = 0usize;
-                // set root=(cd0)
-                let root_line = b"set root=(cd0)\n";
-                fedora_prefix_line[lp..lp + root_line.len()].copy_from_slice(root_line);
-                lp += root_line.len();
-                // set prefix=(cd0)/boot/grub2 (or wherever the config is)
-                let prefix_start = b"set prefix=(cd0)";
-                fedora_prefix_line[lp..lp + prefix_start.len()].copy_from_slice(prefix_start);
-                lp += prefix_start.len();
-                let dir_bytes = dir.as_bytes();
-                let dlen = dir_bytes.len().min(96 - lp - 1);
-                fedora_prefix_line[lp..lp + dlen].copy_from_slice(&dir_bytes[..dlen]);
-                lp += dlen;
-                fedora_prefix_line[lp] = b'\n';
-                lp += 1;
-                &fedora_prefix_line[..lp]
-            } else {
-                b""
-            }
+            // GRUB's default prefix on Fedora may point to the exFAT partition
+            // which GRUB cannot read.  Force root to the virtual CD-ROM so
+            // that blscfg finds entries at /loader/entries/ on the ISO root.
+            fedora_prefix_line[..31].copy_from_slice(b"set root=(cd0)\nset prefix=(cd0)");
+            fedora_prefix_line[31] = b'\n';
+            &fedora_prefix_line[..32]
         } else {
             b""
         };
@@ -1383,158 +1505,24 @@ fn uefi_chainload_iso(
     patch_grub_cfg_blockio(st, bs, vbio_ptr, sfs_instance, bio_ref, bio_ptr, mid, iso_lba, iso_name,
         Some(&iso_loc), boot_kind);
 
-    // ── Initrd extension: append premount CPIO to original initrd ──
-    // Instead of injecting PREMOUNT.CPIO into the ISO directory (fragile),
-    // we patch the initrd file's directory entry to report a larger size.
-    // The virtual Block I/O layer serves the premount CPIO data at sectors
-    // beyond the original initrd file.  This works regardless of ISO structure.
+    // ── Inject premount CPIO into initramfs via initrd extension ──
+    // Patch the initrd file's directory entry to report a larger size.
+    // GRUB reads the extended initrd through the virtual Block I/O, and
+    // the VBio serves the premount CPIO data at sectors beyond the
+    // original file.  This works at the Block I/O level and is visible
+    // to GRUB's own ISO9660 driver.  If the initrd file is not found in
+    // the ISO (some distros use unusual initrd paths), we skip premount.
     if !vbio_ptr.is_null() && premount_bundle.is_some() {
         let vb = unsafe { &mut *vbio_ptr };
         let bundle = premount_bundle.as_ref().unwrap();
-
-        // Store premount CPIO data in VirtualBlockIo
         vb.premount_cpio_buf = bundle.cpio_buf;
         vb.premount_cpio_size = bundle.cpio_size as u32;
 
-        // Place CPIO data beyond the current ISO media end to avoid overlapping existing files
-        let cpio_sectors = ((bundle.cpio_size as u64 + 2047) / 2048) as u32;
-        let orig_last_block = vb.media.bim_lb;
-        let cpio_start_lba = (orig_last_block + 1) as u32;
-        vb.media.bim_lb = orig_last_block + cpio_sectors as u64;
-
-        // Scan the patched grub.cfg for the first initrd line
-        let mut initrd_path: [u8; 256] = [0; 256];
-        let mut initrd_path_len = 0usize;
-
-        if !vb.patched_file_buf.is_null() && vb.patched_file_sectors > 0 {
-            let patched = unsafe {
-                core::slice::from_raw_parts(vb.patched_file_buf as *const u8, vb.patched_file_sectors as usize * 2048)
-            };
-            let mut pos = 0usize;
-            while pos < patched.len() {
-                // Look for "initrd " or "initrd\t" at the start of a line
-                let line_start = pos;
-                while pos < patched.len() && patched[pos] != b'\n' { pos += 1; }
-                let line = &patched[line_start..pos];
-                let mut ts = 0;
-                while ts < line.len() && (line[ts] == b' ' || line[ts] == b'\t') { ts += 1; }
-                if (line[ts..].starts_with(b"initrd ") || line[ts..].starts_with(b"initrd\t"))
-                    || (line[ts..].starts_with(b"initrdefi ") || line[ts..].starts_with(b"initrdefi\t"))
-                {
-                    // Extract first argument (skip "initrd"/"initrdefi" and whitespace)
-                    let mut ap = ts;
-                    while ap < line.len() && line[ap] != b' ' && line[ap] != b'\t' { ap += 1; }
-                    while ap < line.len() && (line[ap] == b' ' || line[ap] == b'\t') { ap += 1; }
-                    // Skip GRUB variable prefix like "($root)" or "($prefix)"
-                    let mut path_start = ap;
-                    if path_start < line.len() && line[path_start] == b'(' {
-                        while path_start < line.len() && line[path_start] != b')' { path_start += 1; }
-                        if path_start < line.len() { path_start += 1; } // skip ')'
-                    }
-                    // Skip leading '/'
-                    while path_start < line.len() && line[path_start] == b'/' { path_start += 1; }
-                    let mut path_end = path_start;
-                    while path_end < line.len() && line[path_end] != b' ' && line[path_end] != b'\t' && line[path_end] != b'\n' && line[path_end] != b'\r' {
-                        path_end += 1;
-                    }
-                    let plen = path_end - path_start;
-                    if plen > 0 && plen < 256 {
-                        initrd_path[..plen].copy_from_slice(&line[path_start..path_end]);
-                        initrd_path_len = plen;
-                    }
-                    break;
-                }
-                if pos < patched.len() { pos += 1; }
-            }
-        }
-
-        if initrd_path_len > 0 {
-            // Find the initrd file in the ISO directory tree
-            // Split path into components: "boot/x86_64/loader/initrd" or "casper/initrd"
-            let mut components: [&[u8]; 16] = [b""; 16];
-            let mut comp_count = 0usize;
-            let mut seg_start = 0usize;
-            for i in 0..=initrd_path_len {
-                if i == initrd_path_len || initrd_path[i] == b'/' {
-                    if i > seg_start {
-                        if comp_count < 16 {
-                            components[comp_count] = &initrd_path[seg_start..i];
-                            comp_count += 1;
-                        }
-                    }
-                    seg_start = i + 1;
-                }
-            }
-
-            if comp_count > 0 {
-                let filename = components[comp_count - 1];
-                let parent_components = &components[..comp_count - 1];
-
-                let mut pvd = [0u8; 2048];
-                if read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, 16, &mut pvd)
-                    && pvd[0] == 1 && &pvd[1..6] == b"CD001"
-                {
-                    let root_lba = u32::from_le_bytes(pvd[158..162].try_into().unwrap());
-                    let root_size = u32::from_le_bytes(pvd[166..170].try_into().unwrap());
-                    let mut scratch = [0u8; 2048];
-
-                    // Traverse parent directories
-                    let mut dir_lba = root_lba;
-                    let mut dir_size = root_size;
-                    let mut found = true;
-                    for &comp in parent_components {
-                        let comp_upper: [u8; 64] = {
-                            let mut buf = [0u8; 64];
-                            let len = comp.len().min(64);
-                            for i in 0..len { buf[i] = comp[i].to_ascii_uppercase(); }
-                            buf
-                        };
-                        if let Some((cl, cs)) = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, dir_lba, dir_size, &comp_upper[..comp.len().min(64)], &mut scratch) {
-                            dir_lba = cl;
-                            dir_size = cs;
-                        } else {
-                            found = false;
-                            break;
-                        }
-                    }
-
-                    if found {
-                        // Look up the initrd file in the final directory
-                        let filename_upper: [u8; 128] = {
-                            let mut buf = [0u8; 128];
-                            let len = filename.len().min(128);
-                            for i in 0..len { buf[i] = filename[i].to_ascii_uppercase(); }
-                            buf
-                        };
-                        if let Some((file_lba, file_size, entry_sector, entry_offset)) =
-                            find_in_dir_with_loc(bio_ref, bio_ptr, mid, iso_lba, dir_lba, dir_size, &filename_upper[..filename.len().min(128)], &mut scratch)
-                        {
-                            // Set up initrd extension in VirtualBlockIo
-                            vb.initrd_base_lba = file_lba;
-                            vb.initrd_orig_size = file_size;
-                            vb.initrd_ext_sectors = cpio_sectors;
-                            vb.initrd_cpio_start_lba = cpio_start_lba;
-                            vb.initrd_entry_sector = entry_sector;
-                            vb.initrd_entry_offset = entry_offset;
-                            vb.initrd_ext_active = true;
-
-                            print_raw(st, b"[initrd] extending \0");
-                            print_raw(st, &initrd_path[..initrd_path_len.min(60)]);
-                            print_raw(st, b" lba=\0");
-                            print_dec(st, file_lba as u64);
-                            print_raw(st, b" + \0");
-                            print_dec(st, cpio_sectors as u64);
-                            print_raw(st, b" sectors (premount CPIO)\r\n\0");
-                        } else {
-                            print_raw(st, b"[initrd] file not found in ISO\r\n\0");
-                        }
-                    } else {
-                        print_raw(st, b"[initrd] parent directory not found\r\n\0");
-                    }
-                }
-            }
-        } else {
-            print_raw(st, b"[initrd] no initrd line in patched config\r\n\0");
+        if !try_extend_initrd_in_iso(
+            st, bs, vb, bio_ref, bio_ptr, mid, iso_lba,
+            bundle.cpio_size as u32)
+        {
+            print_raw(st, b"[premount] initrd not found, booting without premount\r\n\0");
         }
     }
 

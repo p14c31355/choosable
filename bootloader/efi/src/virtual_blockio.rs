@@ -294,10 +294,13 @@ unsafe extern "efiapi" fn vblock_read(
             dst[off + 80..off + 84].copy_from_slice(&new_vol_size.to_le_bytes());
             dst[off + 84..off + 88].copy_from_slice(&new_vol_size.to_be_bytes());
 
-            // If initrd extension is active, update initrd file's
-            // PVD root directory record size so GRUB can find it.
-            // (The actual initrd directory entry is patched in its
-            //  parent directory sector, not in PVD root record.)
+            // Volume Label (bytes 40-71): write "CHOOSABLE" so that
+            // root=live:CDLABEL=CHOOSABLE (used by Fedora dracut)
+            // matches this virtual CD-ROM.
+            let label = b"CHOOSABLE";
+            let mut label_buf = [0x20u8; 32];
+            label_buf[..label.len()].copy_from_slice(label);
+            dst[off + 40..off + 72].copy_from_slice(&label_buf);
         }
     }
 

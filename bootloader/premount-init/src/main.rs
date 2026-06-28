@@ -302,7 +302,7 @@ fn by_partnum(target_num: u32) -> Option<String> {
 }
 
 /// Scan all partitions (legacy fallback).
-fn scan_all(offset: u64) {
+fn scan_all(offset: u64, sizelimit: u64) {
     let Ok(data) = fs::read_to_string("/proc/partitions") else {
         console_log("cannot read /proc/partitions");
         return;
@@ -315,7 +315,7 @@ fn scan_all(offset: u64) {
             || name.starts_with("dm") || name.starts_with("sr")
         { continue; }
         let dev = format!("/dev/{}", name);
-        if let Some(loop_path) = try_mount_iso(&dev, offset) {
+        if let Some(loop_path) = try_mount_iso(&dev, offset, sizelimit) {
             if check_distro() {
                 console_log("success (fallback scan)");
                 unsafe { do_execve("/init"); }
@@ -335,8 +335,9 @@ fn scan_all(offset: u64) {
 // ── Loop + mount ───────────────────────────────────────────────────────
 
 /// Try to loopback-mount the ISO at the given partition + offset.
+/// `sizelimit` limits the loop device to `size` bytes (0 = no limit).
 /// Returns the loop device path on success, or None.
-fn try_mount_iso(dev_path: &str, offset: u64) -> Option<String> {
+fn try_mount_iso(dev_path: &str, offset: u64, sizelimit: u64) -> Option<String> {
     let Ok(df) = fs::OpenOptions::new().read(true).write(true).open(dev_path) else { return None };
     let dfd = df.as_raw_fd();
 
@@ -356,9 +357,10 @@ fn try_mount_iso(dev_path: &str, offset: u64) -> Option<String> {
     let Some((loop_path, lf)) = loop_dev else { return None };
     let lfd = lf.as_raw_fd();
 
-    if offset > 0 {
+    if offset > 0 || sizelimit > 0 {
         let mut info: LoopInfo64 = unsafe { core::mem::zeroed() };
         info.lo_offset = offset;
+        info.lo_sizelimit = sizelimit;
         info.lo_flags = LO_FLAGS_READ_ONLY;
         if unsafe { libc::ioctl(lfd, LOOP_SET_STATUS64, &info as *const LoopInfo64) } != 0 {
             unsafe { libc::ioctl(lfd, LOOP_CLR_FD, 0) };
@@ -404,6 +406,7 @@ fn main() {
     // 2. Parse kernel cmdline
     let params = parse_cmdline();
     let offset = params.iso_offset.unwrap_or(0);
+    let sizelimit = params.iso_size.unwrap_or(0);
 
     // 3. Wait for devices with retry
     let mut target: Option<String> = None;
@@ -420,7 +423,7 @@ fn main() {
     let mounted = match target {
         Some(ref dev) => {
             console_log(&format!("target: {}", dev));
-            if let Some(loop_path) = try_mount_iso(dev, offset) {
+            if let Some(loop_path) = try_mount_iso(dev, offset, sizelimit) {
                 if check_distro() {
                     true
                 } else {
@@ -432,18 +435,18 @@ fn main() {
                         unsafe { libc::ioctl(lfd, LOOP_CLR_FD, 0) };
                     }
                     console_log("target mount/check failed, falling back to scan_all");
-                    scan_all(offset);
+                    scan_all(offset, sizelimit);
                     false
                 }
             } else {
                 console_log("target mount failed, falling back to scan_all");
-                scan_all(offset);
+                scan_all(offset, sizelimit);
                 false
             }
         }
         None => {
             console_log("no PARTUUID/partnum, scanning all partitions");
-            scan_all(offset);
+            scan_all(offset, sizelimit);
             false
         }
     };
