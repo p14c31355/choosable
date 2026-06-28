@@ -177,7 +177,7 @@ fn read_gpt_entries_with_index<T>(
 ///   - Formatted as: <sig_hex_le>-<partnum_hex> e.g. "aabbccdd-01"
 /// For GUID representation, store the raw 4-byte disk signature in d4[4..8].
 pub fn read_mbr_guid(mbr: &[u8; 512]) -> crate::protocol::Guid {
-    let disk_sig = mbr[440..444].try_into().unwrap();
+    let disk_sig: [u8; 4] = mbr[440..444].try_into().unwrap();
     crate::protocol::Guid {
         d1: 0,
         d2: 0,
