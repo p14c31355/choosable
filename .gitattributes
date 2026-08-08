@@ -1,0 +1,5 @@
+# Keep GitHub's language panel focused on the implementation language.
+*.toml linguist-vendored=true
+*.lock linguist-generated=true
+*.md linguist-documentation=true
+docs/* linguist-documentation=true

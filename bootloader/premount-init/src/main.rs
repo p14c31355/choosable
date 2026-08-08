@@ -165,20 +165,36 @@ unsafe fn do_execve(path: &str) -> ! {
 fn check_distro() -> bool {
     if std::path::Path::new("/cdrom/casper").is_dir() {
         console_log("distro: casper/pop");
+        // casper normally discovers the ISO by scanning the host filesystem.
+        // Choosable has already mounted the exact ISO, so expose that mount at
+        // casper's conventional location as a deterministic fallback.
+        unsafe {
+            do_mkdir("/isodevice");
+            do_mount("/cdrom", "/isodevice", "", MS_BIND);
+        }
         return true;
     }
     if std::path::Path::new("/cdrom/live").is_dir() {
         console_log("distro: debian-live");
+        unsafe {
+            do_mkdir("/isodevice");
+            do_mount("/cdrom", "/isodevice", "", MS_BIND);
+        }
         return true;
     }
     if std::path::Path::new("/cdrom/LiveOS").is_dir() {
         console_log("distro: LiveOS (Fedora)");
-        unsafe {
-            do_mkdir("/run/initramfs");
-            do_mkdir("/run/initramfs/live");
-            do_mkdir("/run/initramfs/live/LiveOS");
-            do_mount("/cdrom/LiveOS", "/run/initramfs/live/LiveOS", "", MS_BIND);
+        if let Some(loop_path) = mounted_loop_device() {
+            // dracut needs a block device in root=live:<device>.  Keep the
+            // loop device created by Choosable alive and give it a stable
+            // name, since loop numbers are not deterministic.
+            let _ = std::fs::remove_file("/dev/choosable-live");
+            if std::os::unix::fs::symlink(&loop_path, "/dev/choosable-live").is_ok() {
+                console_log(&format!("Fedora live device: {}", loop_path));
+                return true;
+            }
         }
+        console_log("Fedora live device symlink failed");
         return true;
     }
     if std::path::Path::new("/cdrom/arch").is_dir() {
@@ -194,10 +210,37 @@ fn check_distro() -> bool {
         || std::path::Path::new("/cdrom/apks").is_dir()
     {
         console_log("distro: alpine");
+        unsafe {
+            // Alpine's initramfs expects the CD at /media/cdrom.  Mounting
+            // only /cdrom leaves it searching the original exFAT partition and
+            // produces "Mounting boot media failed".
+            do_mkdir("/media");
+            do_mkdir("/media/cdrom");
+            do_mount("/cdrom", "/media/cdrom", "", MS_BIND);
+        }
         return true;
     }
     console_log("distro: unknown, mount anyway");
     true
+}
+
+/// Return the block device backing the ISO currently mounted at /cdrom.
+/// /dev/loopN is intentionally discovered from mountinfo rather than assumed.
+fn mounted_loop_device() -> Option<String> {
+    let mounts = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    for line in mounts.lines() {
+        let Some((mount_fields, fs_fields)) = line.split_once(" - ") else { continue; };
+        let fields: Vec<&str> = mount_fields.split_whitespace().collect();
+        if fields.get(4).copied() != Some("/cdrom") {
+            continue;
+        }
+        let fs_parts: Vec<&str> = fs_fields.split_whitespace().collect();
+        let Some(source) = fs_parts.get(1).copied() else { continue; };
+        if source.starts_with("/dev/loop") {
+            return Some(source.to_string());
+        }
+    }
+    None
 }
 
 // ── Partition lookup ────────────────────────────────────────────────────
@@ -394,9 +437,8 @@ fn main() {
         do_mkdir("/tmp");
         do_mkdir("/cdrom");
         do_mkdir("/run");
-        // Mount tmpfs on /run before dracut does, so our bind mounts
-        // (/run/initramfs/live/LiveOS for Fedora, /run/archiso/bootmnt
-        // for Arch) survive when dracut skips its own tmpfs mount.
+        // Mount tmpfs on /run before distro init scripts run, so the Arch
+        // bind mount (/run/archiso/bootmnt) survives their setup.
         do_mount("tmpfs", "/run", "tmpfs", 0);
         for i in 0u32..8 {
             do_mknod_blk(&format!("/dev/loop{}", i), 7, i);

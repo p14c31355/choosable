@@ -1,5 +1,5 @@
 #![no_std]
-#![no_main]
+#![cfg_attr(not(test), no_main)]
 
 mod ata;
 mod chainload;
@@ -11,6 +11,7 @@ mod menu;
 mod part;
 mod vga;
 
+#[cfg(not(test))]
 use core::panic::PanicInfo;
 use fs::{scan_filesystem, DirEntry, FsCtx, FsType};
 
@@ -19,6 +20,7 @@ use fs::{scan_filesystem, DirEntry, FsCtx, FsType};
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[no_mangle]
+#[cfg(not(test))]
 pub extern "C" fn _start() -> ! {
     vga::vga_clear(0x07);
     vga::vga_print(0, 0, b"  Choosable Kernel v0.4  ", 0x1F);
@@ -175,6 +177,10 @@ pub extern "C" fn _start() -> ! {
     menu::show_menu(&iso_files, iso_count, &ctx);
 }
 
+#[cfg(test)]
+fn main() {}
+
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_: &PanicInfo) -> ! {
     loop {

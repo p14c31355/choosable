@@ -294,9 +294,9 @@ unsafe extern "efiapi" fn vblock_read(
             dst[off + 80..off + 84].copy_from_slice(&new_vol_size.to_le_bytes());
             dst[off + 84..off + 88].copy_from_slice(&new_vol_size.to_be_bytes());
 
-            // Volume Label (bytes 40-71): write "CHOOSABLE" so that
-            // root=live:CDLABEL=CHOOSABLE (used by Fedora dracut)
-            // matches this virtual CD-ROM.
+            // Volume Label (bytes 40-71): write "CHOOSABLE" for consumers
+            // that inspect the virtual CD-ROM's ISO9660 label. Fedora's
+            // dracut path uses the premount-created loop device instead.
             let label = b"CHOOSABLE";
             let mut label_buf = [0x20u8; 32];
             label_buf[..label.len()].copy_from_slice(label);
@@ -371,7 +371,15 @@ pub fn create_virtual_cdrom(
     }
     let vbio: &mut VirtualBlockIo = unsafe { &mut *(ptr as *mut VirtualBlockIo) };
 
-    let iso_sectors = iso_size_bytes / 2048;
+    // ISO files are normally 2048-byte aligned, but a truncated/copy-created
+    // image still needs a valid medium description.  Rounding up prevents an
+    // underflow in LastBlock and lets the final partial block be zero-padded
+    // by the backing read path.
+    let iso_sectors = iso_size_bytes.saturating_add(2047) / 2048;
+    if iso_sectors == 0 {
+        unsafe { (bs.free_pool)(dp_ptr); (bs.free_pool)(ptr); }
+        return None;
+    }
     vbio.protocol = BlockIoProtocol {
         bio_rev: 0x0001_0000_0000_0001,
         media: &mut vbio.media as *mut BlockIoMedia,

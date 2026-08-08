@@ -173,7 +173,9 @@ fn patch_grub_cfg_impl(
                 eol_buf[plen..plen + pl].copy_from_slice(&path[..pl]);
                 &eol_buf[..plen + pl]
             } else if linux_eol_extra == b" iso-scan/filename=" {
-                let fname = loc.path_without_leading_slash(); let pl = fname.len().min(320 - plen);
+                // casper expects an absolute path.  Passing `ubuntu.iso` instead
+                // of `/ubuntu.iso` makes its ISO search silently miss the file.
+                let fname = loc.path(); let pl = fname.len().min(320 - plen);
                 eol_buf[..plen].copy_from_slice(linux_eol_extra);
                 eol_buf[plen..plen + pl].copy_from_slice(&fname[..pl]);
                 &eol_buf[..plen + pl]

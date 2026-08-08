@@ -24,7 +24,10 @@ pub fn scancode_to_ascii(sc: u8) -> Option<u8> {
     match sc {
         0x02..=0x0A => Some(b'1' + (sc - 0x02)),
         0x0B => Some(b'0'),
+        0x0E => Some(8), // backspace
+        0x19 => Some(b'p'),
         0x13 => Some(b'r'),
+        0x31 => Some(b'n'),
         0x1C => Some(b'\n'),
         _ => None,
     }

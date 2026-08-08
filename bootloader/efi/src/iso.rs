@@ -252,11 +252,9 @@ fn find_first_file_in_dir(
                             && (scratch[ofs+2] | 0x20) == b'f' && (scratch[ofs+3] | 0x20) == b'i'
                     })
                     || &upper[..cl] == b"BOOTX64.EFI"
-                    || &upper[..cl] == b"BOOTIA32.EFI"
                     || &upper[..cl] == b"GRUBX64.EFI"
                     || &upper[..cl] == b"SHIMX64.EFI"
                     || &upper[..cl] == b"SYSTEMD-BOOTX64.EFI"
-                    || &upper[..cl] == b"SYSTEMD-BOOTIA32.EFI"
                     || &upper[..cl] == b"SHELLX64.EFI"
                     || &upper[..cl] == b"SHELLIA32.EFI"
                     || &upper[..cl] == b"MMX64.EFI"
@@ -647,21 +645,13 @@ fn find_efi_boot(
             b"SYSTEMD-BOOTX64.EFI",
             b"GRUBX64.EFI",
             b"SHIMX64.EFI",
-            b"BOOTIA32.EFI",
-            b"SYSTEMD-BOOTIA32.EFI",
-            b"SHELLX64.EFI",
-            b"SHELLIA32.EFI",
         ]
     } else {
         &[
             b"GRUBX64.EFI",
             b"SHIMX64.EFI",
             b"BOOTX64.EFI",
-            b"BOOTIA32.EFI",
             b"SYSTEMD-BOOTX64.EFI",
-            b"SYSTEMD-BOOTIA32.EFI",
-            b"SHELLX64.EFI",
-            b"SHELLIA32.EFI",
         ]
     };
     for &name in efi_names {
@@ -1685,6 +1675,33 @@ pub fn boot_iso(
 
 use crate::fs::scan_payloads;
 
+const MENU_PAGE_SIZE: usize = 12;
+
+fn parse_menu_number(digits: &[u8], count: usize) -> Option<usize> {
+    if digits.is_empty() || digits.len() > 3 {
+        return None;
+    }
+    let mut value = 0usize;
+    for &digit in digits {
+        if !(b'0'..=b'9').contains(&digit) {
+            return None;
+        }
+        value = value.saturating_mul(10).saturating_add((digit - b'0') as usize);
+    }
+    if value > 0 && value <= count {
+        Some(value - 1)
+    } else {
+        None
+    }
+}
+
+fn clear_payload_menu(st: &mut SystemTable) {
+    if !st.con_out.is_null() {
+        let co = unsafe { &mut *(st.con_out as *mut crate::protocol::SimpleTextOutput) };
+        unsafe { (co.sto_clear_screen)(co as *mut _) };
+    }
+}
+
 pub fn show_payload_menu(
     st: &mut SystemTable,
     image_handle: *mut c_void,
@@ -1703,68 +1720,100 @@ pub fn show_payload_menu(
         print_raw(st, b"\r\nNo bootable payloads found on partition 1.\r\n\0");
         halt_or_reboot(st);
     }
-    print_raw(st, b"\r\n=== Choosable UEFI Boot Menu ===\r\n\0");
-    for i in 0..count.min(10) {
-        let (sb, sl) = format_u64_buf((i + 1) as u64);
-        print_raw(st, b" "); print_raw(st, &sb[20 - sl..]); print_raw(st, b". ");
-        if payloads[i].name_len > 0 && payloads[i].name[0] != 0 {
-            print_raw(st, &payloads[i].name[..payloads[i].name_len]);
-        }
-        let (type_str, is_supported): (&[u8], bool) = match payloads[i].payload_type {
-            PayloadType::Iso => (b" ISO ", true),
-            PayloadType::Wim => (b" WIM  [unsupported]", false),
-            PayloadType::Vhd => (b" VHD  [unsupported]", false),
-            PayloadType::Vhdx => (b" VHDX [unsupported]", false),
-            PayloadType::Img => (b" IMG  [unsupported]", false),
-            PayloadType::Efi => (b" EFI ", true),
-        };
-        let size_mb = payloads[i].file_size / (1024 * 1024);
-        let (sb2, sl2) = format_u64_buf(size_mb);
-        print_raw(st, type_str);
-        if is_supported {
-            print_raw(st, b" ("); print_raw(st, &sb2[20 - sl2..]); print_raw(st, b" MiB)\r\n\0");
-        } else {
-            print_raw(st, b"\r\n\0");
-        }
-    }
-    print_raw(st, b"Enter number to boot (or 'r' to scan): \0");
+    let mut current_payloads = *payloads;
+    let mut current_count = count.min(PAYLOAD_SLOT_COUNT);
+    let mut page_start = 0usize;
+    let mut digits = [0u8; 3];
+    let mut digit_len = 0usize;
 
     use crate::protocol::{Key, SimpleTextInput};
     loop {
-        let mut k = Key { sc: 0, uc: 0 };
-        if !st.con_in.is_null() {
-            let ci = unsafe { &mut *(st.con_in as *mut SimpleTextInput) };
-            if unsafe { (ci.read_key_stroke)(ci as *mut _, &mut k) } != EFI_SUCCESS { continue; }
+        clear_payload_menu(st);
+        print_raw(st, b"=== Choosable UEFI Boot Menu ===\r\n\0");
+        let page_end = (page_start + MENU_PAGE_SIZE).min(current_count);
+        for i in page_start..page_end {
+            let (sb, sl) = format_u64_buf((i + 1) as u64);
+            print_raw(st, b" "); print_raw(st, &sb[20 - sl..]); print_raw(st, b". ");
+            if current_payloads[i].name_len > 0 && current_payloads[i].name[0] != 0 {
+                print_raw(st, &current_payloads[i].name[..current_payloads[i].name_len.min(120)]);
+            }
+            let (type_str, is_supported): (&[u8], bool) = match current_payloads[i].payload_type {
+                PayloadType::Iso => (b" ISO ", true),
+                PayloadType::Wim => (b" WIM  [unsupported]", false),
+                PayloadType::Vhd => (b" VHD  [unsupported]", false),
+                PayloadType::Vhdx => (b" VHDX [unsupported]", false),
+                PayloadType::Img => (b" IMG  [unsupported]", false),
+                PayloadType::Efi => (b" EFI ", true),
+            };
+            let size_mb = current_payloads[i].file_size / (1024 * 1024);
+            let (sb2, sl2) = format_u64_buf(size_mb);
+            print_raw(st, type_str);
+            if is_supported {
+                print_raw(st, b" ("); print_raw(st, &sb2[20 - sl2..]); print_raw(st, b" MiB)");
+            }
+            print_raw(st, b"\r\n\0");
         }
+        print_raw(st, b"\r\nEnter number (n/p page, r scan): ");
+        if digit_len > 0 { print_raw(st, &digits[..digit_len]); }
+
+        let mut k = Key { sc: 0, uc: 0 };
+        if st.con_in.is_null() { continue; }
+        let ci = unsafe { &mut *(st.con_in as *mut SimpleTextInput) };
+        if unsafe { (ci.read_key_stroke)(ci as *mut _, &mut k) } != EFI_SUCCESS { continue; }
         let ch = if k.uc >= 0x20 && k.uc < 0x7F { k.uc as u8 }
             else if k.uc == 0x0D || k.uc == 0x0A { b'\n' }
+            else if k.uc == 0x08 { 8 }
             else { 0 };
-        if (b'1'..=b'9').contains(&ch) {
-            let idx = (ch - b'1') as usize;
-            if idx < count {
-                let is_supported = matches!(payloads[idx].payload_type, PayloadType::Iso | PayloadType::Efi);
-                if !is_supported {
-                    print_raw(st, b"\r\nPayload type not yet implemented. Press any key to continue...\r\n\0");
+        match ch {
+            b'r' | b'R' => {
+                current_count = 0;
+                scan_payloads(bio_ref, bio_ptr, mid, ctx, &mut current_payloads, &mut current_count);
+                page_start = 0;
+                digit_len = 0;
+            }
+            b'n' | b'N' => {
+                if page_start + MENU_PAGE_SIZE < current_count { page_start += MENU_PAGE_SIZE; }
+                digit_len = 0;
+            }
+            b'p' | b'P' => {
+                page_start = page_start.saturating_sub(MENU_PAGE_SIZE);
+                digit_len = 0;
+            }
+            8 => { digit_len = digit_len.saturating_sub(1); }
+            b'0'..=b'9' if digit_len < digits.len() => {
+                digits[digit_len] = ch;
+                digit_len += 1;
+            }
+            b'\n' => {
+                let Some(idx) = parse_menu_number(&digits[..digit_len], current_count) else {
+                    digit_len = 0;
+                    continue;
+                };
+                if !matches!(current_payloads[idx].payload_type, PayloadType::Iso | PayloadType::Efi) {
+                    print_raw(st, b"\r\nPayload type not yet implemented.\r\n");
+                    digit_len = 0;
                     continue;
                 }
-                boot_payload_by_type(st, image_handle, disk_handle, ctx.part1_lba, payloads, idx, bio_ref, bio_ptr, mid, partition_guid, partition_number, is_mbr);
+                boot_payload_by_type(st, image_handle, disk_handle, ctx.part1_lba, &current_payloads, idx, bio_ref, bio_ptr, mid, partition_guid, partition_number, is_mbr);
             }
-        } else if ch == b'0' && count >= 10 {
-            let is_supported = matches!(payloads[9].payload_type, PayloadType::Iso | PayloadType::Efi);
-            if !is_supported {
-                print_raw(st, b"\r\nPayload type not yet implemented. Press any key to continue...\r\n\0");
-                continue;
-            }
-            boot_payload_by_type(st, image_handle, disk_handle, ctx.part1_lba, payloads, 9, bio_ref, bio_ptr, mid, partition_guid, partition_number, is_mbr);
-        } else if ch == b'r' || ch == b'R' {
-            print_raw(st, b"\r\nRe-scanning...\r\n\0");
-            let mut new_payloads: [PayloadEntry; PAYLOAD_SLOT_COUNT] = [PayloadEntry {
-                name: [0; 256], name_len: 0, file_start_lba: 0, file_size: 0,
-                payload_type: PayloadType::Iso,
-            }; PAYLOAD_SLOT_COUNT];
-            let mut new_count: usize = 0;
-            scan_payloads(bio_ref, bio_ptr, mid, ctx, &mut new_payloads, &mut new_count);
-            show_payload_menu(st, image_handle, disk_handle, &new_payloads, new_count, ctx, bio_ref, bio_ptr, mid, partition_guid, partition_number, is_mbr);
+            _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod menu_tests {
+    use super::parse_menu_number;
+
+    #[test]
+    fn parses_entries_beyond_ten() {
+        assert_eq!(parse_menu_number(b"12", 64), Some(11));
+        assert_eq!(parse_menu_number(b"64", 64), Some(63));
+    }
+
+    #[test]
+    fn rejects_invalid_entries() {
+        assert_eq!(parse_menu_number(b"0", 64), None);
+        assert_eq!(parse_menu_number(b"65", 64), None);
     }
 }

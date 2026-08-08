@@ -74,7 +74,10 @@ pub enum BootKind {
 
 impl BootKind {
     /// Kernel cmdline arguments to inject after the second argument on linux lines.
-    /// `is_popos` is true when the ISO filename contains "pop" or "pop-os".
+    /// `is_popos` is retained for API compatibility with older callers.  Pop!_OS
+    /// images have used several different casper directory names, so do not
+    /// manufacture a fixed `casper_path=pop-os` value here; the original ISO
+    /// entry already contains the correct `live-media-path` when one is needed.
     /// `iso_location` provides partition GUID, number, offset, path, and size for precise ISO location.
     /// Writes into `buf` and returns a slice of the used portion, or None if buffer is insufficient.
     pub fn linux_extra<'a>(&self, is_popos: bool, iso_location: Option<&crate::locator::IsoLocation>, buf: &'a mut [u8]) -> Option<&'a [u8]> {
@@ -88,15 +91,10 @@ impl BootKind {
                 // partition's filesystem type doesn't matter.  If premount
                 // fails, casper's own iso-scan/filename= fallback still runs
                 // (and may fail on exFAT if the kernel lacks exFAT support).
-                if is_popos {
-                    let chunk = b" boot=casper casper_path=pop-os maybe-ubiquity init=/init.choosable";
-                    if pos + chunk.len() > initial_cap { return None; }
-                    pos += copy_at(buf, pos, chunk);
-                } else {
-                    let chunk = b" boot=casper maybe-ubiquity init=/init.choosable";
-                    if pos + chunk.len() > initial_cap { return None; }
-                    pos += copy_at(buf, pos, chunk);
-                }
+                let _ = is_popos;
+                let chunk = b" boot=casper maybe-ubiquity init=/init.choosable";
+                if pos + chunk.len() > initial_cap { return None; }
+                pos += copy_at(buf, pos, chunk);
             }
             BootKind::DebianLive => {
                 let chunk = b" boot=live live-media=removable init=/init.choosable";
@@ -104,7 +102,12 @@ impl BootKind {
                 pos += copy_at(buf, pos, chunk);
             }
             BootKind::FedoraLive => {
-                let chunk = b" rd.live.image root=live:CDLABEL=CHOOSABLE rd.live.dir=/LiveOS rootdelay=10 init=/init.choosable";
+                // The ISO is a file on Choosable's data partition, so Linux
+                // cannot see the synthetic CD label after ExitBootServices.
+                // premount-init exposes /cdrom at dracut's live-media path;
+                // keeping a CDLABEL root here makes dracut search a device
+                // that does not exist and leaves Fedora in its emergency shell.
+                let chunk = b" root=live:/dev/choosable-live rd.live.image rd.live.dir=/LiveOS rd.live.squashimg=squashfs.img rootdelay=10 init=/init.choosable";
                 if pos + chunk.len() > initial_cap { return None; }
                 pos += copy_at(buf, pos, chunk);
             }
@@ -482,9 +485,13 @@ mod tests {
         let mut buf = [0u8; 512];
         assert_eq!(BootKind::Casper.linux_extra(false, None, &mut buf).unwrap(), b" boot=casper maybe-ubiquity init=/init.choosable");
         let mut buf2 = [0u8; 512];
-        assert_eq!(BootKind::Casper.linux_extra(true, None, &mut buf2).unwrap(), b" boot=casper casper_path=pop-os maybe-ubiquity init=/init.choosable");
+        assert_eq!(BootKind::Casper.linux_extra(true, None, &mut buf2).unwrap(), b" boot=casper maybe-ubiquity init=/init.choosable");
         let mut buf3 = [0u8; 512];
         assert_eq!(BootKind::WindowsPE.linux_extra(false, None, &mut buf3).unwrap(), b"");
+        let mut buf4 = [0u8; 512];
+        let fedora = BootKind::FedoraLive.linux_extra(false, None, &mut buf4).unwrap();
+        let root_arg = b"root=live:/dev/choosable-live";
+        assert!(fedora.windows(root_arg.len()).any(|w| w == root_arg));
         assert_eq!(BootKind::DebianLive.linux_eol_extra(), b" findiso=");
         assert_eq!(BootKind::Casper.linux_eol_extra(), b" iso-scan/filename=");
     }

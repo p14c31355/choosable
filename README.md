@@ -17,6 +17,7 @@ Just copy your image files to the USB drive and boot from them — no need to re
 - **FAT16 EFI partition**: Properly formatted VTOYEFI-equivalent partition
 - **CRC32-verified GPT**: All GPT headers written with correct checksums
 - **4K-aligned partitions**: Ensures optimal alignment for modern drives
+- **64-entry boot menu**: Select ten or more ISO files with multi-digit input and paging
 
 ## Installation
 
@@ -124,6 +125,21 @@ Choosable writes a bootable MBR (or GPT protective MBR) to the disk, creates two
 2. A small (32 MiB) FAT16 EFI partition containing the bootloader
 
 The bootloader at sector 0 scans the data partition for ISO/WIM/IMG/VHD(x)/EFI files and presents a menu at boot time.
+
+## ISO menu capacity and distro families
+
+Choosable can show up to 64 bootable payloads (the UEFI scanner also searches subdirectories). The BIOS and UEFI menus accept multi-digit numbers; use `n`/`p` to change pages and `r` to rescan. This is enough for ten or more ISOs on one drive, for example:
+
+- Ubuntu, Pop!_OS, Linux Mint
+- Debian Live, Kali Linux, MX Linux
+- Fedora Workstation, Rocky Linux, AlmaLinux
+- Arch Linux, EndeavourOS, Manjaro
+- Alpine Linux and openSUSE Tumbleweed
+- SystemRescue
+
+The boot protocol is detected from the ISO contents rather than its filename. Casper-based images receive an absolute `iso-scan/filename=/...` path, Arch no longer falls back to the EFI shell, Fedora's dracut media is exposed as `/dev/choosable-live`, and Alpine's ISO is exposed at `/media/cdrom`.
+
+For the most reliable result, keep Secure Boot disabled for unsigned or third-party ISO payloads. Verify each ISO's checksum before copying it to the data partition.
 
 ## License
 
