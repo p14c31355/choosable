@@ -16,7 +16,7 @@ use crate::fs::{FsCtx, PayloadEntry, PayloadType, PAYLOAD_SLOT_COUNT};
 use crate::output::{format_u64_buf, halt_or_reboot, print_dec, print_hex, print_raw, wait_for_keypress};
 use crate::protocol::{
     BlockIoProtocol, BootServices, LoadedImageProtocol, MemoryType, SystemTable,
-    DevicePathProtocol, VirtualBlockIo, EFI_SUCCESS, LOADED_IMAGE_PROTOCOL_GUID,
+    DevicePathProtocol, VirtualBlockIo, EFI_NOT_READY, EFI_SUCCESS, LOADED_IMAGE_PROTOCOL_GUID,
 };
 
 use crate::locator::{FileBackedIsoLocator, IsoLocator};
@@ -1702,6 +1702,28 @@ fn clear_payload_menu(st: &mut SystemTable) {
     }
 }
 
+/// Wait for one UEFI key without redrawing the menu while the firmware has no
+/// input available.  Redrawing on EFI_NOT_READY causes visible flicker on
+/// firmware whose text console clears the screen synchronously.
+fn read_menu_key(st: &mut SystemTable) -> Option<crate::protocol::Key> {
+    if st.con_in.is_null() {
+        return None;
+    }
+    let ci = unsafe { &mut *(st.con_in as *mut crate::protocol::SimpleTextInput) };
+    let bs = unsafe { &mut *st.boot_services };
+    loop {
+        let mut key = crate::protocol::Key { sc: 0, uc: 0 };
+        let status = unsafe { (ci.read_key_stroke)(ci as *mut _, &mut key) };
+        if status == EFI_SUCCESS {
+            return Some(key);
+        }
+        if status != EFI_NOT_READY {
+            return None;
+        }
+        unsafe { (bs.stall)(10_000); }
+    }
+}
+
 pub fn show_payload_menu(
     st: &mut SystemTable,
     image_handle: *mut c_void,
@@ -1726,7 +1748,7 @@ pub fn show_payload_menu(
     let mut digits = [0u8; 3];
     let mut digit_len = 0usize;
 
-    use crate::protocol::{Key, SimpleTextInput};
+    use crate::protocol::Key;
     loop {
         clear_payload_menu(st);
         print_raw(st, b"=== Choosable UEFI Boot Menu ===\r\n\0");
@@ -1756,10 +1778,9 @@ pub fn show_payload_menu(
         print_raw(st, b"\r\nEnter number (n/p page, r scan): ");
         if digit_len > 0 { print_raw(st, &digits[..digit_len]); }
 
-        let mut k = Key { sc: 0, uc: 0 };
-        if st.con_in.is_null() { continue; }
-        let ci = unsafe { &mut *(st.con_in as *mut SimpleTextInput) };
-        if unsafe { (ci.read_key_stroke)(ci as *mut _, &mut k) } != EFI_SUCCESS { continue; }
+        let Some(k) = read_menu_key(st) else {
+            halt_or_reboot(st);
+        };
         let ch = if k.uc >= 0x20 && k.uc < 0x7F { k.uc as u8 }
             else if k.uc == 0x0D || k.uc == 0x0A { b'\n' }
             else if k.uc == 0x08 { 8 }
