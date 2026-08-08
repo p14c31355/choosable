@@ -318,8 +318,10 @@ pub struct VirtualBlockIo {
     /// original initrd and the CPIO extension.
     pub premount_cpio_buf: *mut u8,
     pub premount_cpio_size: u32,
-    /// LBA (ISO 2048-byte sector) of the first initrd file extent.
+    /// LBA (ISO 2048-byte sector) of the relocated initrd extent visible to GRUB.
     pub initrd_base_lba: u32,
+    /// LBA of the original initrd extent in the physical ISO.
+    pub initrd_source_lba: u32,
     /// Original file size of the initrd in bytes.
     pub initrd_orig_size: u32,
     /// Number of 2048-byte sectors of CPIO data.

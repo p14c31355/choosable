@@ -591,16 +591,31 @@ fn try_extend_initrd_in_iso(
     match find_in_dir_with_loc(bio_ref, bio_ptr, mid, iso_lba, dir_lba, dir_size, &filename_upper[..flen], &mut scratch) {
         Some((file_lba, file_size, entry_sector, entry_offset)) => {
             let cpio_sectors = ((cpio_size as u64 + 2047) / 2048) as u32;
-            vb.initrd_base_lba = file_lba;
+            // Relocate the complete initrd to virtual sectors after all
+            // original ISO data. Appending CPIO at file_lba + initrd_sectors
+            // is unsafe when the next ISO file starts there (Ubuntu's
+            // casper/vmlinuz is an example), because the Block I/O layer has
+            // no context to distinguish a kernel read from an initrd read.
+            let initrd_sectors = (file_size as u64 + 2047) / 2048;
+            let virtual_base = vb.media.bim_lb.saturating_add(1) as u32;
+            vb.initrd_base_lba = virtual_base;
+            vb.initrd_source_lba = file_lba;
             vb.initrd_orig_size = file_size;
             vb.initrd_ext_sectors = cpio_sectors;
+            vb.initrd_cpio_start_lba = virtual_base.saturating_add(initrd_sectors as u32);
             vb.initrd_entry_sector = entry_sector;
             vb.initrd_entry_offset = entry_offset;
             vb.initrd_ext_active = true;
+            vb.media.bim_lb = virtual_base
+                .saturating_add(initrd_sectors as u32)
+                .saturating_add(cpio_sectors)
+                .saturating_sub(1) as u64;
             print_raw(st, b"[initrd] extending \0");
             print_raw(st, &initrd_path[..initrd_path_len.min(60)]);
-            print_raw(st, b" lba=\0");
+            print_raw(st, b" src=\0");
             print_dec(st, file_lba as u64);
+            print_raw(st, b" -> virtual=\0");
+            print_dec(st, virtual_base as u64);
             print_raw(st, b" + \0");
             print_dec(st, cpio_sectors as u64);
             print_raw(st, b" sectors\r\n\0");

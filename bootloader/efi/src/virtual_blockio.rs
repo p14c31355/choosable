@@ -253,15 +253,36 @@ unsafe extern "efiapi" fn vblock_read(
             continue;
         }
 
-        // ── Initrd extension: redirect reads beyond original initrd to CPIO buffer ──
-        // When GRUB reads the extended initrd, sectors beyond the original file
-        // should come from the CPIO buffer, not from the actual ISO sectors
-        // (which may contain unrelated files).
+        // ── Relocated initrd: serve the original bytes from their ISO extent ──
+        // The virtual initrd is placed after the original ISO. This is
+        // important because the next ISO file may begin exactly where the
+        // original initrd's last rounded sector ends (Ubuntu does this for
+        // casper/initrd followed by casper/vmlinuz). Serving the extension at
+        // the original location would therefore replace the kernel data.
         if vbio.initrd_ext_active {
             let initrd_sectors = (vbio.initrd_orig_size as u64 + 2047) / 2048;
             let initrd_end = vbio.initrd_base_lba as u64 + initrd_sectors;
+
+            // Re-map the original initrd bytes into the relocated extent.
+            if block_lba >= vbio.initrd_base_lba as u64 && block_lba < initrd_end {
+                let source_lba = vbio.initrd_source_lba as u64
+                    + (block_lba - vbio.initrd_base_lba as u64);
+                if !read_real_iso_sector(vbio, source_lba, dst, block_offset) {
+                    return EFI_DEVICE_ERROR;
+                }
+                // Do not leak bytes from the next physical ISO file in the
+                // final partial source sector into the initrd stream.
+                let valid = (vbio.initrd_orig_size as usize) % 2048;
+                if block_lba + 1 == initrd_end && valid != 0 {
+                    for j in (block_offset + valid)..(block_offset + 2048) {
+                        dst[j] = 0;
+                    }
+                }
+                continue;
+            }
+
             let ext_end = initrd_end + vbio.initrd_ext_sectors as u64;
-            // If GRUB is reading the CPIO extension region
+            // Serve the CPIO extension after the relocated original initrd.
             if block_lba >= initrd_end && block_lba < ext_end {
                 let off = (block_lba - initrd_end) as usize * 2048;
                 let cpio = unsafe { core::slice::from_raw_parts(vbio.premount_cpio_buf as *const u8, vbio.premount_cpio_size as usize) };
@@ -412,6 +433,7 @@ pub fn create_virtual_cdrom(
     vbio.premount_cpio_buf = core::ptr::null_mut();
     vbio.premount_cpio_size = 0;
     vbio.initrd_base_lba = 0;
+    vbio.initrd_source_lba = 0;
     vbio.initrd_orig_size = 0;
     vbio.initrd_ext_sectors = 0;
     vbio.initrd_cpio_start_lba = 0;
