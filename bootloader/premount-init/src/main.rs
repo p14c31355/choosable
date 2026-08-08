@@ -163,6 +163,16 @@ unsafe fn do_execve(path: &str) -> ! {
 
 // ── Distro detection ────────────────────────────────────────────────────
 fn check_distro() -> bool {
+    // Expose the actual loop device under a stable name before handing
+    // control to the distro initramfs. Loop numbers are not deterministic.
+    if let Some(loop_path) = mounted_loop_device() {
+        let _ = std::fs::remove_file("/dev/choosable-live");
+        if std::os::unix::fs::symlink(&loop_path, "/dev/choosable-live").is_ok() {
+            console_log(&format!("live device: {}", loop_path));
+        } else {
+            console_log("live device symlink failed");
+        }
+    }
     if std::path::Path::new("/cdrom/casper").is_dir() {
         console_log("distro: casper/pop");
         // casper normally discovers the ISO by scanning the host filesystem.
@@ -184,17 +194,6 @@ fn check_distro() -> bool {
     }
     if std::path::Path::new("/cdrom/LiveOS").is_dir() {
         console_log("distro: LiveOS (Fedora)");
-        if let Some(loop_path) = mounted_loop_device() {
-            // dracut needs a block device in root=live:<device>.  Keep the
-            // loop device created by Choosable alive and give it a stable
-            // name, since loop numbers are not deterministic.
-            let _ = std::fs::remove_file("/dev/choosable-live");
-            if std::os::unix::fs::symlink(&loop_path, "/dev/choosable-live").is_ok() {
-                console_log(&format!("Fedora live device: {}", loop_path));
-                return true;
-            }
-        }
-        console_log("Fedora live device symlink failed");
         return true;
     }
     if std::path::Path::new("/cdrom/arch").is_dir() {

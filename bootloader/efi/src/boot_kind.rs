@@ -92,12 +92,15 @@ impl BootKind {
                 // fails, casper's own iso-scan/filename= fallback still runs
                 // (and may fail on exFAT if the kernel lacks exFAT support).
                 let _ = is_popos;
-                let chunk = b" boot=casper maybe-ubiquity init=/init.choosable";
+                // Use the loop device mounted by premount-init. casper's
+                // iso-scan/filename fallback cannot find the original ISO
+                // file after Choosable has mounted its contents at /cdrom.
+                let chunk = b" boot=casper live-media=/dev/choosable-live live-media-path=/casper maybe-ubiquity init=/init.choosable";
                 if pos + chunk.len() > initial_cap { return None; }
                 pos += copy_at(buf, pos, chunk);
             }
             BootKind::DebianLive => {
-                let chunk = b" boot=live live-media=removable init=/init.choosable";
+                let chunk = b" boot=live live-media=/dev/choosable-live live-media-path=/live init=/init.choosable";
                 if pos + chunk.len() > initial_cap { return None; }
                 pos += copy_at(buf, pos, chunk);
             }
@@ -483,9 +486,11 @@ mod tests {
     #[test]
     fn test_boot_kind_linux_extra_values() {
         let mut buf = [0u8; 512];
-        assert_eq!(BootKind::Casper.linux_extra(false, None, &mut buf).unwrap(), b" boot=casper maybe-ubiquity init=/init.choosable");
+        let casper = BootKind::Casper.linux_extra(false, None, &mut buf).unwrap();
+        assert!(casper.windows(b"live-media=/dev/choosable-live".len()).any(|w| w == b"live-media=/dev/choosable-live"));
         let mut buf2 = [0u8; 512];
-        assert_eq!(BootKind::Casper.linux_extra(true, None, &mut buf2).unwrap(), b" boot=casper maybe-ubiquity init=/init.choosable");
+        let debian = BootKind::DebianLive.linux_extra(true, None, &mut buf2).unwrap();
+        assert!(debian.windows(b"live-media=/dev/choosable-live".len()).any(|w| w == b"live-media=/dev/choosable-live"));
         let mut buf3 = [0u8; 512];
         assert_eq!(BootKind::WindowsPE.linux_extra(false, None, &mut buf3).unwrap(), b"");
         let mut buf4 = [0u8; 512];

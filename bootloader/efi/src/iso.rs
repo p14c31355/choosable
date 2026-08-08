@@ -747,7 +747,13 @@ fn try_patch_candidate(
         || (orig.len() >= 7 && orig.windows(7).any(|w| w == b"\nblscfg" || w == b"\nBLSCFG"));
     // systemd-boot .conf files have "options" lines instead of "linux"
     let has_options = orig.len() >= 8 && orig.windows(8).any(|w| w == b"options " || w == b"options\t");
-    let has_relevant_directive = has_linux || has_menuentry || has_blscfg || has_options;
+    // Fedora/Alpine EFI stubs can contain only `configfile`; they still need
+    // the virtual-CD root/prefix prepended or GRUB drops to its shell before
+    // loading the real menu.
+    let has_configfile = orig.len() >= 11
+        && orig.windows(11).any(|w| w == b"configfile " || w == b"configfile\t");
+    let has_relevant_directive = has_linux || has_menuentry || has_blscfg || has_options
+        || (has_configfile && !prefix_set_line.is_empty());
     if !has_relevant_directive {
         unsafe { (bs.free_pool)(orig_ptr as *mut c_void); }
         return false;
@@ -960,7 +966,10 @@ fn patch_grub_cfg_blockio(
             fedora_prefix_line[31] = b'\n';
             &fedora_prefix_line[..32]
         } else {
-            b""
+            // GRUB config stubs (notably Alpine) often only contain a
+            // configfile command. Ensure that command resolves on the
+            // synthetic CD instead of the host partition.
+            b"set root=(cd0)\n"
         };
 
         if try_patch_candidate(st, bs, vb, sfs_instance, bio_ref, bio_ptr, mid, iso_lba, iso_name,
@@ -1167,11 +1176,14 @@ fn path_exists(
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn build_iso_device_path(bs: &mut BootServices, iso_size_bytes: u64, efi_filename: &[u8]) -> *mut c_void {
-    const CDROM_NODE: [u8; 24] = {
-        let mut n = [0u8; 24];
-        n[0] = 0x04; n[1] = 0x02; n[2] = 24; n[3] = 0;
-        n
-    };
+    // EFI_CDROM_DP is 42 bytes, not 24.  Keeping the complete node is
+    // required for GRUB/systemd-boot to resolve the virtual CD filesystem.
+    let iso_sectors = iso_size_bytes.saturating_add(2047) / 2048;
+    if iso_sectors == 0 { return core::ptr::null_mut(); }
+    let mut cdrom_node = [0u8; 42];
+    cdrom_node[0] = 0x04; cdrom_node[1] = 0x02;
+    cdrom_node[2..4].copy_from_slice(&(42u16).to_le_bytes());
+    cdrom_node[16..24].copy_from_slice(&iso_sectors.to_le_bytes());
 
     // Build UTF-16 path dynamically from the matched EFI filename
     let mut file_name = [0u16; 32];
@@ -1193,23 +1205,15 @@ fn build_iso_device_path(bs: &mut BootServices, iso_size_bytes: u64, efi_filenam
     const END_NODE: [u8; 4] = [0x7F, 0xFF, 0x04, 0x00];
 
     let file_body_bytes = idx * 2;
-    let total = CDROM_NODE.len() + 4 + file_body_bytes + END_NODE.len();
+    let total = cdrom_node.len() + 4 + file_body_bytes + END_NODE.len();
     let mut ptr: *mut c_void = core::ptr::null_mut();
     if unsafe { (bs.allocate_pool)(MemoryType::EfiLoaderData, total, &mut ptr) } != EFI_SUCCESS || ptr.is_null() {
         return core::ptr::null_mut();
     }
     let dp = ptr as *mut u8;
     unsafe {
-        dp.copy_from_nonoverlapping(CDROM_NODE.as_ptr(), CDROM_NODE.len());
-        *(dp.add(8) as *mut u64) = 0u64.to_le();
-        // Partition Start — 0 for virtual CD-ROM backed by an ISO file.
-        // On physical CD-ROM this is typically 16 (after the System Area).
-        // Some firmware rejects the DevicePath if this field is set to the
-        // ISO size (as was done previously), causing LoadImage to return
-        // EFI_UNSUPPORTED.
-        let partition_start = 0u64;
-        *(dp.add(16) as *mut u64) = partition_start.to_le();
-        let mut off = 24usize;
+        dp.copy_from_nonoverlapping(cdrom_node.as_ptr(), cdrom_node.len());
+        let mut off = cdrom_node.len();
         dp.add(off).write_volatile(0x04u8); off += 1;
         dp.add(off).write_volatile(0x04u8); off += 1;
         *(dp.add(off) as *mut u16) = ((4 + file_body_bytes) as u16).to_le(); off += 2;
@@ -1224,23 +1228,22 @@ fn build_iso_device_path(bs: &mut BootServices, iso_size_bytes: u64, efi_filenam
 /// Used as a fallback when firmware rejects the synthetic file path node
 /// but requires a DevicePath to locate the virtual CD-ROM handle.
 fn build_cdrom_only_device_path(bs: &mut BootServices, _iso_size_bytes: u64) -> *mut c_void {
-    const CDROM_NODE: [u8; 24] = {
-        let mut n = [0u8; 24];
-        n[0] = 0x04; n[1] = 0x02; n[2] = 24; n[3] = 0;
-        n
-    };
+    let iso_sectors = _iso_size_bytes.saturating_add(2047) / 2048;
+    if iso_sectors == 0 { return core::ptr::null_mut(); }
+    let mut cdrom_node = [0u8; 42];
+    cdrom_node[0] = 0x04; cdrom_node[1] = 0x02;
+    cdrom_node[2..4].copy_from_slice(&(42u16).to_le_bytes());
+    cdrom_node[16..24].copy_from_slice(&iso_sectors.to_le_bytes());
     const END_NODE: [u8; 4] = [0x7F, 0xFF, 0x04, 0x00];
-    let total = CDROM_NODE.len() + END_NODE.len();
+    let total = cdrom_node.len() + END_NODE.len();
     let mut ptr: *mut c_void = core::ptr::null_mut();
     if unsafe { (bs.allocate_pool)(MemoryType::EfiLoaderData, total, &mut ptr) } != EFI_SUCCESS || ptr.is_null() {
         return core::ptr::null_mut();
     }
     let dp = ptr as *mut u8;
     unsafe {
-        dp.copy_from_nonoverlapping(CDROM_NODE.as_ptr(), CDROM_NODE.len());
-        *(dp.add(8) as *mut u64) = 0u64.to_le();
-        *(dp.add(16) as *mut u64) = 0u64.to_le(); // Partition Start = 0
-        dp.add(CDROM_NODE.len())
+        dp.copy_from_nonoverlapping(cdrom_node.as_ptr(), cdrom_node.len());
+        dp.add(cdrom_node.len())
             .copy_from_nonoverlapping(END_NODE.as_ptr(), END_NODE.len());
     }
     ptr

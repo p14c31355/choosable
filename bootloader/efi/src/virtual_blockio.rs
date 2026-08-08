@@ -323,17 +323,23 @@ pub fn create_virtual_cdrom(
     // ═════════════════════════════════════════════════════════════
     // 1. Build CD-ROM DevicePath
     // ═════════════════════════════════════════════════════════════
-    const CDROM_NODE: [u8; 24] = {
-        let mut n = [0u8; 24];
-        n[0] = 0x04;
-        n[1] = 0x02;
-        n[2] = 24u8.to_le_bytes()[0];
-        n[3] = 0x00;
-        n
-    };
     const END_NODE: [u8; 4] = [0x7F, 0xFF, 0x04, 0x00];
 
-    let dp_len = CDROM_NODE.len() + END_NODE.len();
+    // EFI_CDROM_DP is 42 bytes: BootEntry, PartitionStart, PartitionSize,
+    // Signature, MBRType, and SignatureType.  A shorter 24-byte node may be
+    // accepted by LoadImage but leaves GRUB/systemd-boot without a valid
+    // virtual CD filesystem device.
+    let iso_sectors = iso_size_bytes.saturating_add(2047) / 2048;
+    if iso_sectors == 0 {
+        return None;
+    }
+    let mut cdrom_node = [0u8; 42];
+    cdrom_node[0] = 0x04;
+    cdrom_node[1] = 0x02;
+    cdrom_node[2..4].copy_from_slice(&(42u16).to_le_bytes());
+    cdrom_node[16..24].copy_from_slice(&iso_sectors.to_le_bytes());
+
+    let dp_len = cdrom_node.len() + END_NODE.len();
     let mut dp_ptr: *mut c_void = core::ptr::null_mut();
     let dp_status = unsafe {
         (bs.allocate_pool)(MemoryType::EfiLoaderData, dp_len, &mut dp_ptr)
@@ -343,14 +349,8 @@ pub fn create_virtual_cdrom(
     }
     let dp = dp_ptr as *mut u8;
     unsafe {
-        dp.copy_from_nonoverlapping(CDROM_NODE.as_ptr(), CDROM_NODE.len());
-        *(dp.add(8) as *mut u64) = 0u64.to_le();
-        // Partition Start — must be 0 for virtual ISO-backed CD-ROM.
-        // Some firmware rejects the DevicePath if this is set to the
-        // volume size / last_block value.
-        let partition_start = 0u64;
-        *(dp.add(16) as *mut u64) = partition_start.to_le();
-        dp.add(CDROM_NODE.len())
+        dp.copy_from_nonoverlapping(cdrom_node.as_ptr(), cdrom_node.len());
+        dp.add(cdrom_node.len())
             .copy_from_nonoverlapping(END_NODE.as_ptr(), END_NODE.len());
     }
 
@@ -371,15 +371,8 @@ pub fn create_virtual_cdrom(
     }
     let vbio: &mut VirtualBlockIo = unsafe { &mut *(ptr as *mut VirtualBlockIo) };
 
-    // ISO files are normally 2048-byte aligned, but a truncated/copy-created
-    // image still needs a valid medium description.  Rounding up prevents an
-    // underflow in LastBlock and lets the final partial block be zero-padded
-    // by the backing read path.
-    let iso_sectors = iso_size_bytes.saturating_add(2047) / 2048;
-    if iso_sectors == 0 {
-        unsafe { (bs.free_pool)(dp_ptr); (bs.free_pool)(ptr); }
-        return None;
-    }
+    // ISO files are normally 2048-byte aligned. Rounding up keeps the final
+    // partial block addressable and prevents an underflow in LastBlock.
     vbio.protocol = BlockIoProtocol {
         bio_rev: 0x0001_0000_0000_0001,
         media: &mut vbio.media as *mut BlockIoMedia,
