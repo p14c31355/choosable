@@ -477,9 +477,117 @@ fn build_premount_cpio_entry(
     (record_len as u32) + 1 // record (46) + EOD (1) = 47
 }
 
+/// Expose the premount archive as a real ISO9660 file at `/PREMOUNT.CPIO`.
+///
+/// A distro initrd must not be modified in-place: Ubuntu's `casper/initrd`
+/// is a hybrid archive, and adding a second CPIO stream to that file makes
+/// the kernel reject it before the initramfs is unpacked. Instead, append a
+/// separate file to the virtual ISO and let GRUB refer to it as a second
+/// `initrd` input.
+fn prepare_premount_iso_file(
+    st: &mut SystemTable,
+    bs: &mut BootServices,
+    vb: &mut VirtualBlockIo,
+    sfs_instance: *mut crate::iso_fs::IsoFsInstance,
+    bio_ref: &BlockIoProtocol,
+    bio_ptr: *mut BlockIoProtocol,
+    mid: u32,
+    iso_lba: u64,
+    bundle: &crate::premount::PremountBundle,
+) -> bool {
+    let alloc_size = bundle.cpio_alloc_size;
+    if alloc_size == 0 || bundle.cpio_size > alloc_size || bundle.cpio_buf.is_null() {
+        return false;
+    }
+
+    // The pool allocation is rounded to ISO sectors. The directory record
+    // reports the exact CPIO size, while the final sector is padded.
+    unsafe {
+        let cpio = core::slice::from_raw_parts_mut(bundle.cpio_buf, alloc_size);
+        cpio[bundle.cpio_size..].fill(0);
+    }
+    let file_sectors = ((alloc_size as u64 + 2047) / 2048) as u32;
+    let file_sector = vb.media.bim_lb.saturating_add(1) as u32;
+    vb.premount_file_sector = file_sector;
+    vb.premount_file_sectors = file_sectors;
+    vb.premount_file_buf = bundle.cpio_buf;
+    vb.media.bim_lb = vb.media.bim_lb.saturating_add(file_sectors as u64);
+
+    let mut pvd = [0u8; 2048];
+    if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, 16, &mut pvd)
+        || pvd[0] != 1 || &pvd[1..6] != b"CD001"
+    {
+        print_raw(st, b"[premount] PVD read failed\r\n\0");
+        return false;
+    }
+    let root_lba = u32::from_le_bytes(pvd[158..162].try_into().unwrap());
+    let root_size = u32::from_le_bytes(pvd[166..170].try_into().unwrap());
+    let mut scratch = [0u8; 2048];
+
+    // Prefer an unused EOD slot. This preserves every original root entry,
+    // including boot files and firmware metadata.
+    let mut new_root_size = 0u32;
+    if let Some((entry_sector, entry_offset)) = find_eod_in_dir(
+        bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, &mut scratch,
+        &mut new_root_size,
+    ) {
+        let mut blob = [0u8; 128];
+        let blob_size = build_premount_cpio_entry(&mut blob, file_sector, bundle.cpio_size as u32);
+        vb.premount_entry_sector = entry_sector;
+        vb.premount_entry_offset = entry_offset;
+        vb.premount_entry_injected_blob = blob;
+        vb.premount_entry_injected_size = blob_size;
+        vb.premount_entry_injected = true;
+        vb.premount_new_root_size = new_root_size.saturating_add(blob_size);
+
+        if !sfs_instance.is_null() {
+            let sfs = unsafe { &mut *sfs_instance };
+            sfs.ctx.premount_cpio_buf = bundle.cpio_buf;
+            sfs.ctx.premount_cpio_size = bundle.cpio_size;
+            sfs.ctx.premount_target_name = *b"PREMOUNT.CPIO___";
+            sfs.ctx.premount_target_name_len = 13;
+        }
+        print_raw(st, b"[premount] injected /PREMOUNT.CPIO at root dir sector=\0");
+        print_dec(st, entry_sector as u64);
+        print_raw(st, b" offset=\0");
+        print_dec(st, entry_offset as u64);
+        print_raw(st, b"\r\n\0");
+        return true;
+    }
+
+    // If the root directory has no room, reuse a nonessential root file.
+    // The helper excludes boot catalogs, EFI files, configs, kernels,
+    // initrds, and known directory names.
+    if let Some((entry_sector, entry_offset, old_name, old_name_len)) =
+        find_first_file_in_dir(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, &mut scratch)
+    {
+        vb.premount_entry_sector = entry_sector;
+        vb.premount_entry_offset = entry_offset;
+        vb.premount_entry_new_extent = file_sector;
+        vb.premount_entry_new_size = bundle.cpio_size as u32;
+        vb.premount_entry_patched = true;
+        vb.premount_entry_rename = true;
+        if !sfs_instance.is_null() {
+            let sfs = unsafe { &mut *sfs_instance };
+            sfs.ctx.premount_cpio_buf = bundle.cpio_buf;
+            sfs.ctx.premount_cpio_size = bundle.cpio_size;
+            sfs.ctx.premount_target_name = *b"PREMOUNT.CPIO___";
+            sfs.ctx.premount_target_name_len = 13;
+        }
+        print_raw(st, b"[premount] replaced root file ");
+        print_raw(st, &old_name[..old_name_len.min(16)]);
+        print_raw(st, b" with /PREMOUNT.CPIO\r\n\0");
+        return true;
+    }
+
+    print_raw(st, b"[premount] no root directory slot available\r\n\0");
+    false
+}
+
 /// Try to find the initrd file in the ISO directory tree and patch its
 /// directory entry so extra CPIO sectors are served after the original file.
 /// Returns true if the initrd was found and extended successfully.
+#[cfg(any())]
 fn try_extend_initrd_in_iso(
     st: &mut SystemTable,
     bs: &mut BootServices,
@@ -1533,8 +1641,18 @@ fn uefi_chainload_iso(
         print_raw(st, b"[premount] allocation failed, skipping\r\n\0");
     }
 
-    // ── Build locator and patch grub.cfg first ──
-    // This must happen before initrd extension setup so vb.patched_file_buf is populated
+    // ── Add premount as a separate ISO file ──
+    // This must happen before patching grub.cfg so the virtual ISO size and
+    // the synthetic directory entry are already visible to the config patcher.
+    if !vbio_ptr.is_null() && premount_bundle.is_some() {
+        let vb = unsafe { &mut *vbio_ptr };
+        let bundle = premount_bundle.as_ref().unwrap();
+        if !prepare_premount_iso_file(st, bs, vb, sfs_instance, bio_ref, bio_ptr, mid, iso_lba, bundle) {
+            print_raw(st, b"[premount] unable to expose separate initrd\r\n\0");
+        }
+    }
+
+    // ── Build locator and patch grub.cfg ──
     let locator = FileBackedIsoLocator::from_payload_entry(
         &files[idx],
         *partition_guid,
@@ -1545,27 +1663,6 @@ fn uefi_chainload_iso(
 
     patch_grub_cfg_blockio(st, bs, vbio_ptr, sfs_instance, bio_ref, bio_ptr, mid, iso_lba, iso_name,
         Some(&iso_loc), boot_kind);
-
-    // ── Inject premount CPIO into initramfs via initrd extension ──
-    // Patch the initrd file's directory entry to report a larger size.
-    // GRUB reads the extended initrd through the virtual Block I/O, and
-    // the VBio serves the premount CPIO data at sectors beyond the
-    // original file.  This works at the Block I/O level and is visible
-    // to GRUB's own ISO9660 driver.  If the initrd file is not found in
-    // the ISO (some distros use unusual initrd paths), we skip premount.
-    if !vbio_ptr.is_null() && premount_bundle.is_some() {
-        let vb = unsafe { &mut *vbio_ptr };
-        let bundle = premount_bundle.as_ref().unwrap();
-        vb.premount_cpio_buf = bundle.cpio_buf;
-        vb.premount_cpio_size = bundle.cpio_size as u32;
-
-        if !try_extend_initrd_in_iso(
-            st, bs, vb, bio_ref, bio_ptr, mid, iso_lba,
-            bundle.cpio_size as u32)
-        {
-            print_raw(st, b"[premount] initrd not found, booting without premount\r\n\0");
-        }
-    }
 
     let (efi_lba, efi_size, efi_filename) = match find_efi_boot(st, bio_ref, bio_ptr, mid, iso_lba, boot_kind) {
         Some(v) => v,

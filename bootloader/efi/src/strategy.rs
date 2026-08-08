@@ -326,13 +326,23 @@ fn patch_grub_cfg_impl(
                     shift_and_inject(out, inject_at, &mut dst, &opt_buf[..ob]);
                 }
             }
-            // NOTE: initrd line modification (/PREMOUNT.CPIO append) is NOT done here.
-            // GRUB uses its own ISO9660 driver (not EFI SFS), so synthetic SFS files
-            // are invisible to GRUB. Instead, the premount CPIO is delivered by
-            // patching the initrd file's directory entry at the Block I/O level
-            // (see try_extend_initrd_in_iso in iso.rs).  When that fails, the system
-            // boots without premount-init, falling back to the distro's native
-            // boot mechanisms.
+            else if (t.starts_with(b"initrd ") || t.starts_with(b"initrd\t")
+                || t.starts_with(b"initrdefi ") || t.starts_with(b"initrdefi\t"))
+                && !effective_target.is_empty()
+                && dedup_slice.len() <= line.len()
+                && !line.windows(dedup_slice.len()).any(|w| w == dedup_slice)
+            {
+                // Add the premount archive as a separate initrd input. Ubuntu's
+                // casper/initrd is a hybrid archive with several member
+                // boundaries, so appending raw CPIO bytes to it corrupts the
+                // initramfs and results in "invalid magic" in initramfs.
+                let mut inject_at = dst;
+                if dst > 0 && out[dst - 1] == b'\n' {
+                    inject_at -= 1;
+                    if dst > 1 && out[dst - 2] == b'\r' { inject_at -= 1; }
+                }
+                shift_and_inject(out, inject_at, &mut dst, initrd_extra);
+            }
         }
     }
 
