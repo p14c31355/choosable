@@ -507,11 +507,6 @@ fn prepare_premount_iso_file(
         cpio[bundle.cpio_size..].fill(0);
     }
     let file_sectors = ((alloc_size as u64 + 2047) / 2048) as u32;
-    let file_sector = vb.media.bim_lb.saturating_add(1) as u32;
-    vb.premount_file_sector = file_sector;
-    vb.premount_file_sectors = file_sectors;
-    vb.premount_file_buf = bundle.cpio_buf;
-    vb.media.bim_lb = vb.media.bim_lb.saturating_add(file_sectors as u64);
 
     let mut pvd = [0u8; 2048];
     if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, 16, &mut pvd)
@@ -520,6 +515,11 @@ fn prepare_premount_iso_file(
         print_raw(st, b"[premount] PVD read failed\r\n\0");
         return false;
     }
+    let file_sector = vb.media.bim_lb.saturating_add(1) as u32;
+    vb.premount_file_sector = file_sector;
+    vb.premount_file_sectors = file_sectors;
+    vb.premount_file_buf = bundle.cpio_buf;
+    vb.media.bim_lb = vb.media.bim_lb.saturating_add(file_sectors as u64);
     let root_lba = u32::from_le_bytes(pvd[158..162].try_into().unwrap());
     let root_size = u32::from_le_bytes(pvd[166..170].try_into().unwrap());
     let mut scratch = [0u8; 2048];
@@ -582,157 +582,6 @@ fn prepare_premount_iso_file(
 
     print_raw(st, b"[premount] no root directory slot available\r\n\0");
     false
-}
-
-/// Try to find the initrd file in the ISO directory tree and patch its
-/// directory entry so extra CPIO sectors are served after the original file.
-/// Returns true if the initrd was found and extended successfully.
-#[cfg(any())]
-fn try_extend_initrd_in_iso(
-    st: &mut SystemTable,
-    bs: &mut BootServices,
-    vb: &mut crate::protocol::VirtualBlockIo,
-    bio_ref: &BlockIoProtocol,
-    bio_ptr: *mut BlockIoProtocol,
-    mid: u32,
-    iso_lba: u64,
-    cpio_size: u32,
-) -> bool {
-    if vb.patched_file_buf.is_null() || vb.patched_file_sectors == 0 {
-        return false;
-    }
-
-    // Scan the patched config for the first initrd line
-    let patched = unsafe {
-        core::slice::from_raw_parts(vb.patched_file_buf as *const u8, vb.patched_file_sectors as usize * 2048)
-    };
-    let mut initrd_path: [u8; 256] = [0; 256];
-    let mut initrd_path_len = 0usize;
-    let mut pos = 0usize;
-
-    while pos < patched.len() {
-        let line_start = pos;
-        while pos < patched.len() && patched[pos] != b'\n' { pos += 1; }
-        let line = &patched[line_start..pos];
-        let mut ts = 0;
-        while ts < line.len() && (line[ts] == b' ' || line[ts] == b'\t') { ts += 1; }
-        if (line[ts..].starts_with(b"initrd ") || line[ts..].starts_with(b"initrd\t"))
-            || (line[ts..].starts_with(b"initrdefi ") || line[ts..].starts_with(b"initrdefi\t"))
-        {
-            let mut ap = ts;
-            while ap < line.len() && line[ap] != b' ' && line[ap] != b'\t' { ap += 1; }
-            while ap < line.len() && (line[ap] == b' ' || line[ap] == b'\t') { ap += 1; }
-            let mut path_start = ap;
-            if path_start < line.len() && line[path_start] == b'(' {
-                while path_start < line.len() && line[path_start] != b')' { path_start += 1; }
-                if path_start < line.len() { path_start += 1; }
-            }
-            while path_start < line.len() && line[path_start] == b'/' { path_start += 1; }
-            let mut path_end = path_start;
-            while path_end < line.len() && line[path_end] != b' ' && line[path_end] != b'\t' && line[path_end] != b'\n' && line[path_end] != b'\r' {
-                path_end += 1;
-            }
-            let plen = path_end - path_start;
-            if plen > 0 && plen < 256 {
-                initrd_path[..plen].copy_from_slice(&line[path_start..path_end]);
-                initrd_path_len = plen;
-            }
-            break;
-        }
-        if pos < patched.len() { pos += 1; }
-    }
-
-    if initrd_path_len == 0 {
-        print_raw(st, b"[initrd] no initrd line in patched config\r\n\0");
-        return false;
-    }
-
-    // Split path into components
-    let mut components: [&[u8]; 16] = [b""; 16];
-    let mut comp_count = 0usize;
-    let mut seg_start = 0usize;
-    for i in 0..=initrd_path_len {
-        if i == initrd_path_len || initrd_path[i] == b'/' {
-            if i > seg_start && comp_count < 16 {
-                components[comp_count] = &initrd_path[seg_start..i];
-                comp_count += 1;
-            }
-            seg_start = i + 1;
-        }
-    }
-    if comp_count == 0 { return false; }
-
-    let filename = components[comp_count - 1];
-    let parent_components = &components[..comp_count - 1];
-
-    let mut pvd = [0u8; 2048];
-    if !read_iso_sector(bio_ref, bio_ptr, mid, iso_lba, 16, &mut pvd)
-        || pvd[0] != 1 || &pvd[1..6] != b"CD001"
-    {
-        print_raw(st, b"[initrd] PVD read failed\r\n\0");
-        return false;
-    }
-    let root_lba = u32::from_le_bytes(pvd[158..162].try_into().unwrap());
-    let root_size = u32::from_le_bytes(pvd[166..170].try_into().unwrap());
-    let mut scratch = [0u8; 2048];
-
-    // Traverse parent directories
-    let mut dir_lba = root_lba;
-    let mut dir_size = root_size;
-    for &comp in parent_components {
-        let mut comp_upper = [0u8; 64];
-        let len = comp.len().min(64);
-        for i in 0..len { comp_upper[i] = comp[i].to_ascii_uppercase(); }
-        match find_in_dir(bio_ref, bio_ptr, mid, iso_lba, dir_lba, dir_size, &comp_upper[..len], &mut scratch) {
-            Some((cl, cs)) => { dir_lba = cl; dir_size = cs; }
-            None => {
-                print_raw(st, b"[initrd] parent dir not found\r\n\0");
-                return false;
-            }
-        }
-    }
-
-    // Look up initrd file
-    let mut filename_upper = [0u8; 128];
-    let flen = filename.len().min(128);
-    for i in 0..flen { filename_upper[i] = filename[i].to_ascii_uppercase(); }
-    match find_in_dir_with_loc(bio_ref, bio_ptr, mid, iso_lba, dir_lba, dir_size, &filename_upper[..flen], &mut scratch) {
-        Some((file_lba, file_size, entry_sector, entry_offset)) => {
-            let cpio_sectors = ((cpio_size as u64 + 2047) / 2048) as u32;
-            // Relocate the complete initrd to virtual sectors after all
-            // original ISO data. Appending CPIO at file_lba + initrd_sectors
-            // is unsafe when the next ISO file starts there (Ubuntu's
-            // casper/vmlinuz is an example), because the Block I/O layer has
-            // no context to distinguish a kernel read from an initrd read.
-            let initrd_sectors = ((file_size as u64 + cpio_size as u64) + 2047) / 2048;
-            let virtual_base = vb.media.bim_lb.saturating_add(1) as u32;
-            vb.initrd_base_lba = virtual_base;
-            vb.initrd_source_lba = file_lba;
-            vb.initrd_orig_size = file_size;
-            vb.initrd_ext_sectors = cpio_sectors;
-            vb.initrd_cpio_start_lba = virtual_base.saturating_add((file_size / 2048) as u32);
-            vb.initrd_entry_sector = entry_sector;
-            vb.initrd_entry_offset = entry_offset;
-            vb.initrd_ext_active = true;
-            vb.media.bim_lb = virtual_base.saturating_add(initrd_sectors as u32).saturating_sub(1) as u64;
-            print_raw(st, b"[initrd] extending \0");
-            print_raw(st, &initrd_path[..initrd_path_len.min(60)]);
-            print_raw(st, b" src=\0");
-            print_dec(st, file_lba as u64);
-            print_raw(st, b" -> virtual=\0");
-            print_dec(st, virtual_base as u64);
-            print_raw(st, b" + \0");
-            print_dec(st, cpio_sectors as u64);
-            print_raw(st, b" sectors\r\n\0");
-            true
-        }
-        None => {
-            print_raw(st, b"[initrd] file not found in ISO: \0");
-            print_raw(st, &initrd_path[..initrd_path_len.min(60)]);
-            print_raw(st, b"\r\n\0");
-            false
-        }
-    }
 }
 
 fn find_efi_boot(
@@ -892,8 +741,13 @@ fn try_patch_candidate(
         unsafe { (bs.free_pool)(orig_ptr as *mut c_void); }
         return false;
     }
-    let has_relevant_directive = has_linux || has_menuentry || has_blscfg || has_options
-        || (has_configfile && !prefix_set_line.is_empty());
+    let configfile_stub = has_configfile && !has_linux && !has_menuentry && !has_blscfg && !has_options;
+    let effective_prefix_set_line = if configfile_stub {
+        if prefix_set_line.is_empty() { b"set root=(cd0)\n" } else { prefix_set_line }
+    } else {
+        b""
+    };
+    let has_relevant_directive = has_linux || has_menuentry || has_blscfg || has_options || configfile_stub;
     if !has_relevant_directive {
         unsafe { (bs.free_pool)(orig_ptr as *mut c_void); }
         return false;
@@ -906,7 +760,7 @@ fn try_patch_candidate(
         iso_location,
         &premount_target_name[..premount_target_name_len],
         bs as *mut BootServices,
-        prefix_set_line,
+        effective_prefix_set_line,
     );
 
     let (patched_buf, patched_size) = match patch {
@@ -1129,12 +983,7 @@ fn patch_grub_cfg_blockio(
             fedora_prefix_line[..31].copy_from_slice(b"set root=(cd0)\nset prefix=(cd0)");
             fedora_prefix_line[31] = b'\n';
             &fedora_prefix_line[..32]
-        } else {
-            // GRUB config stubs (notably Alpine) often only contain a
-            // configfile command. Ensure that command resolves on the
-            // synthetic CD instead of the host partition.
-            b"set root=(cd0)\n"
-        };
+        } else { b"" };
 
         if try_patch_candidate(st, bs, vb, sfs_instance, bio_ref, bio_ptr, mid, iso_lba, iso_name,
             entries[i].ext_lba, entries[i].ext_size,
@@ -1332,13 +1181,13 @@ fn path_exists(
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn build_iso_device_path(bs: &mut BootServices, iso_size_bytes: u64, efi_filename: &[u8]) -> *mut c_void {
-    // EFI_CDROM_DP is 42 bytes, not 24.  Keeping the complete node is
-    // required for GRUB/systemd-boot to resolve the virtual CD filesystem.
+    // EFI_CDROM_DP consists of a 4-byte header, BootEntry, PartitionStart,
+    // and PartitionSize: 24 bytes total.
     let iso_sectors = iso_size_bytes.saturating_add(2047) / 2048;
     if iso_sectors == 0 { return core::ptr::null_mut(); }
-    let mut cdrom_node = [0u8; 42];
+    let mut cdrom_node = [0u8; 24];
     cdrom_node[0] = 0x04; cdrom_node[1] = 0x02;
-    cdrom_node[2..4].copy_from_slice(&(42u16).to_le_bytes());
+    cdrom_node[2..4].copy_from_slice(&(24u16).to_le_bytes());
     cdrom_node[16..24].copy_from_slice(&iso_sectors.to_le_bytes());
 
     // Build UTF-16 path dynamically from the matched EFI filename
@@ -1386,9 +1235,9 @@ fn build_iso_device_path(bs: &mut BootServices, iso_size_bytes: u64, efi_filenam
 fn build_cdrom_only_device_path(bs: &mut BootServices, _iso_size_bytes: u64) -> *mut c_void {
     let iso_sectors = _iso_size_bytes.saturating_add(2047) / 2048;
     if iso_sectors == 0 { return core::ptr::null_mut(); }
-    let mut cdrom_node = [0u8; 42];
+    let mut cdrom_node = [0u8; 24];
     cdrom_node[0] = 0x04; cdrom_node[1] = 0x02;
-    cdrom_node[2..4].copy_from_slice(&(42u16).to_le_bytes());
+    cdrom_node[2..4].copy_from_slice(&(24u16).to_le_bytes());
     cdrom_node[16..24].copy_from_slice(&iso_sectors.to_le_bytes());
     const END_NODE: [u8; 4] = [0x7F, 0xFF, 0x04, 0x00];
     let total = cdrom_node.len() + END_NODE.len();
@@ -1955,6 +1804,10 @@ pub fn show_payload_menu(
             b'r' | b'R' => {
                 current_count = 0;
                 scan_payloads(bio_ref, bio_ptr, mid, ctx, &mut current_payloads, &mut current_count);
+                if current_count == 0 {
+                    print_raw(st, b"\r\nNo bootable payloads found.\r\n\0");
+                    halt_or_reboot(st);
+                }
                 page_start = 0;
                 digit_len = 0;
             }

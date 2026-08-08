@@ -426,7 +426,7 @@ fn try_mount_iso(dev_path: &str, offset: u64, sizelimit: u64) -> Option<String> 
         return None;
     }
 
-    console_log(&format!("mounted {} on /cdrom (offset={})", loop_path, offset));
+    console_log(&format!("mounted {} on /cdrom (offset={}, sizelimit={})", loop_path, offset, sizelimit));
     Some(loop_path)
 }
 

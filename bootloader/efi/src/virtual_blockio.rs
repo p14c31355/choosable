@@ -346,18 +346,16 @@ pub fn create_virtual_cdrom(
     // ═════════════════════════════════════════════════════════════
     const END_NODE: [u8; 4] = [0x7F, 0xFF, 0x04, 0x00];
 
-    // EFI_CDROM_DP is 42 bytes: BootEntry, PartitionStart, PartitionSize,
-    // Signature, MBRType, and SignatureType.  A shorter 24-byte node may be
-    // accepted by LoadImage but leaves GRUB/systemd-boot without a valid
-    // virtual CD filesystem device.
+    // EFI_CDROM_DP consists of a 4-byte header, BootEntry, PartitionStart,
+    // and PartitionSize: 24 bytes total.
     let iso_sectors = iso_size_bytes.saturating_add(2047) / 2048;
     if iso_sectors == 0 {
         return None;
     }
-    let mut cdrom_node = [0u8; 42];
+    let mut cdrom_node = [0u8; 24];
     cdrom_node[0] = 0x04;
     cdrom_node[1] = 0x02;
-    cdrom_node[2..4].copy_from_slice(&(42u16).to_le_bytes());
+    cdrom_node[2..4].copy_from_slice(&(24u16).to_le_bytes());
     cdrom_node[16..24].copy_from_slice(&iso_sectors.to_le_bytes());
 
     let dp_len = cdrom_node.len() + END_NODE.len();
