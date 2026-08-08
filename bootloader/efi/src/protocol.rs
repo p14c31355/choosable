@@ -310,27 +310,24 @@ pub struct VirtualBlockIo {
     pub dir_entry_new_size: u32,
     /// Whether directory entry patching is active
     pub dir_entry_patched: bool,
-    /// ── Premount CPIO initrd extension ───────────────────────────
-    /// The premount CPIO is served as extended sectors appended beyond
-    /// the original ISO media end, not after the initrd file itself.
-    /// The initrd's directory entry is patched to report a larger data
-    /// length and point to a relocated extent that includes both the
-    /// original initrd and the CPIO extension.
-    pub premount_cpio_buf: *mut u8,
-    pub premount_cpio_size: u32,
-    /// LBA (ISO 2048-byte sector) of the first initrd file extent.
-    pub initrd_base_lba: u32,
-    /// Original file size of the initrd in bytes.
-    pub initrd_orig_size: u32,
-    /// Number of 2048-byte sectors of CPIO data.
-    pub initrd_ext_sectors: u32,
-    /// Absolute LBA where the CPIO extension sectors start (beyond ISO media end).
-    pub initrd_cpio_start_lba: u32,
-    /// Directory entry location for the initrd file (sector/offset).
-    pub initrd_entry_sector: u32,
-    pub initrd_entry_offset: u32,
-    /// Whether initrd extension patching is active.
-    pub initrd_ext_active: bool,
+    /// ── Synthetic premount CPIO ISO file ──────────────────────────
+    /// The CPIO is exposed as a separate ISO9660 file and added as a
+    /// second initrd input. This is required for hybrid initrds such as
+    /// Ubuntu casper/initrd, which contain several archive/compression
+    /// members and cannot safely have raw bytes appended to them.
+    pub premount_file_sector: u32,
+    pub premount_file_sectors: u32,
+    pub premount_file_buf: *mut u8,
+    pub premount_entry_sector: u32,
+    pub premount_entry_offset: u32,
+    pub premount_entry_new_extent: u32,
+    pub premount_entry_new_size: u32,
+    pub premount_entry_patched: bool,
+    pub premount_entry_rename: bool,
+    pub premount_entry_injected: bool,
+    pub premount_entry_injected_blob: [u8; 128],
+    pub premount_entry_injected_size: u32,
+    pub premount_new_root_size: u32,
 }
 
 pub const DEVICE_PATH_PROTOCOL_GUID: Guid = Guid {
