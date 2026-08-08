@@ -162,6 +162,16 @@ unsafe fn do_execve(path: &str) -> ! {
 }
 
 // ── Distro detection ────────────────────────────────────────────────────
+fn has_casper_tree() -> bool {
+    if std::path::Path::new("/cdrom/casper").is_dir() {
+        return true;
+    }
+    let Ok(entries) = fs::read_dir("/cdrom") else { return false };
+    entries.flatten().any(|entry| {
+        entry.file_name().to_string_lossy().to_ascii_lowercase().starts_with("casper")
+    })
+}
+
 fn check_distro() -> bool {
     // Expose the actual loop device under a stable name before handing
     // control to the distro initramfs. Loop numbers are not deterministic.
@@ -173,7 +183,7 @@ fn check_distro() -> bool {
             console_log("live device symlink failed");
         }
     }
-    if std::path::Path::new("/cdrom/casper").is_dir() {
+    if has_casper_tree() {
         console_log("distro: casper/pop");
         // casper normally discovers the ISO by scanning the host filesystem.
         // Choosable has already mounted the exact ISO, so expose that mount at

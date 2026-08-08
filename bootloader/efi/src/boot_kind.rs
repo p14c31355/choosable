@@ -95,7 +95,11 @@ impl BootKind {
                 // Use the loop device mounted by premount-init. casper's
                 // iso-scan/filename fallback cannot find the original ISO
                 // file after Choosable has mounted its contents at /cdrom.
-                let chunk = b" boot=casper live-media=/dev/choosable-live live-media-path=/casper maybe-ubiquity init=/init.choosable";
+                // Do not hard-code live-media-path=/casper here. Pop!_OS
+                // images use versioned directories such as
+                // /casper_pop-os_24.04_amd64_generic_debug_600, and their
+                // original GRUB entry already contains the correct path.
+                let chunk = b" boot=casper live-media=/dev/choosable-live maybe-ubiquity init=/init.choosable";
                 if pos + chunk.len() > initial_cap { return None; }
                 pos += copy_at(buf, pos, chunk);
             }
@@ -136,7 +140,11 @@ impl BootKind {
                 }
             }
             BootKind::Alpine | BootKind::AlpinePremount => {
-                let chunk = b" init=/init.choosable modules=loop,iso9660";
+                // Alpine's real menu already supplies its complete modules
+                // list (loop, squashfs, storage, ...). Do not add a second
+                // modules= value before it: the original later value would
+                // win and make the injected list misleading.
+                let chunk = b" init=/init.choosable";
                 if pos + chunk.len() > initial_cap { return None; }
                 pos += copy_at(buf, pos, chunk);
             }
@@ -401,6 +409,12 @@ pub struct BootDescriptor {
 pub(crate) fn name_matches(iso_name: &[u8], pattern: &[u8]) -> bool {
     iso_name.len() == pattern.len()
         && iso_name.iter().zip(pattern.iter()).all(|(&a, &b)| (a | 0x20) == (b | 0x20))
+}
+
+pub(crate) fn name_starts_with(iso_name: &[u8], pattern: &[u8]) -> bool {
+    iso_name.len() >= pattern.len()
+        && iso_name[..pattern.len()].iter().zip(pattern.iter())
+            .all(|(&a, &b)| (a | 0x20) == (b | 0x20))
 }
 
 /// Convert a GUID to PARTUUID string format for testing only.

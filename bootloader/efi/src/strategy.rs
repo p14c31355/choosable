@@ -18,6 +18,7 @@ use crate::protocol::{BootServices, MemoryType, EFI_SUCCESS};
 
 pub struct PatchInput<'a> {
     pub original: &'a [u8],
+    pub boot_kind: BootKind,
     pub iso_name: &'a [u8],
     pub bs: *mut BootServices,
     pub live_media_uuid: &'a [u8; 10],
@@ -96,7 +97,8 @@ fn remove_iso_locator_args(out: &mut [u8], line_start: usize, dst: &mut usize) {
     let patterns: &[&[u8]] = &[
         b"findiso=", b"iso-scan/filename=", b"choosable.iso_offset=",
         b"choosable.part_guid=", b"choosable.part_num=", b"choosable.iso_path=", b"choosable.iso_size=",
-        b"root=live:", // Fedora BLS original root= overrides our injected value
+        b"root=live:", // Fedora's original CDLABEL root overrides our live device
+        b"archisosearchuuid=", b"archisosearchfilename=",
     ];
 
     let mut pos = line_start;
@@ -248,7 +250,10 @@ fn patch_grub_cfg_impl(
             {
                 // Remove any existing ISO locator arguments to prevent duplicates
                 // and ensure our dynamic value takes precedence.
-                if !eol_extra_dynamic.is_empty() {
+                if !eol_extra_dynamic.is_empty()
+                    || inp.boot_kind == BootKind::FedoraLive
+                    || inp.boot_kind == BootKind::ArchIso
+                {
                     remove_iso_locator_args(out, line_start, &mut dst);
                 }
 
@@ -401,6 +406,7 @@ pub fn patch_grub_cfg(
 
     let inp = PatchInput {
         original,
+        boot_kind,
         iso_name,
         bs,
         live_media_uuid: &live_media_uuid,

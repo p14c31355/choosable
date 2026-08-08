@@ -1205,7 +1205,7 @@ fn recursive_find_files_with_ext(
 //  ISO scanner — detects BootKind from directory structure
 // ═══════════════════════════════════════════════════════════════════════════
 
-use crate::boot_kind::{name_matches, BootDescriptor, BootKind, BootloaderType};
+use crate::boot_kind::{name_matches, name_starts_with, BootDescriptor, BootKind, BootloaderType};
 
 /// Walk the ISO root directory and identify the distro family by checking
 /// for well-known directories and files:
@@ -1259,8 +1259,8 @@ pub fn scan_iso_structure(
 
             if boot_kind == BootKind::Unknown {
                 if is_dir {
-                         if name_matches(name, b"CASPER")  { boot_kind = BootKind::Casper; }
-                    else if name_matches(name, b"POP-OS")  { boot_kind = BootKind::Casper; }
+                         if name_matches(name, b"CASPER") || name_starts_with(name, b"CASPER_") || name_starts_with(name, b"CASPER-") { boot_kind = BootKind::Casper; }
+                    else if name_matches(name, b"POP-OS") || name_starts_with(name, b"POP-OS_") || name_starts_with(name, b"POP-OS-") { boot_kind = BootKind::Casper; }
                     else if name_matches(name, b"LIVE")    { boot_kind = BootKind::DebianLive; }
                     else if name_matches(name, b"LIVEOS")  { boot_kind = BootKind::FedoraLive; }
                     else if name_matches(name, b"ARCH")    { boot_kind = BootKind::ArchIso; }
@@ -1664,6 +1664,24 @@ fn uefi_chainload_iso(
     patch_grub_cfg_blockio(st, bs, vbio_ptr, sfs_instance, bio_ref, bio_ptr, mid, iso_lba, iso_name,
         Some(&iso_loc), boot_kind);
 
+    // The virtual ISO now contains the synthetic premount file and, when
+    // applicable, the patched configuration file. Keep the CD-ROM media
+    // node's LastBlock in sync with that expanded Block I/O media; otherwise
+    // GRUB/systemd-boot may reject reads beyond the original ISO end.
+    let virtual_iso_size = if !vbio_ptr.is_null() {
+        let last_block = unsafe { (*vbio_ptr).media.bim_lb };
+        last_block.saturating_add(1).saturating_mul(2048)
+    } else {
+        iso_size
+    };
+    if !cdrom_dp.is_null() {
+        let last_block_bytes = ((virtual_iso_size / 2048) as u64).to_le_bytes();
+        unsafe {
+            (cdrom_dp as *mut u8).add(16)
+                .copy_from_nonoverlapping(last_block_bytes.as_ptr(), 8);
+        }
+    }
+
     let (efi_lba, efi_size, efi_filename) = match find_efi_boot(st, bio_ref, bio_ptr, mid, iso_lba, boot_kind) {
         Some(v) => v,
         None => {
@@ -1678,7 +1696,7 @@ fn uefi_chainload_iso(
             halt_or_reboot(st);
         }
     };
-    let device_path = build_iso_device_path(bs, iso_size, efi_filename);
+    let device_path = build_iso_device_path(bs, virtual_iso_size, efi_filename);
     print_raw(st, b"Loading EFI image...\r\n\0");
     print_raw(st, b"EFI image size=\0");
     print_dec(st, buf_len as u64);
@@ -1723,7 +1741,7 @@ fn uefi_chainload_iso(
         // Retry with CD-ROM-only DevicePath (no file path node).
         // Some firmware needs a real DevicePath to locate the
         // device, but rejects the synthetic file path.
-        let cdrom_only_dp = build_cdrom_only_device_path(bs, iso_size);
+        let cdrom_only_dp = build_cdrom_only_device_path(bs, virtual_iso_size);
         if !cdrom_only_dp.is_null() {
             load_status = unsafe {
                 (bs.load_image)(false, image_handle,
