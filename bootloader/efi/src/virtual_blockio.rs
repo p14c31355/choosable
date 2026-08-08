@@ -244,55 +244,58 @@ unsafe extern "efiapi" fn vblock_read(
             }
 
             if needs_initrd_patch {
-                // Calculate total size: original initrd + CPIO extension, aligned to sector boundary
-                let initrd_sectors = (vbio.initrd_orig_size as u64 + 2047) / 2048;
-                let new_size = (initrd_sectors + vbio.initrd_ext_sectors as u64) * 2048;
+                // The CPIO follows the original file bytes directly. Keep
+                // the exact byte size so the kernel does not see a large
+                // zero-filled gap between the two archives.
+                let new_size = vbio.initrd_orig_size
+                    .saturating_add(vbio.premount_cpio_size);
                 patch_dir_entry(&mut dst[block_offset..block_offset + 2048],
                     vbio.initrd_entry_offset as usize, vbio.initrd_base_lba, new_size as u32);
             }
             continue;
         }
 
-        // ── Relocated initrd: serve the original bytes from their ISO extent ──
-        // The virtual initrd is placed after the original ISO. This is
-        // important because the next ISO file may begin exactly where the
-        // original initrd's last rounded sector ends (Ubuntu does this for
-        // casper/initrd followed by casper/vmlinuz). Serving the extension at
-        // the original location would therefore replace the kernel data.
+        // ── Relocated initrd: serve a contiguous initrd stream ─────────
+        // The extra CPIO must start immediately after the original file's
+        // actual byte length. Starting it at the next 2048-byte sector leaves
+        // zero padding between two CPIO archives; some kernels then stop at
+        // the original TRAILER!!! and never unpack init.choosable.
         if vbio.initrd_ext_active {
-            let initrd_sectors = (vbio.initrd_orig_size as u64 + 2047) / 2048;
-            let initrd_end = vbio.initrd_base_lba as u64 + initrd_sectors;
+            let total_bytes = vbio.initrd_orig_size as u64 + vbio.premount_cpio_size as u64;
+            let total_sectors = (total_bytes + 2047) / 2048;
+            let initrd_start = vbio.initrd_base_lba as u64;
+            let initrd_end = initrd_start + total_sectors;
 
-            // Re-map the original initrd bytes into the relocated extent.
-            if block_lba >= vbio.initrd_base_lba as u64 && block_lba < initrd_end {
-                let source_lba = vbio.initrd_source_lba as u64
-                    + (block_lba - vbio.initrd_base_lba as u64);
-                if !read_real_iso_sector(vbio, source_lba, dst, block_offset) {
-                    return EFI_DEVICE_ERROR;
-                }
-                // Do not leak bytes from the next physical ISO file in the
-                // final partial source sector into the initrd stream.
-                let valid = (vbio.initrd_orig_size as usize) % 2048;
-                if block_lba + 1 == initrd_end && valid != 0 {
-                    for j in (block_offset + valid)..(block_offset + 2048) {
-                        dst[j] = 0;
+            if block_lba >= initrd_start && block_lba < initrd_end {
+                let stream_offset = (block_lba - initrd_start) as usize * 2048;
+                for j in 0..2048 { dst[block_offset + j] = 0; }
+
+                // Copy the original file portion from its physical extent.
+                if stream_offset < vbio.initrd_orig_size as usize {
+                    let mut source = [0u8; 2048];
+                    let source_lba = vbio.initrd_source_lba as u64
+                        + (stream_offset / 2048) as u64;
+                    if !read_real_iso_sector(vbio, source_lba, &mut source, 0) {
+                        return EFI_DEVICE_ERROR;
                     }
+                    let count = (vbio.initrd_orig_size as usize - stream_offset).min(2048);
+                    dst[block_offset..block_offset + count].copy_from_slice(&source[..count]);
                 }
-                continue;
-            }
 
-            let ext_end = initrd_end + vbio.initrd_ext_sectors as u64;
-            // Serve the CPIO extension after the relocated original initrd.
-            if block_lba >= initrd_end && block_lba < ext_end {
-                let off = (block_lba - initrd_end) as usize * 2048;
-                let cpio = unsafe { core::slice::from_raw_parts(vbio.premount_cpio_buf as *const u8, vbio.premount_cpio_size as usize) };
-                let to_copy = (vbio.premount_cpio_size as usize).saturating_sub(off).min(2048);
-                if to_copy > 0 {
-                    dst[block_offset..block_offset + to_copy].copy_from_slice(&cpio[off..off + to_copy]);
-                }
-                // Zero-fill remainder of the sector
-                for j in (block_offset + to_copy)..(block_offset + 2048) {
-                    dst[j] = 0;
+                // Copy the CPIO directly after the original file bytes,
+                // including the case where that boundary is inside a sector.
+                let cpio_start = vbio.initrd_orig_size as usize;
+                let block_end = stream_offset + 2048;
+                if block_end > cpio_start {
+                    let dst_start = cpio_start.saturating_sub(stream_offset);
+                    let cpio_offset = stream_offset.saturating_sub(cpio_start);
+                    let count = (vbio.premount_cpio_size as usize).saturating_sub(cpio_offset)
+                        .min(2048 - dst_start);
+                    if count > 0 {
+                        let cpio = unsafe { core::slice::from_raw_parts(vbio.premount_cpio_buf as *const u8, vbio.premount_cpio_size as usize) };
+                        dst[block_offset + dst_start..block_offset + dst_start + count]
+                            .copy_from_slice(&cpio[cpio_offset..cpio_offset + count]);
+                    }
                 }
                 continue;
             }

@@ -596,20 +596,17 @@ fn try_extend_initrd_in_iso(
             // is unsafe when the next ISO file starts there (Ubuntu's
             // casper/vmlinuz is an example), because the Block I/O layer has
             // no context to distinguish a kernel read from an initrd read.
-            let initrd_sectors = (file_size as u64 + 2047) / 2048;
+            let initrd_sectors = ((file_size as u64 + cpio_size as u64) + 2047) / 2048;
             let virtual_base = vb.media.bim_lb.saturating_add(1) as u32;
             vb.initrd_base_lba = virtual_base;
             vb.initrd_source_lba = file_lba;
             vb.initrd_orig_size = file_size;
             vb.initrd_ext_sectors = cpio_sectors;
-            vb.initrd_cpio_start_lba = virtual_base.saturating_add(initrd_sectors as u32);
+            vb.initrd_cpio_start_lba = virtual_base.saturating_add((file_size / 2048) as u32);
             vb.initrd_entry_sector = entry_sector;
             vb.initrd_entry_offset = entry_offset;
             vb.initrd_ext_active = true;
-            vb.media.bim_lb = virtual_base
-                .saturating_add(initrd_sectors as u32)
-                .saturating_add(cpio_sectors)
-                .saturating_sub(1) as u64;
+            vb.media.bim_lb = virtual_base.saturating_add(initrd_sectors as u32).saturating_sub(1) as u64;
             print_raw(st, b"[initrd] extending \0");
             print_raw(st, &initrd_path[..initrd_path_len.min(60)]);
             print_raw(st, b" src=\0");
@@ -776,6 +773,17 @@ fn try_patch_candidate(
     // loading the real menu.
     let has_configfile = orig.len() >= 11
         && orig.windows(11).any(|w| w == b"configfile " || w == b"configfile\t");
+    // Fedora's EFI/BOOT/grub.cfg and EFI/fedora/grub.cfg are only tiny
+    // configfile stubs.  Patching one of those stubs first prevents the real
+    // /boot/grub2/grub.cfg (which contains the linux/initrd lines) from being
+    // patched, so the live-media arguments never reach the kernel.
+    if boot_kind == crate::boot_kind::BootKind::FedoraLive
+        && has_configfile
+        && !has_linux && !has_menuentry && !has_blscfg && !has_options
+    {
+        unsafe { (bs.free_pool)(orig_ptr as *mut c_void); }
+        return false;
+    }
     let has_relevant_directive = has_linux || has_menuentry || has_blscfg || has_options
         || (has_configfile && !prefix_set_line.is_empty());
     if !has_relevant_directive {
@@ -901,6 +909,30 @@ fn patch_grub_cfg_blockio(
         (b"",      b"",       b"SYSLINUX.CFG", b"/syslinux/syslinux.cfg"),
         (b"",      b"",       b"ISOLINUX.CFG", b"/isolinux/isolinux.cfg"),
     ];
+
+    // Arch's x86_64 UEFI image is systemd-boot, which consumes the BLS
+    // entries under /loader/entries rather than boot/grub/loopback.cfg.
+    // Put those entries first so the single virtual directory-entry patch is
+    // applied to a file that systemd-boot actually reads.  CachyOS also uses
+    // the Arch directory marker, but has no BLS directory and keeps the GRUB
+    // path below.
+    if boot_kind == crate::boot_kind::BootKind::ArchIso {
+        let conf_dir = find_in_dir(bio_ref, bio_ptr, mid, iso_lba, root_lba, root_size, b"LOADER", &mut scratch)
+            .and_then(|(lba, sz)| find_in_dir(bio_ref, bio_ptr, mid, iso_lba, lba, sz, b"ENTRIES", &mut scratch));
+        if let Some((dir_lba, dir_size)) = conf_dir {
+            let mut conf_entries: [(u32, u32, u32, u32); 32] = [(0,0,0,0); 32];
+            let mut conf_count = 0usize;
+            recursive_find_files_with_ext(
+                bio_ref, bio_ptr, mid, iso_lba, dir_lba, dir_size,
+                &mut scratch, &mut conf_entries, &mut conf_count, 0, b"conf",
+            );
+            for i in 0..conf_count {
+                let (ext_lba, ext_size, dir_sector, dir_offset) = conf_entries[i];
+                if ext_size == 0 { continue; }
+                add_cfg_entry(&mut entries, &mut entry_count, ext_lba, ext_size, dir_sector, dir_offset, b"/<entries>.conf");
+            }
+        }
+    }
 
     for (dir1, dir2, filename, path) in &known_paths {
         let entry = if dir1.is_empty() {
